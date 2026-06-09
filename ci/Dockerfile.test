@@ -1,0 +1,14 @@
+FROM clux/muslrust:stable
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bats \
+      ca-certificates \
+      curl \
+      docker.io \
+      docker-compose-plugin \
+      jq \
+      protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
