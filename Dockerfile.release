@@ -1,0 +1,14 @@
+FROM gcr.io/distroless/static
+
+COPY lnurl-server /bin/lnurl-server
+
+USER 1000
+
+ARG VERSION
+ARG BUILDTIME
+ARG COMMITHASH
+ENV VERSION ${VERSION}
+ENV BUILDTIME ${BUILDTIME}
+ENV COMMITHASH ${COMMITHASH}
+
+CMD ["lnurl-server"]

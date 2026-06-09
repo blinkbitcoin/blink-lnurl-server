@@ -8,7 +8,7 @@ LOG_FILE="${STATE_DIR}/server.log"
 BIND_ADDR="127.0.0.1:8080"
 BASE_URL="http://${BIND_ADDR}"
 DB_URL="postgres://user:password@127.0.0.1:5432/lnurl"
-LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl}"
+LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl-server}"
 
 mkdir -p "${STATE_DIR}"
 
@@ -49,7 +49,7 @@ stop_existing
 : >"${LOG_FILE}"
 
 if [ ! -x "${LNURL_BIN}" ]; then
-  cargo build --locked --bin lnurl
+  cargo build --locked --bin lnurl-server
 fi
 
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \

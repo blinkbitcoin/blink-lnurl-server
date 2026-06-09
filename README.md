@@ -1,147 +1,174 @@
-# LNURL Server
+# Blink LNURL Server
 
-This crate provides an LNURL server implementation for Breez SDK - Spark. 
+Blink LNURL Server provides LNURL-pay and Lightning Address endpoints backed by Spark invoice creation.
 
-## About LNURL
+## What It Does
 
-LNURL is a protocol for Lightning Network interactions such as payments, withdrawals, and authentication. This LNURL server implements:
+The server lets a user register a username and Spark public key. After registration, the server can:
 
-- **LNURL-pay**: Allows receiving Lightning payments via URLs or QR codes
-- **Lightning Address**: Enables email-like addresses for receiving payments (username@domain.com)
+- Serve LNURL-pay metadata for `username@domain.com`.
+- Create Spark Lightning invoices for that registered user.
+- Serve Lightning Address discovery at `/.well-known/lnurlp/{username}`.
+- Store invoice metadata for LUD-21 verification, sender comments, zaps, and webhook delivery.
 
-A user can register their username together with their Spark public key with the server. The server will then:
+Trust model: the user must trust the LNURL server and Spark Service Provider not to collude by sharing the preimage. The user must also trust the LNURL server to return invoices that pay the registered user.
 
-1. Serve LNURL endpoints on the user's behalf
-2. Create invoices on the user's behalf without the user being online
-3. Handle Lightning Address lookups at `/.well-known/lnurlp/username`
+## Development Environment
 
-> **Trust Model**: The user needs to trust that the LNURL server and the SSP (Spark Service Provider) do not collude by sharing the preimage. Additionally, the user must trust the LNURL server as it could return invoices that are not directed to the user at all.
+Use Nix for local dependencies. The flake provides Rust 1.95, protobuf, OpenSSL, Docker Compose, Bats, PostgreSQL tools, cargo-audit, and typos.
 
-## Prerequisites
+With direnv:
 
-To compile and run the LNURL server, you'll need:
-
-- Rust toolchain (1.75 or newer recommended)
-- Protobuf compiler (`protoc`)
-- OpenSSL development libraries
-- PostgreSQL (if using a PostgreSQL database)
-
-## How to Compile
-
-### Installing Dependencies
-
-#### On Debian/Ubuntu:
 ```shell
-apt-get update
-apt-get install -y libprotobuf-dev libssl-dev pkg-config protobuf-compiler
+direnv allow
 ```
 
-#### On macOS (with Homebrew):
+Without direnv, prefix commands with `nix develop -c`:
+
 ```shell
-brew install protobuf openssl pkg-config
+nix develop -c make build
 ```
 
-### Building the Server
+## Common Commands
 
-From the repository root:
+| Command | Description |
+|---------|-------------|
+| `make build` | Build all Rust targets with `Cargo.lock` enforced |
+| `make check-code` | Run `cargo fmt --check` and clippy with warnings denied |
+| `make test-rust` | Run Rust tests without the optional Postgres test URL |
+| `make start-deps` | Start local Docker Compose dependencies |
+| `make stop-deps` | Stop local Docker Compose dependencies |
+| `make reset-deps` | Restart local Docker Compose dependencies |
+| `make start` | Start Postgres and run the LNURL server locally |
+| `make test-integration` | Run Postgres-backed Rust tests |
+| `make e2e` | Run Bats end-to-end tests |
+| `make audit` | Run `cargo audit` |
+
+## Build
+
+Development build:
 
 ```shell
-cargo build --release --manifest-path crates/breez-sdk/lnurl/Cargo.toml
+nix develop -c make build
 ```
 
-The compiled binary will be available at `target/release/lnurl`.
-
-## How to Run
-
-### Docker (Recommended for Production)
-
-Building the Docker image:
+Release build:
 
 ```shell
-docker build -t lnurl-server -f crates/breez-sdk/lnurl/Dockerfile .
+nix develop -c cargo build --release --locked --bin lnurl-server
 ```
 
-Running the container:
+The release binary is written to `target/release/lnurl-server`.
+
+## Run Locally
+
+Start the local Postgres dependency and LNURL server:
 
 ```shell
-docker run -p 8080:8080 \
-  -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl_db" \
+nix develop -c make start
+```
+
+The local stack uses:
+
+- Postgres 17 from `docker-compose.yml`.
+- `LNURL_DB_URL=postgres://user:password@127.0.0.1:5432/lnurl`.
+- `LNURL_DOMAINS=localhost:8080,127.0.0.1:8080`.
+- `LNURL_NETWORK=regtest`.
+- `LNURL_SCHEME=http`.
+
+Run end-to-end tests:
+
+```shell
+nix develop -c make e2e
+```
+
+## Docker
+
+Build a static musl binary from source and copy it into an Ubuntu runtime image:
+
+```shell
+docker build -t blink-lnurl-server .
+```
+
+Run the source-built image:
+
+```shell
+docker run --rm -p 8080:8080 \
+  -e LNURL_ADDRESS="0.0.0.0:8080" \
+  -e LNURL_AUTO_MIGRATE="true" \
+  -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl" \
   -e LNURL_DOMAINS="yourdomain.com" \
-  -e LNURL_AUTO_MIGRATE=true \
-  lnurl-server
+  blink-lnurl-server
 ```
 
-### Native (Rust)
-
-If you've built the binary, you can run it directly:
+`Dockerfile.release` builds a minimal distroless runtime image from a prebuilt static `lnurl-server` binary in the Docker build context:
 
 ```shell
-./target/release/lnurl --db-url="lnurl.sqlite" --domains="yourdomain.com" --auto-migrate
+cp target/x86_64-unknown-linux-musl/release/lnurl-server ./lnurl-server
+docker build \
+  -f Dockerfile.release \
+  --build-arg VERSION="v0.1.0" \
+  -t blink-lnurl-server:v0.1.0 \
+  .
+rm ./lnurl-server
 ```
 
 ## Configuration
 
-The server can be configured in three ways (in order of precedence):
+The server is configured in this precedence order:
 
-1. Command-line arguments
-2. Environment variables (prefixed with `LNURL_`)
-3. Config file (TOML format)
+1. Command-line arguments.
+2. Environment variables prefixed with `LNURL_`.
+3. TOML config file.
 
-### Configuration File
-
-Create a file named `lnurl.conf` (or specify a different path with `--config`):
+Example `lnurl.conf`:
 
 ```toml
-# Server configuration
 address = "0.0.0.0:8080"
 auto_migrate = true
+db_url = "postgres://user:password@localhost:5432/lnurl"
+domains = "yourdomain.com"
 log_level = "info"
+max_sendable = 4000000000
+min_sendable = 1000
 network = "mainnet"
 scheme = "https"
-
-# Database configuration
-db_url = "postgres://user:password@localhost:5432/lnurl_db"
-# Or for SQLite:
-# db_url = "lnurl.sqlite"
-
-# LNURL payment configuration
-min_sendable = 1000          # Minimum amount in millisatoshi (1 sat)
-max_sendable = 4000000000    # Maximum amount in millisatoshi (40,000 sats)
-domains = "yourdomain.com"   # Comma-separated list of allowed domains
 ```
 
-### Important Configuration Options
+Important options:
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--address` | Address the server listens on | `0.0.0.0:8080` |
 | `--auto-migrate` | Automatically apply database migrations | `false` |
-| `--db-url` | Database connection string | `""` |
-| `--domains` | Comma-separated list of allowed domains | `localhost:8080` |
-| `--log-level` | RUST_LOG style format (e.g., `info`, `lnurl=trace,info`, `lnurl=trace,spark_wallet=debug,info`) | `info` |
-| `--network` | Spark network (mainnet, testnet, regtest) | `mainnet` |
-| `--min-sendable` | Minimum payment amount (millisatoshi) | `1000` |
-| `--max-sendable` | Maximum payment amount (millisatoshi) | `4000000000` |
-| `--webhook-domain` | Domain for the webhook URL registered with the SSP | (none) |
-| `--ssp-auth-seed` | Hex-encoded 32-byte seed for SSP authentication | (random) |
+| `--db-url` | PostgreSQL or SQLite connection string | `""` |
+| `--domains` | Comma-separated allowed domains | `localhost:8080` |
+| `--log-level` | `RUST_LOG` style filter | `info` |
+| `--network` | Spark network: `mainnet`, `testnet`, or `regtest` | `mainnet` |
+| `--scheme` | Scheme used in generated LNURL callback URLs | `https` |
+| `--min-sendable` | Minimum payment amount in millisatoshi | `1000` |
+| `--max-sendable` | Maximum payment amount in millisatoshi | `4000000000` |
+| `--webhook-domain` | Domain used when registering the Spark SSP webhook URL | unset |
+| `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
 
-For a complete list of options, run:
+For the complete list:
+
 ```shell
-lnurl --help
+nix develop -c cargo run --locked --bin lnurl-server -- --help
 ```
 
-### Database Support
+## Database Backends
 
-The server supports two database backends:
+The server chooses the database implementation from `db_url`:
 
-- **PostgreSQL**: Use a connection string starting with `postgres://`
-- **SQLite**: Use any other connection string (e.g., `lnurl.sqlite`)
+- PostgreSQL: connection strings beginning with `postgres`.
+- SQLite: any other connection string, for example `lnurl.sqlite`.
 
-When `--auto-migrate` is enabled, the server will automatically create the required tables.
+When `auto_migrate` is enabled, the server applies the embedded SQL migrations on startup.
 
-## Server API Endpoints
+## API Endpoints
 
-The LNURL server provides the following endpoints:
+Authenticated routes always require Spark signatures. If `ca_cert` is configured, authenticated routes also require a bearer certificate signed by that CA.
 
 | Group | Method | Path | Description |
 |-------|--------|------|-------------|
@@ -161,60 +188,28 @@ The LNURL server provides the following endpoints:
 | Authenticated | POST | `/lnurlpay/{pubkey}/invoice-paid` | Notify a single paid invoice |
 | Authenticated | POST | `/lnurlpay/{pubkey}/invoices-paid` | Notify paid invoices in batch |
 
-## Example Usage
-
-### Setting Up With SQLite (Development)
-
-```shell
-# Create a local SQLite database with auto-migrations
-./target/release/lnurl --db-url="lnurl.sqlite" --domains="localhost:8080" --auto-migrate --scheme="http"
-```
-
-### Setting Up With PostgreSQL (Production)
-
-```shell
-# Setup PostgreSQL database with auto-migrations
-./target/release/lnurl --db-url="postgres://user:password@localhost:5432/lnurl_db" \
-  --domains="yourdomain.com" \
-  --auto-migrate \
-  --address="0.0.0.0:8080"
-```
-
-### Docker Compose Example
+## Docker Compose Example
 
 ```yaml
-version: '3'
-
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     environment:
-      POSTGRES_USER: lnurl
+      POSTGRES_USER: user
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: lnurl_db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
+      POSTGRES_DB: lnurl
 
   lnurl-server:
-    build:
-      context: .
-      dockerfile: crates/breez-sdk/lnurl/Dockerfile
+    build: .
     environment:
-      LNURL_DB_URL: "postgres://lnurl:password@postgres:5432/lnurl_db"
-      LNURL_DOMAINS: "yourdomain.com"
-      LNURL_AUTO_MIGRATE: "true"
       LNURL_ADDRESS: "0.0.0.0:8080"
+      LNURL_AUTO_MIGRATE: "true"
+      LNURL_DB_URL: "postgres://user:password@postgres:5432/lnurl"
+      LNURL_DOMAINS: "localhost:8080,127.0.0.1:8080"
+      LNURL_NETWORK: "regtest"
+      LNURL_SCHEME: "http"
     ports:
       - "8080:8080"
     depends_on:
       - postgres
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
 ```
-
-## License
-
-See LICENSE in the repository root.
