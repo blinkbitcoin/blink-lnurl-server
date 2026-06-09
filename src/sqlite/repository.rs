@@ -313,7 +313,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              SELECT payment_hash FROM sender_comments WHERE payment_hash IN ({placeholders})"
         );
 
-        let mut q = sqlx::query_scalar::<_, String>(&query);
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(query));
         // Bind three times (once per subquery in the UNION)
         for _ in 0..3 {
             for hash in payment_hashes {
@@ -646,7 +646,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                AND i.preimage IS NOT NULL",
             placeholders.join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for hash in payment_hashes {
             query = query.bind(hash);
         }
@@ -801,7 +801,7 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
             "UPDATE webhook_deliveries SET claimed_at = NULL WHERE id IN ({})",
             placeholders.join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for id in ids {
             query = query.bind(id);
         }
