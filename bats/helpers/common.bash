@@ -7,7 +7,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 E2E_AUTH_BIN="${E2E_AUTH_BIN:-${ROOT_DIR}/target/debug/e2e_auth}"
 
 start_stack() {
-  "${ROOT_DIR}/scripts/start-local-stack.sh"
+  RESET_DB=true "${ROOT_DIR}/scripts/start-local-stack.sh"
 }
 
 stop_stack() {
@@ -16,6 +16,15 @@ stop_stack() {
     pid="$(<"${PID_FILE}")"
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
     fi
     rm -f "${PID_FILE}"
   fi
