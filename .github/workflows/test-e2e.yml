@@ -1,0 +1,31 @@
+name: E2E Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: End to End Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v21
+      - name: Run the Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: actions/checkout@v6
+      - name: Run e2e tests
+        run: |
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt/3"
+            nix develop -c make e2e && break
+            [ $attempt -lt 3 ] && echo "Failed, retrying..." || exit 1
+          done
