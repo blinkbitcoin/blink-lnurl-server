@@ -14,6 +14,8 @@
 #@   "pipeline_tasks_resource",
 #@   "release_task_image_config",
 #@   "rust_task_image_config",
+#@   "slack_resource",
+#@   "slack_resource_type",
 #@   "charts_repo_resource",
 #@   "charts_repo_bot_branch",
 #@ )
@@ -294,6 +296,7 @@ resources:
 - #@ version_resource()
 - #@ gh_release_resource()
 - #@ edge_image_resource()
+- #@ slack_resource()
 - name: latest-image
   type: registry-image
   source:
@@ -304,3 +307,6 @@ resources:
 - #@ charts_repo_resource()
 - #@ charts_repo_bot_branch()
 - #@ docker_host_pool()
+
+resource_types:
+- #@ slack_resource_type()
