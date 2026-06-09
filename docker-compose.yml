@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: lnurl
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d lnurl"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  lnurl-server:
+    build: .
+    environment:
+      LNURL_ADDRESS: 0.0.0.0:8080
+      LNURL_AUTO_MIGRATE: "true"
+      LNURL_DB_URL: postgres://user:password@postgres:5432/lnurl
+      LNURL_DOMAINS: localhost:8080,127.0.0.1:8080
+      LNURL_LOG_LEVEL: info
+      LNURL_NETWORK: regtest
+      LNURL_SCHEME: http
+      LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
