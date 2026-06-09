@@ -15,7 +15,7 @@ Trust model: the user must trust the LNURL server and Spark Service Provider not
 
 ## Development Environment
 
-Use Nix for local dependencies. The flake provides Rust 1.95, protobuf, OpenSSL, Docker Compose, Bats, PostgreSQL tools, cargo-audit, and typos.
+Use Nix for local dependencies. The flake provides stable Rust, protobuf, OpenSSL, Docker Compose, Bats, PostgreSQL tools, cargo-audit, and typos.
 
 With direnv:
 
