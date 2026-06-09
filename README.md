@@ -143,17 +143,23 @@ When `--auto-migrate` is enabled, the server will automatically create the requi
 
 The LNURL server provides the following endpoints:
 
-### Public Endpoints
-
-- `/.well-known/lnurlp/{username}` - LNURL-pay endpoint for Lightning Address handling
-- `/lnurlp/{username}` - Alternative LNURL-pay endpoint 
-- `/lnurlp/{username}/invoice` - Invoice generation endpoint for LNURL-pay
-
-### Authenticated Endpoints (require API key)
-
-- `/lnurlpay/available/{username}` - Check if a username is available
-- `/lnurlpay/{pubkey}` - Register a username (POST) or unregister (DELETE)
-- `/lnurlpay/{pubkey}/recover` - Recover a username registration
+| Group | Method | Path | Description |
+|-------|--------|------|-------------|
+| Public LNURL | GET | `/.well-known/lnurlp/{identifier}` | LNURL-pay endpoint for Lightning Address handling |
+| Public LNURL | GET | `/lnurlp/{identifier}` | Alternative LNURL-pay endpoint |
+| Public LNURL | GET | `/lnurlp/{identifier}/invoice` | Invoice generation endpoint for LNURL-pay |
+| Public | GET | `/verify/{payment_hash}` | LUD-21 invoice verification endpoint |
+| Health | GET | `/health` | Health check endpoint |
+| Webhook | POST | `/webhook` | Spark SSP payment notification webhook |
+| Authenticated | GET | `/lnurlpay/available/{identifier}` | Check if a username is available |
+| Authenticated | POST | `/lnurlpay/{pubkey}` | Register a username |
+| Authenticated | DELETE | `/lnurlpay/{pubkey}` | Unregister a username |
+| Authenticated | POST | `/lnurlpay/{pubkey}/transfer` | Transfer a username to another pubkey |
+| Authenticated | POST | `/lnurlpay/{pubkey}/recover` | Recover a username registration |
+| Authenticated | GET | `/lnurlpay/{pubkey}/metadata` | List LNURL sender comments, zaps, and invoice metadata |
+| Authenticated | POST | `/lnurlpay/{pubkey}/metadata/{payment_hash}/zap` | Publish a zap receipt |
+| Authenticated | POST | `/lnurlpay/{pubkey}/invoice-paid` | Notify a single paid invoice |
+| Authenticated | POST | `/lnurlpay/{pubkey}/invoices-paid` | Notify paid invoices in batch |
 
 ## Example Usage
 
