@@ -52,7 +52,7 @@ if [ ! -x "${LNURL_BIN}" ]; then
   cargo build --locked --bin lnurl
 fi
 
-BREEZ_LNURL_SSP_AUTH_SEED="${BREEZ_LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   "${LNURL_BIN}" \
     --address "${BIND_ADDR}" \
     --auto-migrate \

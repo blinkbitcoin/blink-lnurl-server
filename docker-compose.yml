@@ -14,14 +14,14 @@ services:
   lnurl-server:
     build: .
     environment:
-      BREEZ_LNURL_ADDRESS: 0.0.0.0:8080
-      BREEZ_LNURL_AUTO_MIGRATE: "true"
-      BREEZ_LNURL_DB_URL: postgres://user:password@postgres:5432/lnurl
-      BREEZ_LNURL_DOMAINS: localhost:8080,127.0.0.1:8080
-      BREEZ_LNURL_LOG_LEVEL: info
-      BREEZ_LNURL_NETWORK: regtest
-      BREEZ_LNURL_SCHEME: http
-      BREEZ_LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      LNURL_ADDRESS: 0.0.0.0:8080
+      LNURL_AUTO_MIGRATE: "true"
+      LNURL_DB_URL: postgres://user:password@postgres:5432/lnurl
+      LNURL_DOMAINS: localhost:8080,127.0.0.1:8080
+      LNURL_LOG_LEVEL: info
+      LNURL_NETWORK: regtest
+      LNURL_SCHEME: http
+      LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     depends_on:
       postgres:
         condition: service_healthy

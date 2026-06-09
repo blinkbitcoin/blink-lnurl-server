@@ -135,7 +135,7 @@ async fn main() -> Result<(), anyhow::Error> {
         figment = figment.merge(Toml::file(config_file));
     }
 
-    let args: Args = figment.merge(Env::prefixed("BREEZ_LNURL_")).extract()?;
+    let args: Args = figment.merge(Env::prefixed("LNURL_")).extract()?;
 
     tracing_subscriber::registry()
         .with(EnvFilter::new(&args.log_level))

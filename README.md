@@ -65,9 +65,9 @@ Running the container:
 
 ```shell
 docker run -p 8080:8080 \
-  -e BREEZ_LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl_db" \
-  -e BREEZ_LNURL_DOMAINS="yourdomain.com" \
-  -e BREEZ_LNURL_AUTO_MIGRATE=true \
+  -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl_db" \
+  -e LNURL_DOMAINS="yourdomain.com" \
+  -e LNURL_AUTO_MIGRATE=true \
   lnurl-server
 ```
 
@@ -84,7 +84,7 @@ If you've built the binary, you can run it directly:
 The server can be configured in three ways (in order of precedence):
 
 1. Command-line arguments
-2. Environment variables (prefixed with `BREEZ_LNURL_`)
+2. Environment variables (prefixed with `LNURL_`)
 3. Config file (TOML format)
 
 ### Configuration File
@@ -195,10 +195,10 @@ services:
       context: .
       dockerfile: crates/breez-sdk/lnurl/Dockerfile
     environment:
-      BREEZ_LNURL_DB_URL: "postgres://lnurl:password@postgres:5432/lnurl_db"
-      BREEZ_LNURL_DOMAINS: "yourdomain.com"
-      BREEZ_LNURL_AUTO_MIGRATE: "true"
-      BREEZ_LNURL_ADDRESS: "0.0.0.0:8080"
+      LNURL_DB_URL: "postgres://lnurl:password@postgres:5432/lnurl_db"
+      LNURL_DOMAINS: "yourdomain.com"
+      LNURL_AUTO_MIGRATE: "true"
+      LNURL_ADDRESS: "0.0.0.0:8080"
     ports:
       - "8080:8080"
     depends_on:
