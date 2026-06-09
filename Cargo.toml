@@ -29,7 +29,7 @@ spark-wallet = { git = "https://github.com/breez/spark-sdk", rev = "2c80c32db448
 sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "signal"] }
-tonic = "0.12.3"
+tonic = "0.14.6"
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
