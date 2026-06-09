@@ -16,7 +16,7 @@ clap = { version = "4.5.40", features = ["derive"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
 hex = "0.4.3"
 lightning-invoice = { version = "0.33.2", features = ["std"] }
-nostr = { version = "0.43.1", default-features = false, features = ["std", "nip57"] }
+nostr = { version = "0.44.3", default-features = false, features = ["std", "nip57"] }
 nostr-sdk = { version = "0.43.0", default-features = false, features = ["nip57"] }
 rand = "0.8"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "http2", "charset", "system-proxy", "rustls-tls"] }
