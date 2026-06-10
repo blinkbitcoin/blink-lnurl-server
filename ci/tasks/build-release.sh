@@ -15,6 +15,15 @@ WORKSPACE="$(pwd)"
 export CARGO_HOME="$(pwd)/cargo-home"
 export CARGO_TARGET_DIR="$(pwd)/cargo-target-dir"
 
+REAL_PROTOC="$(command -v protoc)"
+PROTOC_WRAPPER="$(pwd)/protoc"
+cat > "${PROTOC_WRAPPER}" <<EOF
+#!/bin/sh
+exec "${REAL_PROTOC}" --experimental_allow_proto3_optional "\$@"
+EOF
+chmod +x "${PROTOC_WRAPPER}"
+export PROTOC="${PROTOC_WRAPPER}"
+
 [ -f /workspace/.cargo/config ] && cp /workspace/.cargo/config ${CARGO_HOME}/config
 
 pushd ${REPO}
