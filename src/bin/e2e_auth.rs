@@ -8,6 +8,26 @@ async fn sign(signer: &DefaultSigner, message: String) -> Result<String, anyhow:
     Ok(hex::encode(signature.serialize_der()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn auth_payload_includes_deterministic_transfer_signatures() {
+        let payload = build_payload_json("transferuser", 1).await.unwrap();
+
+        assert!(payload["pubkey"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(payload["to_pubkey"].as_str().is_some_and(|value| !value.is_empty()));
+        assert_ne!(payload["pubkey"], payload["to_pubkey"]);
+        assert!(payload["transfer_from_signature"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(payload["transfer_to_signature"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let username = std::env::args()
