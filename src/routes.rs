@@ -1,3 +1,4 @@
+use crate::identifier::{IdentifierError, canonical_spark_username, parse_public_identifier};
 use crate::models::{
     CheckUsernameAvailableResponse, InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest,
     ListMetadataResponse, PublishZapReceiptRequest, PublishZapReceiptResponse,
@@ -19,7 +20,6 @@ use bitcoin::{
 };
 use lightning_invoice::Bolt11Invoice;
 use nostr::{Alphabet, Event, EventBuilder, JsonUtil, Kind, TagStandard, key::Keys};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::marker::PhantomData;
@@ -37,7 +37,7 @@ use crate::{
 use crate::{
     repository::{LnurlRepository, LnurlRepositoryError},
     state::State,
-    user::{USERNAME_VALIDATION_REGEX, User},
+    user::User,
 };
 
 const ACCEPTABLE_TIME_DIFF_SECS: u64 = 600;
@@ -116,8 +116,7 @@ where
         Path(identifier): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&identifier);
-        validate_username(&username)?;
+        let username = canonical_spark_username_for_route(&identifier)?;
         let user = state
             .db
             .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
@@ -141,8 +140,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterLnurlPayRequest>,
     ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
-        validate_username(&username)?;
+        let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
             &payload.signature,
@@ -190,8 +188,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<TransferLnurlPayRequest>,
     ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
-        validate_username(&username)?;
+        let username = canonical_spark_username_for_route(&payload.username)?;
         validate_description(&payload.description)?;
 
         let message = format!("transfer:{username}-{to_pubkey}");
@@ -641,7 +638,13 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let username = sanitize_username(&identifier);
+        let Some(username) = public_lookup_username(&identifier).map_err(|e| {
+            trace!("invalid public identifier '{identifier}': {e:?}");
+            lnurl_error("invalid identifier")
+        })?
+        else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
         let user = state
             .db
             .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
@@ -694,7 +697,13 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let username = sanitize_username(&identifier);
+        let Some(username) = public_lookup_username(&identifier).map_err(|e| {
+            trace!("invalid public identifier '{identifier}': {e:?}");
+            lnurl_error("invalid identifier")
+        })?
+        else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
         let domain = sanitize_domain(&state, &host).await?;
         let user = state
             .db
@@ -1294,31 +1303,48 @@ fn validate_nostr_zap_request(
     Ok(())
 }
 
-fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    if username.chars().take(65).count() > 64 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("username too long".into())),
-        ));
-    }
-
-    let regex = Regex::new(USERNAME_VALIDATION_REGEX).map_err(|e| {
-        error!("failed to compile regex: {}", e);
+fn canonical_spark_username_for_route(username: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    canonical_spark_username(username).map_err(|e| {
+        trace!("invalid Spark username: {e:?}");
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Value::String("internal server error".into())),
-        )
-    })?;
-
-    if !regex.is_match(username) {
-        trace!("invalid username doesn't match regex");
-        return Err((
             StatusCode::BAD_REQUEST,
             Json(Value::String("invalid username".into())),
-        ));
+        )
+    })
+}
+
+#[cfg(test)]
+fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    canonical_spark_username_for_route(username).map(|_| ())
+}
+
+fn public_lookup_username(identifier: &str) -> Result<Option<String>, IdentifierError> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return Err(IdentifierError::EmptyIdentifier);
     }
 
-    Ok(())
+    match parse_public_identifier(trimmed) {
+        Ok(parsed) => Ok(Some(parsed.canonical)),
+        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
+            Ok(Some(sanitize_username(trimmed)))
+        }
+        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_legacy_spark_lookup_candidate(identifier: &str) -> bool {
+    !is_phone_like_public_identifier(identifier)
+        && !identifier.char_indices().skip(1).any(|(_, ch)| ch == '+')
+}
+
+fn is_phone_like_public_identifier(identifier: &str) -> bool {
+    identifier.starts_with('+')
+        || identifier.starts_with("00")
+        || identifier.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn validate_description(description: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -1840,19 +1866,34 @@ mod tests {
 
     #[test]
     fn public_lookup_identifier_keeps_legacy_names_but_blocks_phone_like_fallback() {
-        assert_eq!(public_lookup_username("legacy.name"), Ok(Some("legacy.name".to_string())));
+        assert_eq!(
+            public_lookup_username("legacy.name"),
+            Ok(Some("legacy.name".to_string()))
+        );
 
-        for phone_like in ["12345", "573005871212", "+573005871212", "00573005871212"] {
+        for phone_like in ["12345", "3005871212"] {
             assert_eq!(public_lookup_username(phone_like), Ok(None));
+        }
+        for phone_like in ["573005871212", "+573005871212", "00573005871212"] {
+            assert_eq!(
+                public_lookup_username(phone_like),
+                Ok(Some("+573005871212".to_string()))
+            );
         }
     }
 
     #[test]
     fn public_lookup_identifier_strips_recognized_modifiers_and_rejects_others() {
-        assert_eq!(public_lookup_username("alice+BTC"), Ok(Some("alice".to_string())));
+        assert_eq!(
+            public_lookup_username("alice+BTC"),
+            Ok(Some("alice".to_string()))
+        );
 
         for invalid in ["alice+eur", "alice+btc+usd"] {
-            assert_eq!(public_lookup_username(invalid), Err(crate::identifier::IdentifierError::InvalidModifier));
+            assert_eq!(
+                public_lookup_username(invalid),
+                Err(crate::identifier::IdentifierError::InvalidModifier)
+            );
         }
     }
 

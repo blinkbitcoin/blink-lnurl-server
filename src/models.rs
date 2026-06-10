@@ -112,6 +112,8 @@ pub struct PublishZapReceiptResponse {
     pub zap_receipt: String,
 }
 
+/// Legacy Spark lookup sanitizer: trim and lowercase without enforcing Blink
+/// Core username rules. New create/update validation uses `canonical_spark_username`.
 pub fn sanitize_username(username: &str) -> String {
     username.trim().to_lowercase()
 }

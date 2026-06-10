@@ -105,7 +105,10 @@ fn split_final_wallet_modifier(
         return Ok((value, None));
     };
 
-    let suffix = &value[plus_index + 1..];
+    let suffix_start = plus_index
+        .checked_add(1)
+        .ok_or(IdentifierError::InvalidModifier)?;
+    let suffix = &value[suffix_start..];
     let wallet = if suffix.eq_ignore_ascii_case("btc") {
         WalletModifier::Btc
     } else if suffix.eq_ignore_ascii_case("usd") {
@@ -127,7 +130,7 @@ fn is_phone_like(value: &str) -> bool {
 }
 
 fn matches_blink_username_regex(value: &str) -> bool {
-    let _blink_core_pattern = BLINK_USERNAME_REGEX;
+    let _ = BLINK_USERNAME_REGEX;
     let lower = value.to_lowercase();
     let len = lower.chars().count();
 
