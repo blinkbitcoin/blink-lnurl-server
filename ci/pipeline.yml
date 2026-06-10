@@ -1,0 +1,316 @@
+#@ load("@ytt:data", "data")
+
+#@ load("vendor/pipeline-fragments.lib.yml",
+#@   "build_edge_image",
+#@   "public_docker_registry",
+#@   "nodejs_task_image_config",
+#@   "rust_check_code",
+#@   "docker_host_pool",
+#@   "run_on_nix_host",
+#@   "repo_resource",
+#@   "edge_image_resource",
+#@   "version_resource",
+#@   "gh_release_resource",
+#@   "pipeline_tasks_resource",
+#@   "release_task_image_config",
+#@   "rust_task_image_config",
+#@   "slack_resource",
+#@   "slack_resource_type",
+#@   "charts_repo_resource",
+#@   "charts_repo_bot_branch",
+#@ )
+
+groups:
+- name: blink-lnurl-server
+  jobs:
+  - check-code
+  - integration-tests
+  - e2e-tests
+  - release
+  - release-docker
+  - set-dev-version
+  - bump-image-in-chart
+  - build-edge-image
+
+jobs:
+- #@ rust_check_code()
+- #@ run_on_nix_host("integration-tests", "make test-in-ci")
+- #@ run_on_nix_host("e2e-tests", "make e2e")
+
+- #@ build_edge_image()
+
+- name: release
+  serial: true
+  plan:
+  - in_parallel:
+    - get: repo
+      passed:
+      - integration-tests
+      - e2e-tests
+      - check-code
+    - get: pipeline-tasks
+    - get: version
+  - task: prep-release
+    config:
+      platform: linux
+      image_resource: #@ release_task_image_config()
+      inputs:
+      - name: pipeline-tasks
+      - name: repo
+      - name: version
+      outputs:
+      - name: version
+      - name: artifacts
+      run:
+        path: pipeline-tasks/ci/vendor/tasks/prep-release-src.sh
+  - task: update-repo
+    config:
+      platform: linux
+      image_resource: #@ rust_task_image_config()
+      inputs:
+      - name: artifacts
+      - name: pipeline-tasks
+      - name: repo
+      - name: version
+      outputs:
+      - name: repo
+      run:
+        path: pipeline-tasks/ci/tasks/update-repo.sh
+  - in_parallel:
+    - task: build-osx-release
+      privileged: true
+      config:
+        platform: linux
+        image_resource:
+          type: registry-image
+          source:
+            username: #@ data.values.osxcross_docker_username
+            password: #@ data.values.osxcross_docker_password
+            repository: #@ data.values.osxcross_repository
+        inputs:
+        - name: version
+        - name: pipeline-tasks
+        - name: repo
+        outputs:
+        - name: x86_64-apple-darwin
+        caches:
+        - path: cargo-home
+        - path: cargo-target-dir
+        params:
+          TARGET: x86_64-apple-darwin
+          OUT: x86_64-apple-darwin
+        run:
+          path: pipeline-tasks/ci/tasks/build-release.sh
+    - task: build-static-release
+      privileged: true
+      config:
+        platform: linux
+        image_resource:
+          type: registry-image
+          source: { repository: clux/muslrust, tag: 1.70.0-stable }
+        inputs:
+        - name: version
+        - name: pipeline-tasks
+        - name: repo
+        outputs:
+        - name: x86_64-unknown-linux-musl
+        caches:
+        - path: cargo-home
+        - path: cargo-target-dir
+        params:
+          TARGET: x86_64-unknown-linux-musl
+          OUT: x86_64-unknown-linux-musl
+        run:
+          path: pipeline-tasks/ci/tasks/build-release.sh
+  - put: repo
+    params:
+      tag: artifacts/gh-release-tag
+      repository: repo
+      merge: true
+  - task: github-release
+    config:
+      image_resource: #@ rust_task_image_config()
+      platform: linux
+      inputs:
+      - name: x86_64-apple-darwin
+      - name: x86_64-unknown-linux-musl
+      - name: version
+      - name: pipeline-tasks
+      - name: artifacts
+      outputs:
+      - name: artifacts
+      params:
+        BRANCH: #@ data.values.git_branch
+      run:
+        path: pipeline-tasks/ci/tasks/github-release.sh
+  - put: gh-release
+    params:
+      name: artifacts/gh-release-name
+      tag: artifacts/gh-release-tag
+      body: artifacts/gh-release-notes.md
+      globs: [artifacts/binaries/*]
+  - put: version
+    params:
+      file: version/version
+
+- name: release-docker
+  serial: true
+  plan:
+  - in_parallel:
+    - get: repo
+      passed:
+      - release
+    - get: version
+      passed:
+      - release
+      trigger: true
+    - get: pipeline-tasks
+  - task: prepare-docker-build
+    config:
+      platform: linux
+      image_resource: #@ rust_task_image_config()
+      inputs:
+      - name: pipeline-tasks
+      - name: version
+      - name: repo
+      outputs:
+      - name: repo
+      run:
+        path: pipeline-tasks/ci/tasks/prep-docker-build-env.sh
+  - task: build
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: gcr.io/kaniko-project/executor
+          tag: debug
+      inputs:
+      - name: repo
+      outputs:
+      - name: image
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          /kaniko/executor \
+            --dockerfile=repo/Dockerfile \
+            --context=repo \
+            $(awk -F= '{print "--build-arg="$1"="$2}' repo/.env) \
+            --use-new-run \
+            --single-snapshot \
+            --cache=false \
+            --no-push \
+            --tar-path=image/image.tar
+  - put: latest-image
+    params:
+      image: image/image.tar
+      additional_tags: version/version
+
+- name: set-dev-version
+  plan:
+  - in_parallel:
+    - { get: repo, passed: [release] }
+    - { get: pipeline-tasks }
+    - get: version
+      trigger: true
+      params: { bump: patch }
+      passed: [release]
+  - task: set-dev-version
+    config:
+      image_resource: #@ release_task_image_config()
+      platform: linux
+      inputs:
+      - name: version
+      - name: repo
+      - name: pipeline-tasks
+      outputs:
+      - name: repo
+      run:
+        path: pipeline-tasks/ci/tasks/set-dev-version.sh
+      params:
+        BRANCH: #@ data.values.git_branch
+  - put: repo
+    params:
+      repository: repo
+      rebase: true
+
+- name: bump-image-in-chart
+  plan:
+  - in_parallel:
+    - get: latest-image
+      passed: [ release-docker ]
+      params: { skip_download: true }
+    - get: repo
+      trigger: true
+      passed: [ release-docker ]
+    - get: version
+      trigger: true
+      passed: [ release-docker ]
+    - get: charts-repo
+      params: { skip_download: true }
+    - get: pipeline-tasks
+  - task: bump-image-digest-in-values
+    config:
+      platform: linux
+      image_resource: #@ nodejs_task_image_config()
+      inputs:
+      - name: repo
+      - name: latest-image
+      - name: pipeline-tasks
+      - name: charts-repo
+      - name: version
+      outputs:
+        - name: charts-repo
+      params:
+        BRANCH: #@ data.values.git_charts_branch
+        CHARTS_SUBDIR: #@ data.values.gh_repository
+      run:
+        path: pipeline-tasks/ci/tasks/bump-image-digest.sh
+  - put: charts-repo-bot-branch
+    params:
+      repository: charts-repo
+      force: true
+  - task: open-charts-pr
+    config:
+      platform: linux
+      image_resource: #@ nodejs_task_image_config()
+      inputs:
+      - name: pipeline-tasks
+      - name: latest-image
+      - name: charts-repo
+      - name: repo
+      params:
+        GH_APP_ID: #@ data.values.github_app_id
+        GH_APP_PRIVATE_KEY: #@ data.values.github_app_private_key
+        BRANCH: #@ data.values.git_charts_branch
+        BOT_BRANCH: #@ data.values.git_charts_bot_branch
+        CHARTS_SUBDIR: #@ data.values.gh_repository
+      run:
+        path: pipeline-tasks/ci/tasks/open-charts-pr.sh
+
+resources:
+- #@ repo_resource(True)
+- #@ pipeline_tasks_resource()
+- #@ version_resource()
+- #@ gh_release_resource()
+- #@ edge_image_resource()
+#@ if not data.values.disable_notifications:
+- #@ slack_resource()
+#@ end
+- name: latest-image
+  type: registry-image
+  source:
+    tag: latest
+    username: #@ data.values.docker_registry_user
+    password: #@ data.values.docker_registry_password
+    repository: #@ public_docker_registry() + "/" + data.values.gh_repository
+- #@ charts_repo_resource()
+- #@ charts_repo_bot_branch()
+- #@ docker_host_pool()
+
+#@ if not data.values.disable_notifications:
+resource_types:
+- #@ slack_resource_type()
+#@ end
