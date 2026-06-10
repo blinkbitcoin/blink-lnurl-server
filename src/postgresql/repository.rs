@@ -1,7 +1,10 @@
 use crate::models::ListMetadataMetadata;
 use sqlx::{PgPool, Row};
 
-use crate::repository::{Invoice, LnurlSenderComment, PendingZapReceipt, WebhookPayloadData};
+use crate::repository::{
+    Account, AccountIdentifierKind, AccountProvider, Invoice, LnurlSenderComment,
+    PendingZapReceipt, ResolvedRecipient, WalletKind, WebhookPayloadData,
+};
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
 };
@@ -21,6 +24,68 @@ impl LnurlRepository {
     pub fn new(pool: PgPool) -> Self {
         LnurlRepository { pool }
     }
+}
+
+fn map_resolved_recipient(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ResolvedRecipient, LnurlRepositoryError> {
+    let provider = AccountProvider::from_database_value(row.try_get("provider")?)?;
+    let identifier_kind =
+        AccountIdentifierKind::from_database_value(row.try_get("identifier_kind")?)?;
+    let spark_pubkey: Option<String> = row.try_get("spark_pubkey")?;
+    let blink_account_id: Option<String> = row.try_get("blink_account_id")?;
+    let btc_wallet_id: Option<String> = row.try_get("btc_wallet_id")?;
+    let usd_wallet_id: Option<String> = row.try_get("usd_wallet_id")?;
+    let default_wallet = row
+        .try_get::<Option<String>, _>("default_wallet")?
+        .map(|wallet| WalletKind::from_database_value(&wallet))
+        .transpose()?;
+
+    match provider {
+        AccountProvider::Spark => {
+            if spark_pubkey.is_none()
+                || blink_account_id.is_some()
+                || btc_wallet_id.is_some()
+                || usd_wallet_id.is_some()
+                || default_wallet.is_some()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+        }
+        AccountProvider::Blink => {
+            if spark_pubkey.is_some()
+                || blink_account_id.is_none()
+                || btc_wallet_id.is_none()
+                || usd_wallet_id.is_none()
+                || default_wallet.is_none()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+        }
+    }
+
+    Ok(ResolvedRecipient {
+        account_id: row.try_get("account_id")?,
+        provider,
+        domain: row.try_get("domain")?,
+        identifier: row.try_get("identifier")?,
+        identifier_kind,
+        description: row.try_get("description")?,
+        spark_pubkey,
+        blink_account_id,
+        btc_wallet_id,
+        usd_wallet_id,
+        default_wallet,
+    })
+}
+
+fn map_account(row: &sqlx::postgres::PgRow) -> Result<Account, LnurlRepositoryError> {
+    Ok(Account {
+        account_id: row.try_get("account_id")?,
+        provider: AccountProvider::from_database_value(row.try_get("provider")?)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 #[async_trait::async_trait]
@@ -103,6 +168,70 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn resolve_recipient_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT a.account_id AS account_id
+             ,      a.provider AS provider
+             ,      ai.domain AS domain
+             ,      ai.identifier AS identifier
+             ,      ai.identifier_kind AS identifier_kind
+             ,      ai.description AS description
+             ,      s.pubkey AS spark_pubkey
+             ,      b.blink_account_id AS blink_account_id
+             ,      b.btc_wallet_id AS btc_wallet_id
+             ,      b.usd_wallet_id AS usd_wallet_id
+             ,      b.default_wallet AS default_wallet
+             FROM account_identifiers ai
+             JOIN accounts a ON a.account_id = ai.account_id
+             LEFT JOIN spark_accounts s ON s.account_id = a.account_id
+             LEFT JOIN blink_accounts b ON b.account_id = a.account_id
+             WHERE ai.domain = $1 AND ai.identifier = $2",
+        )
+        .bind(domain)
+        .bind(identifier)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_resolved_recipient(&row))
+        .transpose()
+    }
+
+    async fn get_account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT account_id, provider, created_at, updated_at
+             FROM accounts
+             WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_account(&row))
+        .transpose()
+    }
+
+    async fn get_account_by_spark_pubkey(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT a.account_id, a.provider, a.created_at, a.updated_at
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_account(&row))
+        .transpose()
     }
 
     async fn transfer_username(
@@ -841,5 +970,97 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(|e| WebhookRepositoryError::General(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod provider_neutral_tests {
+    use super::LnurlRepository;
+    use crate::repository::{AccountProvider, LnurlRepository as _};
+    use crate::time::now;
+
+    async fn setup_test_db() -> Option<(sqlx::PgPool, LnurlRepository)> {
+        let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        crate::postgresql::run_migrations(&pool).await.ok()?;
+        let db = LnurlRepository::new(pool.clone());
+        Some((pool, db))
+    }
+
+    #[tokio::test]
+    async fn lookup_by_identifier_account_id_and_spark_pubkey_round_trips() {
+        let Some((pool, db)) = setup_test_db().await else {
+            return;
+        };
+        let now = now();
+        let account_id = "acct_spark_pg_lookup_task1";
+
+        sqlx::query(
+            "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT(account_id) DO UPDATE
+             SET provider = excluded.provider
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(account_id)
+        .bind(AccountProvider::Spark.as_str())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT(account_id) DO UPDATE
+             SET pubkey = excluded.pubkey
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(account_id)
+        .bind("spark_pg_lookup_task1_pubkey")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)
+             ON CONFLICT(account_id, domain, identifier) DO UPDATE
+             SET identifier_kind = excluded.identifier_kind
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(account_id)
+        .bind("pg-lookup.example.com")
+        .bind("erin")
+        .bind("username")
+        .bind("lookup")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("pg-lookup.example.com", "erin")
+            .await
+            .unwrap()
+            .expect("identifier lookup should find account");
+        let by_id = db
+            .get_account_by_id(account_id)
+            .await
+            .unwrap()
+            .expect("account id lookup should find account");
+        let by_pubkey = db
+            .get_account_by_spark_pubkey("spark_pg_lookup_task1_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark pubkey lookup should find account");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Spark);
+        assert_eq!(
+            recipient.spark_pubkey.as_deref(),
+            Some("spark_pg_lookup_task1_pubkey")
+        );
+        assert_eq!(by_id.account_id, account_id);
+        assert_eq!(by_pubkey.account_id, account_id);
     }
 }
