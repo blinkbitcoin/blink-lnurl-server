@@ -160,6 +160,68 @@ unregister_user_status() {
     "${BASE_URL}/lnurlpay/${pubkey}"
 }
 
+transfer_user() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local description="${3:-Transferred LNURL user}"
+  local auth
+  local from_pubkey
+  local to_pubkey
+  local from_signature
+  local to_signature
+
+  auth="$(auth_payload "${username}")"
+  from_pubkey="$(json_get "${auth}" '.pubkey')"
+  to_pubkey="$(json_get "${auth}" '.to_pubkey')"
+  from_signature="$(json_get "${auth}" '.transfer_from_signature')"
+  to_signature="$(json_get "${auth}" '.transfer_to_signature')"
+
+  curl -fsS \
+    --header "Host: ${host}" \
+    --header "Content-Type: application/json" \
+    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
+    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer" | jq -cer '.'
+}
+
+transfer_user_status() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local description="${3:?description is required}"
+  local from_signature="${4:?from signature is required}"
+  local to_signature="${5:?to signature is required}"
+  local from_pubkey="${6:?from pubkey is required}"
+  local to_pubkey="${7:?to pubkey is required}"
+
+  curl -sS -o /dev/null -w "%{http_code}" \
+    --header "Host: ${host}" \
+    --header "Content-Type: application/json" \
+    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
+    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer"
+}
+
+http_status_body() {
+  local method="${1:?method is required}"
+  local url="${2:?url is required}"
+  local host="${3:?host is required}"
+  local data="${4:-}"
+
+  if [ -n "${data}" ]; then
+    curl -sS \
+      --request "${method}" \
+      --header "Host: ${host}" \
+      --header "Content-Type: application/json" \
+      --data "${data}" \
+      --write-out $'\n%{http_code}' \
+      "${url}"
+  else
+    curl -sS \
+      --request "${method}" \
+      --header "Host: ${host}" \
+      --write-out $'\n%{http_code}' \
+      "${url}"
+  fi
+}
+
 username_available() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
