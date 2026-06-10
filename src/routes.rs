@@ -1821,6 +1821,41 @@ mod tests {
 
     // -- Tests -----------------------------------------------------------------
 
+    fn assert_bad_username(result: Result<(), (StatusCode, Json<Value>)>) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected invalid username error");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String("invalid username".to_string()));
+    }
+
+    #[test]
+    fn create_update_username_validation_uses_blink_rules_after_trim() {
+        assert!(validate_username(&sanitize_username(" Alice_123 ")).is_ok());
+
+        for invalid in ["", "   ", " alice+foo ", " 12345 ", " bc1alice "] {
+            assert_bad_username(validate_username(&sanitize_username(invalid)));
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_keeps_legacy_names_but_blocks_phone_like_fallback() {
+        assert_eq!(public_lookup_username("legacy.name"), Ok(Some("legacy.name".to_string())));
+
+        for phone_like in ["12345", "573005871212", "+573005871212", "00573005871212"] {
+            assert_eq!(public_lookup_username(phone_like), Ok(None));
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_strips_recognized_modifiers_and_rejects_others() {
+        assert_eq!(public_lookup_username("alice+BTC"), Ok(Some("alice".to_string())));
+
+        for invalid in ["alice+eur", "alice+btc+usd"] {
+            assert_eq!(public_lookup_username(invalid), Err(crate::identifier::IdentifierError::InvalidModifier));
+        }
+    }
+
     #[tokio::test]
     async fn webhook_valid_payment_marks_invoice_paid() {
         let repo = setup_repo_with_invoice(TEST_PREIMAGE_HEX, TEST_RECEIVER_PUBKEY);
