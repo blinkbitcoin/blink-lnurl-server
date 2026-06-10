@@ -1,0 +1,17 @@
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+
+# Relative to ci/
+directories:
+  - path: ./vendor
+    contents:
+      - path: .
+        git:
+          url: https://github.com/blinkbitcoin/concourse-shared.git
+          ref: 8abc39e9e056b79b774007e6fadc40ca5d92c2e5
+        includePaths:
+          - shared/ci/**/*
+        excludePaths:
+          - shared/ci/**/nodejs-*
+          - shared/ci/**/tofu-*
+        newRootPath: shared/ci

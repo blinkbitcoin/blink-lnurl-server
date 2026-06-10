@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -e
+
+if [[ $(which ytt) == "" ]]; then
+  echo "You will need to install ytt to repipe. https://carvel.dev/ytt/"
+  exit 1
+fi
+
+target="${FLY_TARGET:-galoy}"
+team=dev
+
+TMPDIR=""
+TMPDIR=$(mktemp -d -t repipe.XXXXXX)
+trap "rm -rf ${TMPDIR}" INT TERM QUIT EXIT
+
+mkdir -p ${TMPDIR}/ytt/vendor
+cp ci/pipeline.yml ${TMPDIR}/ytt/pipeline.yml
+cp ci/values.yml ${TMPDIR}/ytt/values.yml
+cp ci/vendor/pipeline-fragments.lib.yml ${TMPDIR}/ytt/vendor/pipeline-fragments.lib.yml
+
+ytt -f ${TMPDIR}/ytt > ${TMPDIR}/pipeline.yml
+
+echo "Updating pipeline @ ${target}"
+
+fly -t ${target} set-pipeline --team=${team} -p blink-lnurl-server -c ${TMPDIR}/pipeline.yml
+fly -t ${target} unpause-pipeline --team=${team} -p blink-lnurl-server
