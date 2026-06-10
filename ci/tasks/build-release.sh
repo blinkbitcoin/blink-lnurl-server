@@ -15,10 +15,20 @@ WORKSPACE="$(pwd)"
 export CARGO_HOME="$(pwd)/cargo-home"
 export CARGO_TARGET_DIR="$(pwd)/cargo-target-dir"
 
+for dir in /usr/include /usr/local/include; do
+  if [[ -z "${PROTOC_INCLUDE:-}" && -f "${dir}/google/protobuf/timestamp.proto" ]]; then
+    export PROTOC_INCLUDE="${dir}"
+  fi
+done
+export PROTOC_INCLUDE_DIR="${PROTOC_INCLUDE_DIR:-${PROTOC_INCLUDE:-}}"
+
 REAL_PROTOC="$(command -v protoc)"
 PROTOC_WRAPPER="$(pwd)/protoc"
 cat > "${PROTOC_WRAPPER}" <<EOF
 #!/bin/sh
+if [ -n "\${PROTOC_INCLUDE:-}" ]; then
+  exec "${REAL_PROTOC}" --experimental_allow_proto3_optional -I"\${PROTOC_INCLUDE}" "\$@"
+fi
 exec "${REAL_PROTOC}" --experimental_allow_proto3_optional "\$@"
 EOF
 chmod +x "${PROTOC_WRAPPER}"
