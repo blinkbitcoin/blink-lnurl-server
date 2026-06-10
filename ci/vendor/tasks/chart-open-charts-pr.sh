@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #! Auto synced from Shared CI Resources repository
-#! Don't change this file, instead change it in github.com/GaloyMoney/concourse-shared
+#! Don't change this file, instead change it in github.com/blinkbitcoin/concourse-shared
 
 set -eu
 
@@ -26,7 +26,7 @@ ${digest}
 
 Code diff contained in this image:
 
-https://github.com/GaloyMoney/${CHARTS_SUBDIR}/compare/${old_ref}...${ref}
+https://github.com/blinkbitcoin/${CHARTS_SUBDIR}/compare/${old_ref}...${ref}
 EOF
 
 gh pr close ${BOT_BRANCH} || true
@@ -35,5 +35,5 @@ gh pr create \
   --body-file ../body.md \
   --base ${BRANCH} \
   --head ${BOT_BRANCH} \
-  --label galoybot \
+  --label blinkbitcoinbot \
   --label ${CHARTS_SUBDIR}

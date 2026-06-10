@@ -6,7 +6,7 @@
 #@   "nodejs_task_image_config",
 #@   "rust_check_code",
 #@   "docker_host_pool",
-#@   "test_on_docker_host",
+#@   "run_on_nix_host",
 #@   "repo_resource",
 #@   "edge_image_resource",
 #@   "version_resource",
@@ -34,8 +34,8 @@ groups:
 
 jobs:
 - #@ rust_check_code()
-- #@ test_on_docker_host("integration-tests")
-- #@ test_on_docker_host("e2e-tests")
+- #@ run_on_nix_host("integration-tests", "make test-in-ci")
+- #@ run_on_nix_host("e2e-tests", "make e2e")
 
 - #@ build_edge_image()
 
@@ -296,7 +296,9 @@ resources:
 - #@ version_resource()
 - #@ gh_release_resource()
 - #@ edge_image_resource()
+#@ if not data.values.disable_notifications:
 - #@ slack_resource()
+#@ end
 - name: latest-image
   type: registry-image
   source:
@@ -308,5 +310,7 @@ resources:
 - #@ charts_repo_bot_branch()
 - #@ docker_host_pool()
 
+#@ if not data.values.disable_notifications:
 resource_types:
 - #@ slack_resource_type()
+#@ end

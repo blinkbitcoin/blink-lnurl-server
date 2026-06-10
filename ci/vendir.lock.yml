@@ -2,8 +2,8 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - git:
-      commitTitle: 'fix: check-code executable'
-      sha: cfd07211efb7ef9c986020d1d24069c820fd1717
+      commitTitle: 'feat: wire up PARAMS_KEYS in run_on_nix_host ytt function (#26)...'
+      sha: 8abc39e9e056b79b774007e6fadc40ca5d92c2e5
     path: .
   path: ./vendor
 kind: LockConfig

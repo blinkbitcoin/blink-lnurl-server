@@ -8,9 +8,10 @@ directories:
       - path: .
         git:
           url: https://github.com/blinkbitcoin/concourse-shared.git
-          ref: cfd07211efb7ef9c986020d1d24069c820fd1717
+          ref: 8abc39e9e056b79b774007e6fadc40ca5d92c2e5
         includePaths:
           - shared/ci/**/*
         excludePaths:
           - shared/ci/**/nodejs-*
+          - shared/ci/**/tofu-*
         newRootPath: shared/ci
