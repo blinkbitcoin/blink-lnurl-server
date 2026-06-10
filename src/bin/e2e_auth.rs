@@ -38,6 +38,27 @@ async fn build_payload_json(
     }))
 }
 
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let username = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "alice".to_string());
+    let timestamp = std::env::args()
+        .nth(2)
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is before unix epoch")
+                .as_secs()
+        });
+
+    println!("{}", build_payload_json(&username, timestamp).await?);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,25 +89,4 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let username = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "alice".to_string());
-    let timestamp = std::env::args()
-        .nth(2)
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before unix epoch")
-                .as_secs()
-        });
-
-    println!("{}", build_payload_json(&username, timestamp).await?);
-
-    Ok(())
 }
