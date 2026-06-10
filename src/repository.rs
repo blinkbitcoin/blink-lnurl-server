@@ -764,7 +764,10 @@ pub mod shared_tests {
         assert_eq!(zap.account_id.as_deref(), Some(account_id.as_str()));
         assert_eq!(zap.user_pubkey, "spark_side_effect_pubkey");
 
-        let webhook_payloads = db.get_webhook_payloads(&[payment_hash]).await.unwrap();
+        let webhook_payloads = db
+            .get_webhook_payloads(&[payment_hash.clone()])
+            .await
+            .unwrap();
         let webhook_payload = webhook_payloads
             .first()
             .expect("paid invoice should be eligible for webhook payloads");
@@ -775,6 +778,72 @@ pub mod shared_tests {
         assert_eq!(
             webhook_payload.sender_comment.as_deref(),
             Some("provider-neutral comment")
+        );
+
+        db.upsert_invoice(&Invoice {
+            account_id: None,
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            invoice: "lnbc1sideeffect-updated".to_string(),
+            preimage: Some("side_effect_preimage".to_string()),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now.saturating_add(1),
+            domain: Some("effects.example.com".to_string()),
+            amount_received_sat: Some(21),
+        })
+        .await
+        .unwrap();
+        db.upsert_zap(&Zap {
+            account_id: None,
+            payment_hash: payment_hash.clone(),
+            zap_request: r#"{"kind":9734}"#.to_string(),
+            zap_event: Some(r#"{"kind":9735}"#.to_string()),
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            invoice_expiry: i64::MAX,
+            updated_at: now.saturating_add(1),
+            is_user_nostr_key: false,
+        })
+        .await
+        .unwrap();
+        db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: None,
+            comment: "legacy comment update".to_string(),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            updated_at: now.saturating_add(1),
+        })
+        .await
+        .unwrap();
+
+        let updated_invoice = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("updated invoice should round-trip");
+        assert_eq!(
+            updated_invoice.account_id.as_deref(),
+            Some(account_id.as_str()),
+            "legacy invoice updates must not clear existing provider-neutral ownership"
+        );
+        let updated_zap = db
+            .get_zap_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("updated zap should round-trip");
+        assert_eq!(
+            updated_zap.account_id.as_deref(),
+            Some(account_id.as_str()),
+            "legacy zap updates must not clear existing provider-neutral ownership"
+        );
+        let updated_webhook_payloads = db.get_webhook_payloads(&[payment_hash]).await.unwrap();
+        let updated_webhook_payload = updated_webhook_payloads
+            .first()
+            .expect("updated paid invoice should remain eligible for webhook payloads");
+        assert_eq!(
+            updated_webhook_payload.account_id.as_deref(),
+            Some(account_id.as_str()),
+            "legacy comment updates must not clear webhook ownership context"
         );
     }
 }
