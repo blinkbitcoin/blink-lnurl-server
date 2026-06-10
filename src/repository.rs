@@ -185,3 +185,312 @@ pub struct WebhookPayloadData {
     pub sender_comment: Option<String>,
     pub domain: String,
 }
+
+#[cfg(test)]
+pub mod provider_neutral_schema_tests {
+    use sqlx::{Row, SqlitePool};
+
+    const ACCOUNT_TABLES: &[&str] = &[
+        "accounts",
+        "account_identifiers",
+        "spark_accounts",
+        "blink_accounts",
+    ];
+
+    const SIDE_EFFECT_TABLES: &[&str] = &["invoices", "zaps", "sender_comments"];
+
+    struct TableExpectation<'a> {
+        name: &'a str,
+        required_columns: &'a [&'a str],
+        forbidden_columns: &'a [&'a str],
+    }
+
+    const ACCOUNT_EXPECTATIONS: &[TableExpectation<'_>] = &[
+        TableExpectation {
+            name: "accounts",
+            required_columns: &["account_id", "provider", "created_at", "updated_at"],
+            forbidden_columns: &["description", "deleted_at"],
+        },
+        TableExpectation {
+            name: "account_identifiers",
+            required_columns: &[
+                "account_id",
+                "domain",
+                "identifier",
+                "identifier_kind",
+                "description",
+                "created_at",
+                "updated_at",
+            ],
+            forbidden_columns: &["deleted_at"],
+        },
+        TableExpectation {
+            name: "spark_accounts",
+            required_columns: &["account_id", "pubkey", "created_at", "updated_at"],
+            forbidden_columns: &["deleted_at"],
+        },
+        TableExpectation {
+            name: "blink_accounts",
+            required_columns: &[
+                "account_id",
+                "blink_account_id",
+                "btc_wallet_id",
+                "usd_wallet_id",
+                "default_wallet",
+                "created_at",
+                "updated_at",
+            ],
+            forbidden_columns: &["deleted_at"],
+        },
+    ];
+
+    #[tokio::test]
+    async fn sqlite_provider_neutral_schema_migrates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        crate::sqlite::run_migrations(&pool).await.unwrap();
+
+        provider_neutral_schema_migrates(SqlSchema::Sqlite(&pool)).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_provider_neutral_schema_migrates() {
+        let Some(url) = std::env::var("LNURL_TEST_POSTGRES_URL").ok() else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        crate::postgresql::run_migrations(&pool).await.unwrap();
+
+        provider_neutral_schema_migrates(SqlSchema::Postgres(&pool)).await;
+    }
+
+    enum SqlSchema<'a> {
+        Sqlite(&'a SqlitePool),
+        Postgres(&'a sqlx::PgPool),
+    }
+
+    async fn provider_neutral_schema_migrates(schema: SqlSchema<'_>) {
+        match schema {
+            SqlSchema::Sqlite(pool) => assert_sqlite_schema(pool).await,
+            SqlSchema::Postgres(pool) => assert_postgres_schema(pool).await,
+        }
+    }
+
+    async fn assert_sqlite_schema(pool: &SqlitePool) {
+        for table in ACCOUNT_TABLES {
+            assert!(
+                sqlite_table_exists(pool, table).await,
+                "missing table {table}"
+            );
+        }
+
+        for expectation in ACCOUNT_EXPECTATIONS {
+            let columns = sqlite_columns(pool, expectation.name).await;
+            assert_columns(expectation.name, &columns, expectation.required_columns);
+            assert_no_columns(expectation.name, &columns, expectation.forbidden_columns);
+        }
+
+        for table in SIDE_EFFECT_TABLES {
+            let columns = sqlite_columns(pool, table).await;
+            assert_columns(table, &columns, &["account_id", "user_pubkey"]);
+            let account_id = sqlite_column(pool, table, "account_id").await;
+            assert_eq!(account_id.notnull, 0, "{table}.account_id must be nullable");
+        }
+
+        assert_sqlite_check_contains(pool, "accounts", "'spark'").await;
+        assert_sqlite_check_contains(pool, "accounts", "'blink'").await;
+        assert_sqlite_check_contains(pool, "account_identifiers", "'username'").await;
+        assert_sqlite_check_contains(pool, "account_identifiers", "'phone'").await;
+        assert_sqlite_check_contains(pool, "blink_accounts", "'btc'").await;
+        assert_sqlite_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_sqlite_index_exists(pool, "account_identifiers_domain_identifier_key").await;
+        assert_sqlite_index_exists(pool, "spark_accounts_pubkey_key").await;
+        assert_sqlite_index_exists(pool, "blink_accounts_blink_account_id_key").await;
+        assert_sqlite_index_exists(pool, "idx_invoices_account_id").await;
+        assert_sqlite_index_exists(pool, "idx_zaps_account_id").await;
+        assert_sqlite_index_exists(pool, "idx_sender_comments_account_id").await;
+    }
+
+    async fn assert_postgres_schema(pool: &sqlx::PgPool) {
+        for table in ACCOUNT_TABLES {
+            assert!(
+                postgres_table_exists(pool, table).await,
+                "missing table {table}"
+            );
+        }
+
+        for expectation in ACCOUNT_EXPECTATIONS {
+            let columns = postgres_columns(pool, expectation.name).await;
+            assert_columns(expectation.name, &columns, expectation.required_columns);
+            assert_no_columns(expectation.name, &columns, expectation.forbidden_columns);
+        }
+
+        for table in SIDE_EFFECT_TABLES {
+            let columns = postgres_columns(pool, table).await;
+            assert_columns(table, &columns, &["account_id", "user_pubkey"]);
+            assert!(
+                postgres_column_is_nullable(pool, table, "account_id").await,
+                "{table}.account_id must be nullable"
+            );
+        }
+
+        assert_postgres_check_contains(pool, "accounts", "'spark'").await;
+        assert_postgres_check_contains(pool, "accounts", "'blink'").await;
+        assert_postgres_check_contains(pool, "account_identifiers", "'username'").await;
+        assert_postgres_check_contains(pool, "account_identifiers", "'phone'").await;
+        assert_postgres_check_contains(pool, "blink_accounts", "'btc'").await;
+        assert_postgres_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_postgres_index_exists(pool, "account_identifiers_domain_identifier_key").await;
+        assert_postgres_index_exists(pool, "spark_accounts_pubkey_key").await;
+        assert_postgres_index_exists(pool, "blink_accounts_blink_account_id_key").await;
+        assert_postgres_index_exists(pool, "idx_invoices_account_id").await;
+        assert_postgres_index_exists(pool, "idx_zaps_account_id").await;
+        assert_postgres_index_exists(pool, "idx_sender_comments_account_id").await;
+    }
+
+    fn assert_columns(table: &str, columns: &[String], expected: &[&str]) {
+        for column in expected {
+            assert!(
+                columns.iter().any(|actual| actual == column),
+                "{table} missing column {column}; columns: {columns:?}"
+            );
+        }
+    }
+
+    fn assert_no_columns(table: &str, columns: &[String], forbidden: &[&str]) {
+        for column in forbidden {
+            assert!(
+                !columns.iter().any(|actual| actual == column),
+                "{table} must not expose column {column}"
+            );
+        }
+    }
+
+    struct SqliteColumn {
+        notnull: i64,
+    }
+
+    async fn sqlite_table_exists(pool: &SqlitePool, table: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+            == 1
+    }
+
+    async fn sqlite_columns(pool: &SqlitePool, table: &str) -> Vec<String> {
+        let query = format!("PRAGMA table_info({table})");
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect()
+    }
+
+    async fn sqlite_column(pool: &SqlitePool, table: &str, column: &str) -> SqliteColumn {
+        let query = format!("PRAGMA table_info({table})");
+        let row = sqlx::query(sqlx::AssertSqlSafe(query))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.try_get::<String, _>("name").unwrap() == column)
+            .unwrap_or_else(|| panic!("{table} missing column {column}"));
+        SqliteColumn {
+            notnull: row.try_get("notnull").unwrap(),
+        }
+    }
+
+    async fn assert_sqlite_check_contains(pool: &SqlitePool, table: &str, expected: &str) {
+        let sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            sql.contains(expected),
+            "{table} DDL missing {expected}: {sql}"
+        );
+    }
+
+    async fn assert_sqlite_index_exists(pool: &SqlitePool, index: &str) {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "missing SQLite index/constraint {index}");
+    }
+
+    async fn postgres_table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+            == 1
+    }
+
+    async fn postgres_columns(pool: &sqlx::PgPool, table: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn postgres_column_is_nullable(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+        let nullable = sqlx::query_scalar::<_, String>(
+            "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        nullable == "YES"
+    }
+
+    async fn assert_postgres_check_contains(pool: &sqlx::PgPool, table: &str, expected: &str) {
+        let definitions = sqlx::query_scalar::<_, String>(
+            "SELECT pg_get_constraintdef(c.oid)
+             FROM pg_constraint c
+             JOIN pg_class t ON t.oid = c.conrelid
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE n.nspname = 'public' AND t.relname = $1 AND c.contype = 'c'",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.contains(expected)),
+            "{table} checks missing {expected}: {definitions:?}"
+        );
+    }
+
+    async fn assert_postgres_index_exists(pool: &sqlx::PgPool, index: &str) {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "missing Postgres index/constraint {index}");
+    }
+}
