@@ -24,6 +24,7 @@ setup() {
   assert_json_nonempty "$output" '.maxSendable'
   assert_json_nonempty "$output" '.metadata'
   assert_json_equals "$output" '.callback' 'http://localhost:8080/lnurlp/alice/invoice'
+  assert_json_equals "$output" '.commentAllowed' '255'
 }
 
 @test "lnurl: callback returns invoice and verify URL" {
@@ -35,6 +36,7 @@ setup() {
 
   assert_json_nonempty "$output" '.pr'
   assert_json_nonempty "$output" '.verify'
+  assert_json_equals "$output" '.verify | startswith("http://localhost:8080/verify/")' 'true'
   assert_json_equals "$output" '.routes | length' '0'
   assert_json_absent_or_not_contains "$output" '.status' 'ERROR'
 }
@@ -78,11 +80,28 @@ setup() {
 }
 
 @test "lnurl: unknown user returns 404" {
-  run curl -fsS --header "Host: localhost:8080" "${BASE_URL}/.well-known/lnurlp/missing"
-  [ "$status" -eq 22 ]
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/missing" "localhost:8080")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "404" ]
+  [ "$body" = '""' ]
 }
 
 @test "lnurl: disallowed domain returns 404" {
-  run curl -fsS --header "Host: evil.example.com" "${BASE_URL}/.well-known/lnurlp/alice"
-  [ "$status" -eq 22 ]
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/alice" "evil.example.com")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "404" ]
+  [ "$body" = '""' ]
+}
+
+@test "lnurl: callback unknown user returns 404 with empty body" {
+  response="$(http_status_body "GET" "${BASE_URL}/lnurlp/missing/invoice?amount=1000" "localhost:8080")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "404" ]
+  [ "$body" = '""' ]
 }

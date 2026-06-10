@@ -20,6 +20,7 @@ async fn build_payload_json(
 
     let register_signature = sign(&signer, format!("{username}-{timestamp}")).await?;
     let recover_signature = sign(&signer, format!("{pubkey}-{timestamp}")).await?;
+    let to_register_signature = sign(&to_signer, format!("{username}-{timestamp}")).await?;
     let transfer_message = format!("transfer:{username}-{to_pubkey}");
     let transfer_from_signature = sign(&signer, transfer_message.clone()).await?;
     let transfer_to_signature = sign(&to_signer, transfer_message).await?;
@@ -31,6 +32,7 @@ async fn build_payload_json(
         "recover_signature": recover_signature,
         "unregister_signature": register_signature,
         "to_pubkey": to_pubkey,
+        "to_register_signature": to_register_signature,
         "transfer_from_signature": transfer_from_signature,
         "transfer_to_signature": transfer_to_signature,
     }))
