@@ -76,52 +76,27 @@ jobs:
       - name: repo
       run:
         path: pipeline-tasks/ci/tasks/update-repo.sh
-  - in_parallel:
-    - task: build-osx-release
-      privileged: true
-      config:
-        platform: linux
-        image_resource:
-          type: registry-image
-          source:
-            username: #@ data.values.osxcross_docker_username
-            password: #@ data.values.osxcross_docker_password
-            repository: #@ data.values.osxcross_repository
-        inputs:
-        - name: version
-        - name: pipeline-tasks
-        - name: repo
-        outputs:
-        - name: x86_64-apple-darwin
-        caches:
-        - path: cargo-home
-        - path: cargo-target-dir
-        params:
-          TARGET: x86_64-apple-darwin
-          OUT: x86_64-apple-darwin
-        run:
-          path: pipeline-tasks/ci/tasks/build-release.sh
-    - task: build-static-release
-      privileged: true
-      config:
-        platform: linux
-        image_resource:
-          type: registry-image
-          source: { repository: clux/muslrust, tag: stable }
-        inputs:
-        - name: version
-        - name: pipeline-tasks
-        - name: repo
-        outputs:
-        - name: x86_64-unknown-linux-musl
-        caches:
-        - path: cargo-home
-        - path: cargo-target-dir
-        params:
-          TARGET: x86_64-unknown-linux-musl
-          OUT: x86_64-unknown-linux-musl
-        run:
-          path: pipeline-tasks/ci/tasks/build-release.sh
+  - task: build-static-release
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source: { repository: clux/muslrust, tag: stable }
+      inputs:
+      - name: version
+      - name: pipeline-tasks
+      - name: repo
+      outputs:
+      - name: x86_64-unknown-linux-musl
+      caches:
+      - path: cargo-home
+      - path: cargo-target-dir
+      params:
+        TARGET: x86_64-unknown-linux-musl
+        OUT: x86_64-unknown-linux-musl
+      run:
+        path: pipeline-tasks/ci/tasks/build-release.sh
   - put: repo
     params:
       tag: artifacts/gh-release-tag
@@ -132,7 +107,6 @@ jobs:
       image_resource: #@ rust_task_image_config()
       platform: linux
       inputs:
-      - name: x86_64-apple-darwin
       - name: x86_64-unknown-linux-musl
       - name: version
       - name: pipeline-tasks
