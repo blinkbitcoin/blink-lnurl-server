@@ -829,6 +829,7 @@ where
         // save to zap event to db
         if let Some(zap_request) = params.nostr {
             let zap = Zap {
+                account_id: None,
                 payment_hash: payment_hash.clone(),
                 zap_request,
                 zap_event: None,
@@ -852,6 +853,7 @@ where
                 && let Err(e) = state
                     .db
                     .insert_lnurl_sender_comment(&LnurlSenderComment {
+                        account_id: None,
                         comment: comment.to_string(),
                         payment_hash: payment_hash.clone(),
                         user_pubkey: user.pubkey.clone(),
@@ -1849,6 +1851,7 @@ mod tests {
         repo.invoices.lock().unwrap().insert(
             payment_hash.clone(),
             Invoice {
+                account_id: None,
                 payment_hash,
                 user_pubkey: receiver_pubkey.to_string(),
                 invoice: "lnbc1...".to_string(),
@@ -2261,6 +2264,7 @@ mod tests {
         repo.invoices.lock().unwrap().insert(
             payment_hash.clone(),
             Invoice {
+                account_id: None,
                 payment_hash: payment_hash.clone(),
                 user_pubkey: TEST_RECEIVER_PUBKEY.to_string(),
                 invoice: "lnbc1...".to_string(),

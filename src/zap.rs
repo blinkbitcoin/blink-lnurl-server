@@ -1,5 +1,6 @@
 #[derive(Debug, Clone)]
 pub struct Zap {
+    pub account_id: Option<String>,
     pub payment_hash: String,
     pub zap_request: String,
     pub zap_event: Option<String>,

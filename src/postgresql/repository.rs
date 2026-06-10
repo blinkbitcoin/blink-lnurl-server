@@ -605,15 +605,16 @@ impl crate::repository::LnurlRepository for LnurlRepository {
     async fn upsert_zap(&self, zap: &Zap) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
             "INSERT INTO zaps (payment_hash, zap_request, zap_event
-            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT(payment_hash) DO UPDATE
-             SET zap_request = excluded.zap_request
-             ,   zap_event = excluded.zap_event
-             ,   user_pubkey = excluded.user_pubkey
-             ,   invoice_expiry = excluded.invoice_expiry
-             ,   updated_at = excluded.updated_at
-             ,   is_user_nostr_key = excluded.is_user_nostr_key",
+            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key, account_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              ON CONFLICT(payment_hash) DO UPDATE
+              SET zap_request = excluded.zap_request
+              ,   zap_event = excluded.zap_event
+              ,   user_pubkey = excluded.user_pubkey
+              ,   invoice_expiry = excluded.invoice_expiry
+              ,   updated_at = excluded.updated_at
+              ,   is_user_nostr_key = excluded.is_user_nostr_key
+              ,   account_id = COALESCE(excluded.account_id, zaps.account_id)",
         )
         .bind(&zap.payment_hash)
         .bind(&zap.zap_request)
@@ -622,6 +623,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(zap.invoice_expiry)
         .bind(zap.updated_at)
         .bind(zap.is_user_nostr_key)
+        .bind(zap.account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -633,7 +635,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
     ) -> Result<Option<Zap>, LnurlRepositoryError> {
         let maybe_zap = sqlx::query(
             "SELECT payment_hash, zap_request, zap_event, user_pubkey
-            , invoice_expiry, updated_at, is_user_nostr_key
+            , invoice_expiry, updated_at, is_user_nostr_key, account_id
              FROM zaps
              WHERE payment_hash = $1",
         )
@@ -649,6 +651,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 invoice_expiry: row.try_get(4)?,
                 updated_at: row.try_get(5)?,
                 is_user_nostr_key: row.try_get(6)?,
+                account_id: row.try_get(7)?,
             })
         })
         .transpose()?;
@@ -660,17 +663,19 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         comment: &LnurlSenderComment,
     ) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO sender_comments (payment_hash, user_pubkey, sender_comment, updated_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(payment_hash) DO UPDATE
-             SET user_pubkey = excluded.user_pubkey
-             ,   sender_comment = excluded.sender_comment
-             ,   updated_at = excluded.updated_at",
+            "INSERT INTO sender_comments (payment_hash, user_pubkey, sender_comment, updated_at, account_id)
+             VALUES ($1, $2, $3, $4, $5)
+              ON CONFLICT(payment_hash) DO UPDATE
+              SET user_pubkey = excluded.user_pubkey
+              ,   sender_comment = excluded.sender_comment
+              ,   updated_at = excluded.updated_at
+              ,   account_id = COALESCE(excluded.account_id, sender_comments.account_id)",
         )
         .bind(&comment.payment_hash)
         .bind(&comment.user_pubkey)
         .bind(&comment.comment)
         .bind(comment.updated_at)
+        .bind(comment.account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -774,16 +779,17 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn upsert_invoice(&self, invoice: &Invoice) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT(payment_hash) DO UPDATE
-             SET user_pubkey = excluded.user_pubkey
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+              ON CONFLICT(payment_hash) DO UPDATE
+              SET user_pubkey = excluded.user_pubkey
              ,   invoice = excluded.invoice
              ,   preimage = excluded.preimage
              ,   invoice_expiry = excluded.invoice_expiry
-             ,   updated_at = excluded.updated_at
-             ,   domain = excluded.domain
-             ,   amount_received_sat = excluded.amount_received_sat",
+              ,   updated_at = excluded.updated_at
+              ,   domain = excluded.domain
+              ,   amount_received_sat = excluded.amount_received_sat
+              ,   account_id = COALESCE(excluded.account_id, invoices.account_id)",
         )
         .bind(&invoice.payment_hash)
         .bind(&invoice.user_pubkey)
@@ -794,6 +800,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(invoice.updated_at)
         .bind(&invoice.domain)
         .bind(invoice.amount_received_sat)
+        .bind(invoice.account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -813,15 +820,18 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let invoice_expiries: Vec<i64> = invoices.iter().map(|i| i.invoice_expiry).collect();
         let created_ats: Vec<i64> = invoices.iter().map(|i| i.created_at).collect();
         let updated_ats: Vec<i64> = invoices.iter().map(|i| i.updated_at).collect();
+        let account_ids: Vec<Option<&str>> =
+            invoices.iter().map(|i| i.account_id.as_deref()).collect();
 
         let rows = sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::bigint[])
-             ON CONFLICT(payment_hash) DO UPDATE
-             SET preimage = excluded.preimage
-             ,   updated_at = excluded.updated_at
-             WHERE invoices.user_pubkey = excluded.user_pubkey AND invoices.preimage IS NULL
-             RETURNING payment_hash",
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, account_id)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::bigint[], $8::text[])
+              ON CONFLICT(payment_hash) DO UPDATE
+              SET preimage = excluded.preimage
+              ,   updated_at = excluded.updated_at
+              ,   account_id = COALESCE(excluded.account_id, invoices.account_id)
+              WHERE invoices.user_pubkey = excluded.user_pubkey AND invoices.preimage IS NULL
+              RETURNING payment_hash",
         )
         .bind(&payment_hashes)
         .bind(&user_pubkeys)
@@ -830,6 +840,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&invoice_expiries)
         .bind(&created_ats)
         .bind(&updated_ats)
+        .bind(&account_ids)
         .fetch_all(&self.pool)
         .await?;
 
@@ -845,7 +856,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         payment_hash: &str,
     ) -> Result<Option<Invoice>, LnurlRepositoryError> {
         let maybe_invoice = sqlx::query(
-            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat
+            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id
              FROM invoices
              WHERE payment_hash = $1",
         )
@@ -863,6 +874,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 updated_at: row.try_get(6)?,
                 domain: row.try_get(7)?,
                 amount_received_sat: row.try_get(8)?,
+                account_id: row.try_get(9)?,
             })
         })
         .transpose()?;
@@ -878,11 +890,13 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      z.zap_request    AS z_zap_request
              ,      z.zap_event      AS z_zap_event
              ,      z.user_pubkey    AS z_user_pubkey
+             ,      z.account_id     AS z_account_id
              ,      z.invoice_expiry AS z_invoice_expiry
              ,      z.updated_at     AS z_updated_at
              ,      z.is_user_nostr_key AS z_is_user_nostr_key
              ,      i.payment_hash   AS i_payment_hash
              ,      i.user_pubkey    AS i_user_pubkey
+             ,      i.account_id     AS i_account_id
              ,      i.invoice        AS i_invoice
              ,      i.preimage       AS i_preimage
              ,      i.invoice_expiry AS i_invoice_expiry
@@ -906,6 +920,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     zap_request: row.try_get("z_zap_request")?,
                     zap_event: row.try_get("z_zap_event")?,
                     user_pubkey: row.try_get("z_user_pubkey")?,
+                    account_id: row.try_get("z_account_id")?,
                     invoice_expiry: row.try_get("z_invoice_expiry")?,
                     updated_at: row.try_get("z_updated_at")?,
                     is_user_nostr_key: row.try_get("z_is_user_nostr_key")?,
@@ -919,6 +934,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 Ok::<_, sqlx::Error>(Invoice {
                     payment_hash: ph,
                     user_pubkey: row.try_get("i_user_pubkey")?,
+                    account_id: row.try_get("i_account_id")?,
                     invoice: row.try_get("i_invoice")?,
                     preimage: row.try_get("i_preimage")?,
                     invoice_expiry: row.try_get("i_invoice_expiry")?,
@@ -1071,7 +1087,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         }
         let hashes: Vec<&str> = payment_hashes.iter().map(String::as_str).collect();
         let rows = sqlx::query(
-            "SELECT i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
+            "SELECT i.account_id, i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
                     u.name, u.domain,
                     sc.sender_comment,
                     i.domain
@@ -1088,21 +1104,22 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let results = rows
             .into_iter()
             .map(|row| {
-                let name: Option<String> = row.try_get(5)?;
-                let user_domain: Option<String> = row.try_get(6)?;
+                let name: Option<String> = row.try_get(6)?;
+                let user_domain: Option<String> = row.try_get(7)?;
                 let lightning_address = match (name, user_domain) {
                     (Some(n), Some(d)) => Some(format!("{n}@{d}")),
                     _ => None,
                 };
                 Ok::<_, sqlx::Error>(WebhookPayloadData {
-                    payment_hash: row.try_get(0)?,
-                    user_pubkey: row.try_get(1)?,
-                    invoice: row.try_get(2)?,
-                    preimage: row.try_get(3)?,
-                    amount_received_sat: row.try_get(4)?,
+                    account_id: row.try_get(0)?,
+                    payment_hash: row.try_get(1)?,
+                    user_pubkey: row.try_get(2)?,
+                    invoice: row.try_get(3)?,
+                    preimage: row.try_get(4)?,
+                    amount_received_sat: row.try_get(5)?,
                     lightning_address,
-                    sender_comment: row.try_get(7)?,
-                    domain: row.try_get(8)?,
+                    sender_comment: row.try_get(8)?,
+                    domain: row.try_get(9)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1440,6 +1457,14 @@ mod provider_neutral_tests {
             return;
         };
         shared_tests::transfer_identifier_requires_source_owner(&db).await;
+    }
+
+    #[tokio::test]
+    async fn side_effect_records_round_trip_account_id() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::side_effect_records_round_trip_account_id(&db).await;
     }
 
     #[tokio::test]

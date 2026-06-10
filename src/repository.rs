@@ -213,6 +213,7 @@ fn provider_neutral_not_implemented() -> LnurlRepositoryError {
 }
 
 pub struct LnurlSenderComment {
+    pub account_id: Option<String>,
     pub comment: String,
     pub payment_hash: String,
     pub user_pubkey: String,
@@ -221,6 +222,7 @@ pub struct LnurlSenderComment {
 
 #[derive(Debug, Clone)]
 pub struct Invoice {
+    pub account_id: Option<String>,
     pub payment_hash: String,
     pub user_pubkey: String,
     pub invoice: String,
@@ -427,6 +429,7 @@ pub trait LnurlRepository {
 
 /// Data returned by the webhook enqueue query.
 pub struct WebhookPayloadData {
+    pub account_id: Option<String>,
     pub payment_hash: String,
     pub user_pubkey: String,
     pub invoice: String,
@@ -440,10 +443,11 @@ pub struct WebhookPayloadData {
 #[cfg(test)]
 pub mod shared_tests {
     use super::{
-        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
-        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
-        WalletKind, generate_account_id,
+        AccountIdentifierKind, AccountProvider, IdentifierTransfer, Invoice, LnurlRepository,
+        LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier, NewBlinkAccount,
+        NewSparkRegistration, WalletKind, generate_account_id,
     };
+    use crate::zap::Zap;
 
     pub async fn identifier_conflict_is_global<DB>(db: &DB)
     where
@@ -704,6 +708,74 @@ pub mod shared_tests {
             .unwrap()
             .expect("account should remain addressable after side-effect writes");
         assert_eq!(account.account_id, account_id);
+
+        let now = crate::time::now_millis();
+        let payment_hash = "side_effect_account_hash".to_string();
+
+        db.upsert_invoice(&Invoice {
+            account_id: Some(account_id.clone()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            invoice: "lnbc1sideeffect".to_string(),
+            preimage: Some("side_effect_preimage".to_string()),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some("effects.example.com".to_string()),
+            amount_received_sat: None,
+        })
+        .await
+        .unwrap();
+        db.upsert_zap(&Zap {
+            account_id: Some(account_id.clone()),
+            payment_hash: payment_hash.clone(),
+            zap_request: r#"{"kind":9734}"#.to_string(),
+            zap_event: None,
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            invoice_expiry: i64::MAX,
+            updated_at: now,
+            is_user_nostr_key: false,
+        })
+        .await
+        .unwrap();
+        db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: Some(account_id.clone()),
+            comment: "provider-neutral comment".to_string(),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_side_effect_pubkey".to_string(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        let invoice = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should round-trip");
+        assert_eq!(invoice.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(invoice.user_pubkey, "spark_side_effect_pubkey");
+
+        let zap = db
+            .get_zap_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("zap should round-trip");
+        assert_eq!(zap.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(zap.user_pubkey, "spark_side_effect_pubkey");
+
+        let webhook_payloads = db.get_webhook_payloads(&[payment_hash]).await.unwrap();
+        let webhook_payload = webhook_payloads
+            .first()
+            .expect("paid invoice should be eligible for webhook payloads");
+        assert_eq!(
+            webhook_payload.account_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(
+            webhook_payload.sender_comment.as_deref(),
+            Some("provider-neutral comment")
+        );
     }
 }
 

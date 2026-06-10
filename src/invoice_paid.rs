@@ -126,6 +126,7 @@ where
             .map_or(0, |t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
 
         invoices.push(Invoice {
+            account_id: None,
             payment_hash,
             user_pubkey: user_pubkey.to_string(),
             invoice: item.invoice.clone(),
@@ -196,6 +197,7 @@ where
 {
     let now = now_millis();
     let invoice_record = Invoice {
+        account_id: None,
         payment_hash: payment_hash.to_string(),
         user_pubkey: user_pubkey.to_string(),
         invoice: invoice.to_string(),
@@ -260,6 +262,7 @@ mod shared_tests {
         let user_pubkey = "test_user_pubkey";
 
         db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: None,
             comment: "hello from sender".to_string(),
             payment_hash: payment_hash.clone(),
             user_pubkey: user_pubkey.to_string(),
@@ -310,6 +313,7 @@ mod shared_tests {
         let user_pubkey = "test_user_pubkey";
 
         db.upsert_zap(&crate::zap::Zap {
+            account_id: None,
             payment_hash: payment_hash.clone(),
             zap_request: r#"{"kind":9734}"#.to_string(),
             zap_event: None,
@@ -395,6 +399,7 @@ mod shared_tests {
         let known_preimage = [4u8; 32];
         let (known_hex, known_hash, known_invoice) = generate_test_invoice(&known_preimage);
         db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: None,
             comment: "known".to_string(),
             payment_hash: known_hash.clone(),
             user_pubkey: user_pubkey.to_string(),
