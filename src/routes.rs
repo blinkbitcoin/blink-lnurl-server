@@ -241,8 +241,26 @@ where
                         Json(Value::String("name already taken".into())),
                     )
                 }
+                LnurlRepositoryError::IdentifierConflict => {
+                    trace!("identifier conflict during transfer: {username}");
+                    (
+                        StatusCode::CONFLICT,
+                        Json(Value::String("name already taken".into())),
+                    )
+                }
                 LnurlRepositoryError::General(err) => {
                     error!("failed to execute transfer query: {err}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(Value::String("internal server error".into())),
+                    )
+                }
+                LnurlRepositoryError::BlinkAccountExists
+                | LnurlRepositoryError::AccountNotFound
+                | LnurlRepositoryError::InvalidOwnership
+                | LnurlRepositoryError::InvalidProvider
+                | LnurlRepositoryError::InvalidIdentifierKind => {
+                    error!("unexpected provider-neutral repository error during transfer: {e}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(Value::String("internal server error".into())),

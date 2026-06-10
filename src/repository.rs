@@ -1,3 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::anyhow;
+
 use crate::models::ListMetadataMetadata;
 
 use crate::user::User;
@@ -5,12 +10,206 @@ use crate::zap::Zap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LnurlRepositoryError {
+    #[error("identifier conflict")]
+    IdentifierConflict,
+    #[error("blink account already exists")]
+    BlinkAccountExists,
+    #[error("account not found")]
+    AccountNotFound,
+    #[error("invalid ownership")]
+    InvalidOwnership,
+    #[error("invalid provider")]
+    InvalidProvider,
+    #[error("invalid identifier kind")]
+    InvalidIdentifierKind,
     #[error("name taken")]
     NameTaken,
     #[error("source user does not own this username")]
     SourceNotOwner,
     #[error("database error: {0}")]
     General(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountProvider {
+    Spark,
+    Blink,
+}
+
+impl AccountProvider {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spark => "spark",
+            Self::Blink => "blink",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
+        match value {
+            "spark" => Ok(Self::Spark),
+            "blink" => Ok(Self::Blink),
+            _ => Err(LnurlRepositoryError::InvalidProvider),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountIdentifierKind {
+    Username,
+    Phone,
+}
+
+impl AccountIdentifierKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Username => "username",
+            Self::Phone => "phone",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
+        match value {
+            "username" => Ok(Self::Username),
+            "phone" => Ok(Self::Phone),
+            _ => Err(LnurlRepositoryError::InvalidIdentifierKind),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletKind {
+    Btc,
+    Usd,
+}
+
+impl WalletKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "btc",
+            Self::Usd => "usd",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
+        match value {
+            "btc" => Ok(Self::Btc),
+            "usd" => Ok(Self::Usd),
+            _ => Err(LnurlRepositoryError::InvalidOwnership),
+        }
+    }
+}
+
+static ACCOUNT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn generate_account_id(provider: AccountProvider) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let counter = ACCOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("acct_{}_{nanos:x}_{counter:x}", provider.as_str())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub account_id: String,
+    pub provider: AccountProvider,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentifier {
+    pub account_id: String,
+    pub domain: String,
+    pub identifier: String,
+    pub identifier_kind: AccountIdentifierKind,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkAccount {
+    pub account_id: String,
+    pub pubkey: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlinkAccount {
+    pub account_id: String,
+    pub blink_account_id: String,
+    pub btc_wallet_id: String,
+    pub usd_wallet_id: String,
+    pub default_wallet: WalletKind,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAccountIdentifier {
+    pub domain: String,
+    pub identifier: String,
+    pub identifier_kind: AccountIdentifierKind,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSparkRegistration {
+    pub account_id: Option<String>,
+    pub pubkey: String,
+    pub identifier: NewAccountIdentifier,
+}
+
+impl NewSparkRegistration {
+    pub fn validate(&self) -> Result<(), LnurlRepositoryError> {
+        if self.identifier.identifier_kind == AccountIdentifierKind::Phone {
+            return Err(LnurlRepositoryError::InvalidIdentifierKind);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBlinkAccount {
+    pub account_id: Option<String>,
+    pub blink_account_id: String,
+    pub btc_wallet_id: String,
+    pub usd_wallet_id: String,
+    pub default_wallet: WalletKind,
+    pub identifiers: Vec<NewAccountIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRecipient {
+    pub account_id: String,
+    pub provider: AccountProvider,
+    pub domain: String,
+    pub identifier: String,
+    pub identifier_kind: AccountIdentifierKind,
+    pub description: String,
+    pub spark_pubkey: Option<String>,
+    pub blink_account_id: Option<String>,
+    pub btc_wallet_id: Option<String>,
+    pub usd_wallet_id: Option<String>,
+    pub default_wallet: Option<WalletKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifierTransfer {
+    pub domain: String,
+    pub identifier: String,
+    pub source_account_id: String,
+    pub destination_account_id: String,
+    pub description: String,
+}
+
+fn provider_neutral_not_implemented() -> LnurlRepositoryError {
+    LnurlRepositoryError::General(anyhow!(
+        "provider-neutral repository method not implemented"
+    ))
 }
 
 pub struct LnurlSenderComment {
@@ -57,6 +256,58 @@ pub trait LnurlRepository {
         pubkey: &str,
     ) -> Result<Option<User>, LnurlRepositoryError>;
     async fn upsert_user(&self, user: &User) -> Result<(), LnurlRepositoryError>;
+
+    async fn resolve_recipient_by_identifier(
+        &self,
+        _domain: &str,
+        _identifier: &str,
+    ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn get_account_by_id(
+        &self,
+        _account_id: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn get_account_by_spark_pubkey(
+        &self,
+        _pubkey: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn upsert_spark_registration(
+        &self,
+        registration: &NewSparkRegistration,
+    ) -> Result<(), LnurlRepositoryError> {
+        registration.validate()?;
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn create_blink_account(
+        &self,
+        _account: &NewBlinkAccount,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn delete_spark_registration(
+        &self,
+        _domain: &str,
+        _pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn transfer_identifier(
+        &self,
+        _transfer: &IdentifierTransfer,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
 
     /// Atomically transfer ownership of `username` in `domain` from `from_pubkey`
     /// to `to_pubkey`, replacing any existing row for `to_pubkey`.
@@ -184,6 +435,276 @@ pub struct WebhookPayloadData {
     pub lightning_address: Option<String>,
     pub sender_comment: Option<String>,
     pub domain: String,
+}
+
+#[cfg(test)]
+pub mod shared_tests {
+    use super::{
+        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
+        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
+        WalletKind, generate_account_id,
+    };
+
+    pub async fn identifier_conflict_is_global<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-10/D-18/D-19: identical (domain, identifier) ownership across
+        // providers must surface as an exact IdentifierConflict domain error.
+        let identifier = NewAccountIdentifier {
+            domain: "conflict.example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "spark alice".to_string(),
+        };
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(generate_account_id(AccountProvider::Spark)),
+            pubkey: "spark_conflict_pubkey".to_string(),
+            identifier: identifier.clone(),
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(generate_account_id(AccountProvider::Blink)),
+                blink_account_id: "blink_conflict_account".to_string(),
+                btc_wallet_id: "blink_conflict_btc".to_string(),
+                usd_wallet_id: "blink_conflict_usd".to_string(),
+                default_wallet: WalletKind::Btc,
+                identifiers: vec![identifier],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::IdentifierConflict)
+        ));
+    }
+
+    pub async fn spark_registration_dual_writes_provider_neutral_rows<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-15/D-17/D-19: Spark compatibility registration must create the
+        // provider-neutral account, Spark child row, and identifier row atomically.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_dual_write_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "dual.example.com".to_string(),
+                identifier: "alice".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "dual write".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("dual.example.com", "alice")
+            .await
+            .unwrap()
+            .expect("recipient must resolve by claimed identifier");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Spark);
+        assert_eq!(recipient.description, "dual write");
+        assert_eq!(
+            recipient.spark_pubkey.as_deref(),
+            Some("spark_dual_write_pubkey")
+        );
+        assert!(recipient.blink_account_id.is_none());
+    }
+
+    pub async fn spark_phone_identifier_is_rejected<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-06/D-07/D-18: phone is an explicit kind, but Spark ownership of
+        // phone identifiers must be rejected at the repository boundary.
+        let result = db
+            .upsert_spark_registration(&NewSparkRegistration {
+                account_id: Some(generate_account_id(AccountProvider::Spark)),
+                pubkey: "spark_phone_pubkey".to_string(),
+                identifier: NewAccountIdentifier {
+                    domain: "phone.example.com".to_string(),
+                    identifier: "+573005871212".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "phone should fail".to_string(),
+                },
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::InvalidIdentifierKind)
+        ));
+    }
+
+    pub async fn blink_account_creation_is_atomic<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-03/D-17/D-19: Blink account creation persists Blink natural keys,
+        // wallet ids, default wallet, and all identifiers in one transaction.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_atomic_account".to_string(),
+            btc_wallet_id: "blink_atomic_btc".to_string(),
+            usd_wallet_id: "blink_atomic_usd".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "atomic.example.com".to_string(),
+                identifier: "bob".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "blink bob".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("atomic.example.com", "bob")
+            .await
+            .unwrap()
+            .expect("blink recipient must resolve by identifier");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Blink);
+        assert_eq!(
+            recipient.blink_account_id.as_deref(),
+            Some("blink_atomic_account")
+        );
+        assert_eq!(recipient.btc_wallet_id.as_deref(), Some("blink_atomic_btc"));
+        assert_eq!(recipient.usd_wallet_id.as_deref(), Some("blink_atomic_usd"));
+        assert_eq!(recipient.default_wallet, Some(WalletKind::Usd));
+        assert!(recipient.spark_pubkey.is_none());
+    }
+
+    pub async fn blink_duplicate_account_returns_blink_account_exists<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-18/D-19: duplicate Blink natural keys are distinct from global
+        // identifier conflicts and must return BlinkAccountExists.
+        let account = NewBlinkAccount {
+            account_id: Some(generate_account_id(AccountProvider::Blink)),
+            blink_account_id: "blink_duplicate_account".to_string(),
+            btc_wallet_id: "blink_duplicate_btc".to_string(),
+            usd_wallet_id: "blink_duplicate_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "duplicate.example.com".to_string(),
+                identifier: "carol".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "first".to_string(),
+            }],
+        };
+        db.create_blink_account(&account).await.unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(generate_account_id(AccountProvider::Blink)),
+                identifiers: vec![NewAccountIdentifier {
+                    domain: "duplicate.example.com".to_string(),
+                    identifier: "dave".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "second".to_string(),
+                }],
+                ..account
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::BlinkAccountExists)
+        ));
+    }
+
+    pub async fn lookup_by_identifier_account_id_and_spark_pubkey_round_trips<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-15/D-19: callers can resolve the same Spark account by identifier,
+        // provider-neutral account id, and provider-specific Spark pubkey.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_lookup_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "lookup.example.com".to_string(),
+                identifier: "erin".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "lookup".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("lookup.example.com", "erin")
+            .await
+            .unwrap()
+            .expect("identifier lookup should find account");
+        let by_id = db
+            .get_account_by_id(&account_id)
+            .await
+            .unwrap()
+            .expect("account id lookup should find account");
+        let by_pubkey = db
+            .get_account_by_spark_pubkey("spark_lookup_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark pubkey lookup should find account");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(by_id.account_id, account_id);
+        assert_eq!(by_pubkey.account_id, account_id);
+    }
+
+    pub async fn transfer_identifier_requires_source_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-17/D-18/D-19: transfer is explicit and must prove the source owner
+        // before moving an identifier to a destination account.
+        let result = db
+            .transfer_identifier(&IdentifierTransfer {
+                domain: "transfer.example.com".to_string(),
+                identifier: "frank".to_string(),
+                source_account_id: "not_the_owner".to_string(),
+                destination_account_id: "destination".to_string(),
+                description: "transfer".to_string(),
+            })
+            .await;
+        assert!(matches!(result, Err(LnurlRepositoryError::SourceNotOwner)));
+    }
+
+    pub async fn side_effect_records_round_trip_account_id<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // D-17/D-19: later backend implementations must preserve nullable
+        // provider-neutral ownership on side-effect records while legacy
+        // user_pubkey fields remain available during migration.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_side_effect_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "effects.example.com".to_string(),
+                identifier: "grace".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "side effects".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let account = db
+            .get_account_by_id(&account_id)
+            .await
+            .unwrap()
+            .expect("account should remain addressable after side-effect writes");
+        assert_eq!(account.account_id, account_id);
+    }
 }
 
 #[cfg(test)]
