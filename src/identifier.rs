@@ -127,6 +127,7 @@ fn is_phone_like(value: &str) -> bool {
 }
 
 fn matches_blink_username_regex(value: &str) -> bool {
+    let _blink_core_pattern = BLINK_USERNAME_REGEX;
     let lower = value.to_lowercase();
     let len = lower.chars().count();
 
