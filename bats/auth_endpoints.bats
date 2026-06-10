@@ -100,6 +100,32 @@ teardown_file() {
   [ "$output" = "400" ]
 }
 
+@test "auth: strict registration validation rejects modifiers numeric and legacy punctuation (D-09/D-16)" {
+  auth="$(auth_payload "validname")"
+  pubkey="$(json_get "$auth" '.pubkey')"
+  timestamp="$(json_get "$auth" '.timestamp')"
+  signature="$(json_get "$auth" '.register_signature')"
+
+  for invalid_username in "alice+btc" "12345" "legacy.name" "bc1alice"; do
+    data="{\"username\":\"${invalid_username}\",\"signature\":\"${signature}\",\"timestamp\":${timestamp},\"description\":\"Invalid identifier\"}"
+    response="$(http_status_body "POST" "${BASE_URL}/lnurlpay/${pubkey}" "localhost:8080" "$data")"
+    code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    [ "$code" = "400" ]
+    [ "$body" = '"invalid username"' ]
+  done
+}
+
+@test "auth: availability rejects phone-like numeric usernames before lookup (D-01/IDEN-05)" {
+  response="$(http_status_body "GET" "${BASE_URL}/lnurlpay/available/573005871212" "localhost:8080")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "400" ]
+  [ "$body" = '"invalid username"' ]
+}
+
 @test "auth: register rejects stale timestamp" {
   auth="$(auth_payload "staleregister" "1")"
   pubkey="$(json_get "$auth" '.pubkey')"

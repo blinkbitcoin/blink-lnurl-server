@@ -222,6 +222,20 @@ http_status_body() {
   fi
 }
 
+insert_legacy_user() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local pubkey="${3:?pubkey is required}"
+  local description="${4:-Legacy Spark wallet}"
+  local sql_username="${username//\'/\'\'}"
+  local sql_host="${host//\'/\'\'}"
+  local sql_pubkey="${pubkey//\'/\'\'}"
+  local sql_description="${description//\'/\'\'}"
+
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "INSERT INTO users(domain, pubkey, name, description, updated_at) VALUES ('${sql_host}', '${sql_pubkey}', '${sql_username}', '${sql_description}', 0) ON CONFLICT (domain, pubkey) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at" >/dev/null
+}
+
 username_available() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
