@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -681,6 +683,7 @@ pub mod shared_tests {
         assert!(matches!(result, Err(LnurlRepositoryError::SourceNotOwner)));
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn side_effect_records_round_trip_account_id<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -765,7 +768,7 @@ pub mod shared_tests {
         assert_eq!(zap.user_pubkey, "spark_side_effect_pubkey");
 
         let webhook_payloads = db
-            .get_webhook_payloads(&[payment_hash.clone()])
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
             .await
             .unwrap();
         let webhook_payload = webhook_payloads

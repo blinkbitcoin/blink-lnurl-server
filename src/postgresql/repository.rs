@@ -90,6 +90,7 @@ fn map_account(row: &sqlx::postgres::PgRow) -> Result<Account, LnurlRepositoryEr
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::too_many_lines)]
 impl crate::repository::LnurlRepository for LnurlRepository {
     async fn delete_user(&self, domain: &str, pubkey: &str) -> Result<(), LnurlRepositoryError> {
         sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2")
@@ -266,10 +267,9 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 .bind(&account_id)
                 .fetch_optional(&mut *tx)
                 .await?
+            && AccountProvider::from_database_value(&provider)? != AccountProvider::Spark
         {
-            if AccountProvider::from_database_value(&provider)? != AccountProvider::Spark {
-                return Err(LnurlRepositoryError::InvalidProvider);
-            }
+            return Err(LnurlRepositoryError::InvalidProvider);
         }
 
         if let Some((owner_account_id,)) = sqlx::query_as::<_, (String,)>(
