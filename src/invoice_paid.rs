@@ -391,6 +391,19 @@ mod shared_tests {
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_provider_helper".to_string()),
+            pubkey: "spark_provider_helper_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "provider-helper.example.com".to_string(),
+                identifier: "providerhelper".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "provider helper".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
         create_provider_invoice_for_account(
             db,
             "provider_helper_invoice_hash",

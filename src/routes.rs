@@ -27,7 +27,7 @@ use bitcoin::{
     hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256},
     secp256k1::{PublicKey, XOnlyPublicKey, ecdsa::Signature},
 };
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use nostr::{Alphabet, Event, EventBuilder, JsonUtil, Kind, TagStandard, key::Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -830,6 +830,12 @@ where
             error!("failed to parse invoice: {}", e);
             lnurl_error("internal server error")
         })?;
+
+        if !matches!(invoice.description(), Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0.to_string() == desc_hash.to_string())
+        {
+            error!("provider returned invoice with unexpected description hash");
+            return Err(lnurl_error("internal server error"));
+        }
 
         // Calculate expiry timestamp: current time + expiry duration from invoice
         let expiry_timestamp = invoice.expires_at().ok_or_else(|| {
@@ -2541,12 +2547,22 @@ mod tests {
     }
 
     fn generate_route_test_invoice(preimage_byte: u8) -> (String, String) {
+        generate_route_test_invoice_with_description_hash(
+            preimage_byte,
+            sha256::Hash::hash("route test invoice".as_bytes()),
+        )
+    }
+
+    fn generate_route_test_invoice_with_description_hash(
+        preimage_byte: u8,
+        description_hash: sha256::Hash,
+    ) -> (String, String) {
         let preimage = [preimage_byte; 32];
         let payment_hash = sha256::Hash::hash(&preimage);
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let key = bitcoin::secp256k1::SecretKey::from_slice(&[42_u8; 32]).unwrap();
         let invoice = lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Regtest)
-            .description("route test invoice".to_string())
+            .description_hash(description_hash)
             .payment_hash(payment_hash)
             .payment_secret(lightning_invoice::PaymentSecret([0_u8; 32]))
             .current_timestamp()
@@ -2559,7 +2575,7 @@ mod tests {
     }
 
     async fn start_blink_invoice_mock_server(
-        bolt11: String,
+        _bolt11: String,
         fail: bool,
     ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2571,10 +2587,9 @@ mod tests {
             post(move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls_for_route);
                 let bodies = Arc::clone(&bodies_for_route);
-                let bolt11 = bolt11.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    bodies.lock().unwrap().push(body);
+                    bodies.lock().unwrap().push(body.clone());
                     if fail {
                         return Json(json!({
                             "data": {
@@ -2583,6 +2598,15 @@ mod tests {
                             }
                         }));
                     }
+                    let request_description_hash = body["variables"]["input"]["descriptionHash"]
+                        .as_str()
+                        .and_then(|hash| sha256::Hash::from_str(hash).ok())
+                        .expect("Blink invoice mock requires a description hash");
+                    let call_index = u8::try_from(calls.load(Ordering::SeqCst)).unwrap_or(u8::MAX);
+                    let (_, bolt11) = generate_route_test_invoice_with_description_hash(
+                        100_u8.saturating_add(call_index),
+                        request_description_hash,
+                    );
                     Json(json!({
                         "data": {
                             "lnInvoiceCreateOnBehalfOfRecipient": {
@@ -3458,8 +3482,8 @@ mod tests {
             "invoice callback must carry resolved account ownership into side effects"
         );
         assert!(
-            invoice_callback.contains("create_invoice_for_account"),
-            "invoice callback must use account-aware invoice construction"
+            invoice_callback.contains("create_provider_invoice_for_account"),
+            "invoice callback must use provider-aware account invoice construction"
         );
         assert!(
             !invoice_callback.contains("crate::invoice_paid::create_invoice(")
@@ -3475,7 +3499,7 @@ mod tests {
         // create invoices through the provider registry, return exactly
         // pr/routes/verify, and persist provider-neutral metadata without a fake
         // Spark pubkey.
-        let (payment_hash, bolt11) = generate_route_test_invoice(11);
+        let (_payment_hash, bolt11) = generate_route_test_invoice(11);
         let (endpoint, calls, _bodies) =
             start_blink_invoice_mock_server(bolt11.clone(), false).await;
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
@@ -3502,7 +3526,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["pr", "routes", "verify"]
         );
-        assert_eq!(body["pr"], bolt11);
+        let returned_invoice = Bolt11Invoice::from_str(body["pr"].as_str().unwrap())
+            .expect("mock should return a valid invoice");
+        let payment_hash = returned_invoice.payment_hash().to_string();
         assert_eq!(
             body["verify"],
             format!("http://example.com/verify/{payment_hash}")
