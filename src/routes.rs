@@ -2907,6 +2907,157 @@ mod tests {
         assert!(verify_body.get("provider").is_none());
     }
 
+    fn metadata_entries(metadata: &str) -> Vec<(String, String)> {
+        serde_json::from_str::<Vec<(String, String)>>(metadata)
+            .expect("metadata must be a JSON array of string tuples")
+    }
+
+    fn phone_blink_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            identifier: "+573005871212".to_string(),
+            identifier_kind: AccountIdentifierKind::Phone,
+            description: "Phone Blink account".to_string(),
+            ..blink_resolved_recipient()
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_username_metadata_uses_description_and_requested_identity_lnurl_01_lnurl_02_d_01_d_02_d_19() {
+        // LNURL-01/LNURL-02/D-01/D-02/D-19: public discovery must resolve a
+        // Blink recipient by canonical identifier, expose the requested
+        // Lightning Address identity, and not require Spark-only metadata.
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("Example.COM".to_string()),
+            Path("alice".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(response.callback, "http://example.com/lnurlp/alice/invoice");
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Alice Blink account".to_string()),
+                ("text/identifier".to_string(), "alice@example.com".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_wallet_alias_preserves_public_identity_but_looks_up_canonical_lnurl_01_lnurl_02_d_03_comp_04() {
+        // LNURL-01/LNURL-02/D-03/COMP-04: virtual +usd aliases influence only
+        // public metadata/callback identity and wallet intent; repository lookup
+        // remains canonical and never persists identifier+usd.
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink alias discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(
+            response.callback,
+            "http://example.com/lnurlp/alice+usd/invoice"
+        );
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Alice Blink account".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "alice+usd@example.com".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_phone_identifier_keeps_requested_phone_identity_lnurl_01_lnurl_02_d_04() {
+        // LNURL-01/LNURL-02/D-04: payer-supplied public phone identifiers are
+        // allowed in metadata identity and must not be masked by description.
+        let repo = MockRepository::default().with_resolved_recipient(phone_blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("573005871212".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink phone discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "+573005871212".to_string())]
+        );
+        assert_eq!(
+            response.callback,
+            "http://example.com/lnurlp/+573005871212/invoice"
+        );
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Phone Blink account".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "+573005871212@example.com".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_missing_and_invalid_phone_like_identifiers_keep_spark_not_found_shape_d_19() {
+        // D-19: missing/invalid Blink-looking public discovery must not leak
+        // Blink-specific provider, account, phone, or existence details.
+        let missing_repo = MockRepository::default();
+        let missing_state = internal_route_test_state(missing_repo, None).await;
+        let missing = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice".to_string()),
+            Extension(missing_state),
+        )
+        .await;
+
+        let Err((missing_status, Json(missing_body))) = missing else {
+            panic!("missing recipient should keep Spark-compatible not-found shape");
+        };
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_body, Value::String(String::new()));
+
+        let invalid_repo = MockRepository::default();
+        let invalid_state = internal_route_test_state(invalid_repo.clone(), None).await;
+        let invalid = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("12345".to_string()),
+            Extension(invalid_state),
+        )
+        .await;
+
+        let Err((invalid_status, Json(invalid_body))) = invalid else {
+            panic!("invalid phone-like recipient should keep Spark-compatible not-found shape");
+        };
+        assert_eq!(invalid_status, StatusCode::NOT_FOUND);
+        assert_eq!(invalid_body, Value::String(String::new()));
+        assert!(invalid_repo.resolve_calls().is_empty());
+    }
+
     #[test]
     fn provider_invoice_metadata_contract_prov_04_lnurl_05_lnurl_06_d_11_d_13_d_15() {
         // PROV-04/LNURL-05/D-11/D-13/D-15: provider-neutral invoice rows must
