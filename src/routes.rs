@@ -2011,6 +2011,7 @@ mod tests {
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
     use tower::util::ServiceExt;
@@ -2380,6 +2381,19 @@ mod tests {
         repo: MockRepository,
         internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
     ) -> State<MockRepository> {
+        internal_route_test_state_with_blink_endpoint(
+            repo,
+            internal_auth,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
+        )
+        .await
+    }
+
+    async fn internal_route_test_state_with_blink_endpoint(
+        repo: MockRepository,
+        internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+        blink_endpoint: &str,
+    ) -> State<MockRepository> {
         let network = spark_wallet::Network::Regtest;
         let auth_seed = [7_u8; 32];
         let spark_config = spark_wallet::SparkWalletConfig::default_config(network);
@@ -2413,9 +2427,7 @@ mod tests {
         );
         let providers = Arc::new(crate::providers::ProviderRegistry::new(
             Arc::clone(&wallet),
-            blink_client::Client::new(blink_client::ClientConfig::new(
-                blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
-            )),
+            blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
         ));
         let (invoice_paid_trigger, _rx) = watch::channel(());
         State {
@@ -2467,6 +2479,101 @@ mod tests {
             },
         );
         repo
+    }
+
+    fn generate_route_test_invoice(preimage_byte: u8) -> (String, String) {
+        let preimage = [preimage_byte; 32];
+        let payment_hash = sha256::Hash::hash(&preimage);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&[42_u8; 32]).unwrap();
+        let invoice = lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Regtest)
+            .description("route test invoice".to_string())
+            .payment_hash(payment_hash)
+            .payment_secret(lightning_invoice::PaymentSecret([0_u8; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(1_000)
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key))
+            .expect("test invoice should build");
+
+        (payment_hash.to_string(), invoice.to_string())
+    }
+
+    async fn start_blink_invoice_mock_server(
+        bolt11: String,
+        fail: bool,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_route = Arc::clone(&calls);
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/graphql",
+            post(move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls_for_route);
+                let bodies = Arc::clone(&bodies_for_route);
+                let bolt11 = bolt11.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body);
+                    if fail {
+                        return Json(json!({
+                            "data": {
+                                "lnInvoiceCreateOnBehalfOfRecipient": { "invoice": null, "errors": [{"message": "upstream hidden"}] },
+                                "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": { "invoice": null, "errors": [{"message": "upstream hidden"}] }
+                            }
+                        }));
+                    }
+                    Json(json!({
+                        "data": {
+                            "lnInvoiceCreateOnBehalfOfRecipient": {
+                                "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_btc_hash" },
+                                "errors": []
+                            },
+                            "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": {
+                                "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_usd_hash" },
+                                "errors": []
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Blink server should serve");
+        });
+        (format!("http://{addr}/graphql"), calls, bodies)
+    }
+
+    async fn get_public_invoice(
+        state: State<MockRepository>,
+        identifier: &str,
+        params: LnurlPayCallbackParams,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        LnurlServer::<MockRepository>::handle_invoice(
+            Host("example.com".to_string()),
+            Path(identifier.to_string()),
+            Query(params),
+            Extension(state),
+        )
+        .await
+    }
+
+    fn assert_lnurl_error(result: Result<Json<Value>, (StatusCode, Json<Value>)>, reason: &str) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected LNURL error {reason}");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], reason);
     }
 
     fn internal_test_token() -> String {
@@ -3249,6 +3356,214 @@ mod tests {
             !invoice_callback.contains("crate::invoice_paid::create_invoice(")
                 && !invoice_callback.contains("invoice_paid::create_invoice("),
             "migrated invoice callback must not use the legacy account-less helper"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_blink_default_persists_provider_metadata_prov_04_lnurl_05_lnurl_06_d_12_d_15_d_16()
+     {
+        // PROV-04/LNURL-05/LNURL-06/D-12/D-15/D-16: Blink public callbacks must
+        // create invoices through the provider registry, return exactly
+        // pr/routes/verify, and persist provider-neutral metadata without a fake
+        // Spark pubkey.
+        let (payment_hash, bolt11) = generate_route_test_invoice(11);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server(bolt11.clone(), false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let Json(body) = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("Blink default invoice callback should succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            body.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["pr", "routes", "verify"]
+        );
+        assert_eq!(body["pr"], bolt11);
+        assert_eq!(
+            body["verify"],
+            format!("http://example.com/verify/{payment_hash}")
+        );
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should be persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(stored.wallet_id.as_deref(), Some("usd_wallet_123"));
+        assert_eq!(
+            stored.provider_payment_hash.as_deref(),
+            Some("provider_usd_hash")
+        );
+        assert_eq!(stored.account_id.as_deref(), Some("acct_blink_lookup"));
+        assert_eq!(stored.domain.as_deref(), Some("example.com"));
+        assert_eq!(stored.payment_hash, payment_hash);
+        assert_ne!(
+            stored.user_pubkey, "spark_pubkey_123",
+            "Blink must not invent a fake Spark pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_blink_wallet_alias_and_expiry_policy_lnurl_04_d_03_d_05_d_06_d_07_d_08_d_09_d_10()
+     {
+        // LNURL-04/D-03/D-05-D-10: +btc/+usd aliases select Blink wallets and
+        // route-owned expiry policy converts public seconds to provider-ready
+        // minutes before dispatch.
+        let (_payment_hash, bolt11) = generate_route_test_invoice(12);
+        let (endpoint, calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+
+        for (identifier, expiry, expected_wallet, expected_expiry) in [
+            ("alice+btc", None, "btc_wallet_123", None),
+            ("alice+btc", Some(60), "btc_wallet_123", Some(1)),
+            ("alice+btc", Some(61), "btc_wallet_123", Some(2)),
+            ("alice+btc", Some(86_400), "btc_wallet_123", Some(1440)),
+            ("alice+usd", Some(300), "usd_wallet_123", Some(5)),
+        ] {
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            get_public_invoice(
+                state,
+                identifier,
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    expiry,
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await
+            .expect("accepted Blink expiry should create invoice");
+            let body = bodies
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("provider body captured");
+            assert_eq!(
+                body["variables"]["input"]["recipientWalletId"],
+                expected_wallet
+            );
+            match expected_expiry {
+                Some(minutes) => assert_eq!(body["variables"]["input"]["expiresIn"], minutes),
+                None => assert!(body["variables"]["input"].get("expiresIn").is_none()),
+            }
+        }
+
+        for (identifier, expiry) in [("alice+btc", 86_401), ("alice+usd", 301)] {
+            let before = calls.load(Ordering::SeqCst);
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            assert_lnurl_error(
+                get_public_invoice(
+                    state,
+                    identifier,
+                    LnurlPayCallbackParams {
+                        amount: Some(1_000),
+                        expiry: Some(expiry),
+                        ..LnurlPayCallbackParams::default()
+                    },
+                )
+                .await,
+                "expiry too long",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "over-limit expiry must not dispatch provider calls"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_validation_before_dispatch_lnurl_03_comp_04_d_17_d_18() {
+        // LNURL-03/COMP-04/D-17/D-18: route-owned validation must happen before
+        // provider dispatch and public errors must use stable plain phrases.
+        let (_payment_hash, bolt11) = generate_route_test_invoice(13);
+        let (endpoint, calls, _bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+
+        for (params, expected) in [
+            (LnurlPayCallbackParams::default(), "missing amount"),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    comment: Some("x".repeat(MAX_COMMENT_LENGTH + 1)),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "comment too long",
+            ),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    nostr: Some("not-json".to_string()),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "nostr zap not supported",
+            ),
+        ] {
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            let before = calls.load(Ordering::SeqCst);
+            assert_lnurl_error(get_public_invoice(state, "alice", params).await, expected);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "{expected} must happen before provider dispatch"
+            );
+        }
+
+        let spark_repo =
+            MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let spark_state =
+            internal_route_test_state_with_blink_endpoint(spark_repo, None, &endpoint).await;
+        assert_lnurl_error(
+            get_public_invoice(
+                spark_state,
+                "bob+usd",
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "unsupported wallet",
+        );
+
+        let (failing_endpoint, _failing_calls, _failing_bodies) =
+            start_blink_invoice_mock_server("lnbc1unused".to_string(), true).await;
+        let failing_repo =
+            MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let failing_state =
+            internal_route_test_state_with_blink_endpoint(failing_repo, None, &failing_endpoint)
+                .await;
+        assert_lnurl_error(
+            get_public_invoice(
+                failing_state,
+                "alice",
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "invoice creation failed",
         );
     }
 
