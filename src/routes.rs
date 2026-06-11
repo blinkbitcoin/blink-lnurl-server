@@ -1,12 +1,13 @@
 use crate::identifier::{
-    IdentifierError, WalletModifier, canonical_spark_username, parse_public_identifier,
+    IdentifierError, IdentifierKind, WalletModifier, canonical_spark_username, parse_public_identifier,
 };
 use crate::models::{
-    CheckUsernameAvailableResponse, InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest,
-    ListMetadataResponse, PublishZapReceiptRequest, PublishZapReceiptResponse,
-    RecoverLnurlPayRequest, RecoverLnurlPayResponse, RegisterLnurlPayRequest,
-    RegisterLnurlPayResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
-    UnregisterLnurlPayRequest, sanitize_username,
+    CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
+    InternalAccountIdentifierResponse, InternalErrorResponse, InvoicePaidRequest,
+    InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
+    PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+    RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
+    TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
 };
 use axum::{
     Extension, Json,
@@ -41,8 +42,8 @@ use crate::{
     providers::{CreateInvoiceRequest, ProviderError},
     repository::{
         AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
-        LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
-        WalletKind,
+        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
+        ResolvedRecipient, WalletKind, generate_account_id,
     },
     state::State,
     user::User,
@@ -1739,11 +1740,16 @@ mod tests {
     use crate::webhooks::repository::WebhookRepositoryError;
     use crate::zap::Zap;
     use axum::body::Bytes;
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::middleware;
+    use axum::routing::post;
+    use axum::Router;
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
+    use tower::ServiceExt;
 
     // -- Mock repository -------------------------------------------------------
 
@@ -1751,6 +1757,7 @@ mod tests {
     struct MockRepository {
         invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
         pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
+        created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
     }
 
     #[async_trait::async_trait]
@@ -1787,6 +1794,16 @@ mod tests {
             _: &str,
         ) -> Result<Option<crate::repository::Account>, LnurlRepositoryError> {
             Ok(None)
+        }
+        async fn create_blink_account(
+            &self,
+            account: &NewBlinkAccount,
+        ) -> Result<(), LnurlRepositoryError> {
+            self.created_blink_accounts
+                .lock()
+                .unwrap()
+                .push(account.clone());
+            Ok(())
         }
         async fn transfer_identifier(
             &self,
@@ -2456,6 +2473,94 @@ mod tests {
                 && !invoice_callback.contains("invoice_paid::create_invoice("),
             "migrated invoice callback must not use the legacy account-less helper"
         );
+    }
+
+    #[tokio::test]
+    async fn create_internal_blink_account_happy_path_requires_valid_internal_token() {
+        // D-01/D-04/D-08/D-09/D-13/D-14/D-16/D-17/D-19: the internal account
+        // creation happy path is locked to /internal/blink/accounts, a scoped
+        // RS256 JWT, local deterministic JWKS/key fixtures, route-boundary
+        // normalization, and exactly one provider-neutral repository write.
+        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let auth_state = Arc::new(crate::internal_auth::InternalAuthState::from_jwks_json(
+            jwks,
+            "https://issuer.internal.test".to_string(),
+            "lnurl-server.internal.test".to_string(),
+        ).expect("test JWKS fixture must load"));
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": "blink:accounts:create accounts:read"
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign");
+
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), Some(auth_state));
+        let app = Router::new()
+            .route(
+                "/internal/blink/accounts",
+                post(LnurlServer::<MockRepository>::create_internal_blink_account),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&CreateBlinkAccountRequest {
+                    domain: "Example.COM".to_string(),
+                    blink_account_id: "blink_account_123".to_string(),
+                    btc_wallet_id: "btc_wallet_123".to_string(),
+                    usd_wallet_id: "usd_wallet_123".to_string(),
+                    default_wallet: "usd".to_string(),
+                    description: "Blink account".to_string(),
+                    identifiers: vec![" Alice_123 ".to_string(), "+573005871212".to_string()],
+                })
+                .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let response: CreateBlinkAccountResponse =
+            serde_json::from_slice(&body).expect("response deserializes");
+        assert_eq!(response.provider, "blink");
+        assert_eq!(response.domain, "example.com");
+        assert_eq!(response.identifiers[0].identifier, "alice_123");
+
+        let created = repo.created_blink_accounts.lock().unwrap();
+        assert_eq!(created.len(), 1, "create_blink_account is called exactly once");
+        let account = &created[0];
+        assert!(account.account_id.as_deref().is_some_and(|id| id.starts_with("acct_blink_")));
+        assert_eq!(account.blink_account_id, "blink_account_123");
+        assert_eq!(account.default_wallet, WalletKind::Usd);
+        assert_eq!(account.identifiers.len(), 2);
+        assert_eq!(account.identifiers[0].domain, "example.com");
+        assert_eq!(account.identifiers[0].identifier, "alice_123");
+        assert_eq!(account.identifiers[0].identifier_kind, AccountIdentifierKind::Username);
+        assert_eq!(account.identifiers[0].description, "Blink account");
+        assert_eq!(account.identifiers[1].identifier, "+573005871212");
+        assert_eq!(account.identifiers[1].identifier_kind, AccountIdentifierKind::Phone);
     }
 
     #[tokio::test]
