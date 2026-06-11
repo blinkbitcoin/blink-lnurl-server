@@ -33,7 +33,7 @@ stop_stack() {
 auth_payload() {
   local username="${1:?username is required}"
   local timestamp="${2:-}"
-  if [ -x "${E2E_AUTH_BIN}" ]; then
+  if [ -x "${E2E_AUTH_BIN}" ] && [ "${E2E_AUTH_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_auth.rs" ]; then
     if [ -n "${timestamp}" ]; then
       "${E2E_AUTH_BIN}" "${username}" "${timestamp}"
     else

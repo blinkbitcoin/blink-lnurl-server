@@ -73,6 +73,80 @@ teardown_file() {
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.lightning_address' 'transferuser@localhost:8080'
   assert_json_equals "$output" '.lnurl' 'lnurlp://localhost:8080/lnurlp/transferuser'
+
+  old_recover_signature="$(json_get "$auth" '.recover_signature')"
+  timestamp="$(json_get "$auth" '.timestamp')"
+  from_pubkey="$(json_get "$auth" '.pubkey')"
+  run recover_user_status "localhost:8080" "$old_recover_signature" "$timestamp" "$from_pubkey"
+  [ "$status" -eq 0 ]
+  [ "$output" = "404" ]
+
+  new_recover_signature="$(json_get "$auth" '.to_recover_signature')"
+  run curl -fsS \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --data "{\"signature\":\"${new_recover_signature}\",\"timestamp\":${timestamp}}" \
+    "${BASE_URL}/lnurlpay/${to_pubkey}/recover"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.username' 'transferuser'
+  assert_json_equals "$output" '.description' 'Transfer target wallet'
+}
+
+@test "auth: re-registration removes stale Spark aliases and preserves recover" {
+  run register_user "oldalias" "localhost:8080" "Old alias wallet"
+  [ "$status" -eq 0 ]
+
+  auth="$(auth_payload "newalias")"
+  pubkey="$(json_get "$auth" '.pubkey')"
+  timestamp="$(json_get "$auth" '.timestamp')"
+  signature="$(json_get "$auth" '.register_signature')"
+  data="{\"username\":\"newalias\",\"signature\":\"${signature}\",\"timestamp\":${timestamp},\"description\":\"New alias wallet\"}"
+
+  response="$(http_status_body "POST" "${BASE_URL}/lnurlpay/${pubkey}" "localhost:8080" "$data")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.lightning_address' 'newalias@localhost:8080'
+
+  run username_available "oldalias" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/oldalias" "localhost:8080")"
+  code="${response##*$'\n'}"
+  [ "$code" = "404" ]
+
+  run recover_user "newalias" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.username' 'newalias'
+  assert_json_equals "$output" '.description' 'New alias wallet'
+}
+
+@test "auth: unregister deletes only the signed Spark identifier" {
+  run register_user "deleteone" "localhost:8080" "Delete one wallet"
+  [ "$status" -eq 0 ]
+
+  auth="$(auth_payload "deleteone")"
+  pubkey="$(json_get "$auth" '.pubkey')"
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) SELECT account_id, 'localhost:8080', 'keepone', 'username', 'Keep one wallet', 0, 0 FROM spark_accounts WHERE pubkey = '${pubkey}' ON CONFLICT (domain, identifier) DO NOTHING" >/dev/null
+
+  run unregister_user "deleteone" "localhost:8080"
+  [ "$status" -eq 0 ]
+
+  run username_available "deleteone" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+
+  run lnurl_discovery "keepone" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_nonempty "$output" '.callback'
+  metadata_description="$(json_get "$output" '.metadata | fromjson | .[0][1]')"
+  [ "$metadata_description" = "Keep one wallet" ]
+
+  run unregister_user "keepone" "localhost:8080"
+  [ "$status" -eq 0 ]
 }
 
 @test "auth: transfer rejects invalid signature with stable error shape" {
@@ -155,12 +229,12 @@ teardown_file() {
 }
 
 @test "auth: recover returns 404 for missing registration" {
-  unregister_user "missingrecover" "localhost:8080" >/dev/null || true
-
   auth="$(auth_payload "missingrecover")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
   signature="$(json_get "$auth" '.recover_signature')"
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "DELETE FROM account_identifiers WHERE account_id IN (SELECT account_id FROM spark_accounts WHERE pubkey = '${pubkey}'); DELETE FROM users WHERE pubkey = '${pubkey}'" >/dev/null
 
   run recover_user_status "localhost:8080" "$signature" "$timestamp" "$pubkey"
   [ "$status" -eq 0 ]
