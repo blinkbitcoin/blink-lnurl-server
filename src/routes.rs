@@ -2166,6 +2166,23 @@ mod tests {
         assert_eq!(user.description, "Alice wallet");
     }
 
+    #[test]
+    fn invoice_callback_writes_account_owned_side_effects() {
+        let invoice_callback = handler_source("handle_invoice");
+        assert!(
+            invoice_callback.contains("recipient.account_id"),
+            "invoice callback must carry resolved account ownership into side effects"
+        );
+        assert!(
+            invoice_callback.contains("create_invoice_for_account"),
+            "invoice callback must use account-aware invoice construction"
+        );
+        assert!(
+            !invoice_callback.contains("create_invoice("),
+            "migrated invoice callback must not use the legacy account-less helper"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_valid_payment_marks_invoice_paid() {
         let repo = setup_repo_with_invoice(TEST_PREIMAGE_HEX, TEST_RECEIVER_PUBKEY);

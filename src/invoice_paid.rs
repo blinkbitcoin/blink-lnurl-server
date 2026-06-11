@@ -250,6 +250,35 @@ mod shared_tests {
 
     use super::test_helpers::generate_test_invoice;
 
+    pub async fn create_invoice_for_account_sets_account_id<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        create_invoice_for_account(
+            db,
+            "account_invoice_hash",
+            Some("acct_spark_invoice"),
+            "spark_account_invoice_pubkey",
+            "lnbc1accountinvoice",
+            i64::MAX,
+            "account-invoice.example.com",
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash("account_invoice_hash")
+            .await
+            .unwrap()
+            .expect("invoice should be stored");
+        assert_eq!(stored.account_id.as_deref(), Some("acct_spark_invoice"));
+        assert_eq!(stored.user_pubkey, "spark_account_invoice_pubkey");
+        assert_eq!(
+            stored.domain.as_deref(),
+            Some("account-invoice.example.com")
+        );
+    }
+
     pub async fn invoices_paid_creates_invoice_when_only_comment_exists<DB>(db: &DB)
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
@@ -491,6 +520,12 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
+    async fn create_invoice_for_account_sets_account_id() {
+        let db = setup_test_db().await;
+        shared_tests::create_invoice_for_account_sets_account_id(&db).await;
+    }
+
+    #[tokio::test]
     async fn invoices_paid_creates_invoice_when_only_comment_exists() {
         let db = setup_test_db().await;
         shared_tests::invoices_paid_creates_invoice_when_only_comment_exists(&db).await;
@@ -553,6 +588,14 @@ mod postgres_tests {
             .ok()?;
 
         Some(crate::postgresql::LnurlRepository::new(pool))
+    }
+
+    #[tokio::test]
+    async fn create_invoice_for_account_sets_account_id() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::create_invoice_for_account_sets_account_id(&db).await;
     }
 
     #[tokio::test]
