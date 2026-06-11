@@ -2150,6 +2150,109 @@ mod tests {
         }
     }
 
+    // -- Public LNURL provider-dispatch compatibility -------------------------
+
+    #[test]
+    fn public_lnurl_discovery_shape_remains_spark_compatible() {
+        let user = User {
+            domain: "localhost:8080".to_string(),
+            pubkey: "02abc123".to_string(),
+            name: "alice".to_string(),
+            description: "Alice wallet".to_string(),
+        };
+        let response = PayResponse {
+            callback: "http://localhost:8080/lnurlp/alice/invoice".to_string(),
+            max_sendable: 1_000_000,
+            min_sendable: 1_000,
+            tag: Tag::Pay,
+            metadata: get_metadata(&user.domain, &user),
+            comment_allowed: Some(MAX_COMMENT_LENGTH as u32),
+            allows_nostr: None,
+            nostr_pubkey: None,
+        };
+
+        let body = serde_json::to_value(response).expect("PayResponse serializes");
+        assert_eq!(body["tag"], "payRequest");
+        assert_eq!(body["callback"], "http://localhost:8080/lnurlp/alice/invoice");
+        assert_eq!(body["minSendable"], 1_000);
+        assert_eq!(body["maxSendable"], 1_000_000);
+        assert_eq!(body["commentAllowed"], MAX_COMMENT_LENGTH);
+        assert!(body.get("metadata").is_some());
+        assert!(body.get("provider").is_none());
+        assert!(body.get("account_id").is_none());
+    }
+
+    #[test]
+    fn public_invoice_and_verify_shapes_remain_spark_compatible() {
+        let invoice_body = json!({
+            "pr": "lnbc1testinvoice",
+            "routes": Vec::<String>::new(),
+            "verify": "http://localhost:8080/verify/payment_hash",
+        });
+        assert_eq!(invoice_body["pr"], "lnbc1testinvoice");
+        assert_eq!(invoice_body["routes"].as_array().unwrap().len(), 0);
+        assert_eq!(invoice_body["verify"], "http://localhost:8080/verify/payment_hash");
+        assert!(invoice_body.get("provider").is_none());
+        assert!(invoice_body.get("account_id").is_none());
+
+        let verify_body = json!({
+            "status": "OK",
+            "settled": false,
+            "preimage": Value::Null,
+            "pr": "lnbc1testinvoice",
+        });
+        assert_eq!(verify_body["status"], "OK");
+        assert_eq!(verify_body["settled"], false);
+        assert!(verify_body.get("provider").is_none());
+    }
+
+    #[test]
+    fn unsupported_spark_usd_maps_to_existing_lnurl_error_shape() {
+        let routes_source = include_str!("routes.rs");
+        assert!(
+            routes_source.contains("fn map_provider_invoice_error"),
+            "routes must own provider error to LNURL JSON mapping"
+        );
+        assert!(
+            routes_source.contains("ProviderError::UnsupportedWallet"),
+            "unsupported wallet errors must be mapped at the route boundary"
+        );
+
+        let (status, Json(body)) = lnurl_error("unsupported wallet");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], "unsupported wallet");
+    }
+
+    #[test]
+    fn public_invoice_handler_source_uses_provider_dispatch_boundary() {
+        let invoice = handler_source("handle_invoice");
+        assert!(
+            invoice.contains("parse_public_identifier"),
+            "callback must parse wallet modifiers before provider dispatch"
+        );
+        assert!(
+            invoice.contains("resolve_recipient_by_identifier"),
+            "callback must resolve account-backed recipients"
+        );
+        assert!(
+            invoice.contains("provider_for"),
+            "callback must select the provider by resolved recipient provider"
+        );
+        assert!(
+            invoice.contains("create_invoice"),
+            "callback must create invoices through the selected provider"
+        );
+        assert!(
+            !invoice.contains("state.wallet.create_lightning_invoice"),
+            "callback must not call the Spark wallet directly"
+        );
+
+        let providers_source = include_str!("providers.rs");
+        assert!(!providers_source.contains("use axum"));
+        assert!(!providers_source.contains("serde_json"));
+    }
+
     #[test]
     fn spark_recipient_adapts_to_legacy_recover_fields() {
         let recipient = crate::repository::ResolvedRecipient {
