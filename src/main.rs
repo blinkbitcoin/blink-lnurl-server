@@ -418,6 +418,10 @@ where
             "/blink/accounts",
             post(LnurlServer::<DB>::create_internal_blink_account),
         )
+        .route(
+            "/domains/{domain}/identifiers/{identifier}",
+            get(LnurlServer::<DB>::get_internal_identifier),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             internal_auth::internal_auth::<DB>,

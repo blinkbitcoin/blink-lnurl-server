@@ -150,7 +150,7 @@ pub fn require_scope(
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            Json(InternalErrorResponse::new("missing required scope")),
+            Json(InternalErrorResponse::new("forbidden")),
         ))
     }
 }

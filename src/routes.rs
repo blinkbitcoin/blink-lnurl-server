@@ -5,13 +5,15 @@ use crate::identifier::{
 use crate::models::{
     CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
     INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS, INTERNAL_ERROR_IDENTIFIER_CONFLICT,
-    INTERNAL_ERROR_INTERNAL_SERVER_ERROR, INTERNAL_ERROR_INVALID_IDENTIFIER,
-    INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
-    InternalAccountIdentifierResponse, InternalErrorResponse, InvoicePaidRequest,
-    InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
-    PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
-    RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
-    TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
+    INTERNAL_ERROR_INTERNAL_SERVER_ERROR, INTERNAL_ERROR_INVALID_DOMAIN,
+    INTERNAL_ERROR_INVALID_IDENTIFIER, INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND,
+    INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
+    InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
+    InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse,
+    PublishZapReceiptRequest, PublishZapReceiptResponse, RecoverLnurlPayRequest,
+    RecoverLnurlPayResponse, RegisterLnurlPayRequest, RegisterLnurlPayResponse,
+    TransferLnurlPayRequest, TransferLnurlPayResponse, UnregisterLnurlPayRequest,
+    sanitize_username,
 };
 use axum::{
     Extension, Json,
@@ -1160,6 +1162,70 @@ where
             identifiers: response_identifiers,
         }))
     }
+
+    pub async fn get_internal_identifier(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Path((domain, identifier)): Path<(String, String)>,
+        Extension(state): Extension<State<DB>>,
+    ) -> Result<Json<InternalIdentifierLookupResponse>, (StatusCode, Json<InternalErrorResponse>)>
+    {
+        crate::internal_auth::require_scope(&principal, crate::internal_auth::SCOPE_ACCOUNTS_READ)?;
+
+        let domain = validate_internal_lookup_domain(&domain)?;
+        let parsed = parse_public_identifier(&identifier).map_err(|e| {
+            trace!("invalid internal lookup identifier '{identifier}': {e:?}");
+            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
+        })?;
+
+        let recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &parsed.canonical)
+            .await
+            .map_err(internal_lookup_storage_error)?;
+        let Some(recipient) = recipient else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
+            ));
+        };
+
+        Ok(Json(internal_identifier_lookup_response(
+            recipient,
+            parsed.wallet,
+        )))
+    }
+}
+
+fn internal_identifier_lookup_response(
+    recipient: ResolvedRecipient,
+    requested_wallet: Option<WalletModifier>,
+) -> InternalIdentifierLookupResponse {
+    InternalIdentifierLookupResponse {
+        provider: recipient.provider.as_str().to_string(),
+        account_id: recipient.account_id,
+        domain: recipient.domain,
+        identifier: recipient.identifier,
+        identifier_kind: recipient.identifier_kind.as_str().to_string(),
+        description: recipient.description,
+        requested_wallet: requested_wallet
+            .map(|wallet| wallet_modifier_response_value(wallet).to_string()),
+        provider_details: InternalProviderDetailsResponse {
+            spark_pubkey: recipient.spark_pubkey,
+            blink_account_id: recipient.blink_account_id,
+            btc_wallet_id: recipient.btc_wallet_id,
+            usd_wallet_id: recipient.usd_wallet_id,
+            default_wallet: recipient
+                .default_wallet
+                .map(|wallet| wallet.as_str().to_string()),
+        },
+    }
+}
+
+const fn wallet_modifier_response_value(modifier: WalletModifier) -> &'static str {
+    match modifier {
+        WalletModifier::Btc => "btc",
+        WalletModifier::Usd => "usd",
+    }
 }
 
 fn validate_internal_domain(
@@ -1168,6 +1234,17 @@ fn validate_internal_domain(
     let domain = domain.trim().to_lowercase();
     if domain.is_empty() {
         Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
+    } else {
+        Ok(domain)
+    }
+}
+
+fn validate_internal_lookup_domain(
+    domain: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let domain = domain.trim().to_lowercase();
+    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_DOMAIN))
     } else {
         Ok(domain)
     }
@@ -1229,6 +1306,18 @@ fn internal_account_creation_error(
             )
         }
     }
+}
+
+fn internal_lookup_storage_error(
+    error: LnurlRepositoryError,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    error!("failed to resolve internal identifier lookup: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(InternalErrorResponse::new(
+            INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+        )),
+    )
 }
 
 fn internal_bad_request(message: &'static str) -> (StatusCode, Json<InternalErrorResponse>) {
@@ -2455,7 +2544,11 @@ mod tests {
         (status, body)
     }
 
-    async fn get_internal_identifier(app: Router, path: &str, token: String) -> (StatusCode, Value) {
+    async fn get_internal_identifier(
+        app: Router,
+        path: &str,
+        token: String,
+    ) -> (StatusCode, Value) {
         let request = Request::builder()
             .method("GET")
             .uri(path)
@@ -3134,7 +3227,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "alice".to_string())]);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
         assert_eq!(body["provider"], "blink");
         assert_eq!(body["account_id"], "acct_blink_lookup");
         assert_eq!(body["domain"], "example.com");
@@ -3142,11 +3238,18 @@ mod tests {
         assert_eq!(body["identifier_kind"], "username");
         assert_eq!(body["description"], "Alice Blink account");
         assert_eq!(body["requested_wallet"], "btc");
-        assert_eq!(body["provider_details"]["blink_account_id"], "blink_account_123");
+        assert_eq!(
+            body["provider_details"]["blink_account_id"],
+            "blink_account_123"
+        );
         assert_eq!(body["provider_details"]["btc_wallet_id"], "btc_wallet_123");
         assert_eq!(body["provider_details"]["usd_wallet_id"], "usd_wallet_123");
         assert_eq!(body["provider_details"]["default_wallet"], "usd");
-        assert!(body["provider_details"].get("spark_pubkey").is_none_or(Value::is_null));
+        assert!(
+            body["provider_details"]
+                .get("spark_pubkey")
+                .is_none_or(Value::is_null)
+        );
     }
 
     #[tokio::test]
@@ -3162,12 +3265,19 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "bob".to_string())]);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "bob".to_string())]
+        );
         assert_eq!(body["provider"], "spark");
         assert_eq!(body["account_id"], "acct_spark_lookup");
         assert_eq!(body["requested_wallet"], "usd");
         assert_eq!(body["provider_details"]["spark_pubkey"], "spark_pubkey_123");
-        assert!(body["provider_details"].get("blink_account_id").is_none_or(Value::is_null));
+        assert!(
+            body["provider_details"]
+                .get("blink_account_id")
+                .is_none_or(Value::is_null)
+        );
     }
 
     #[tokio::test]
@@ -3201,7 +3311,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, json!({"error": "not_found"}));
-        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "alice".to_string())]);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
     }
 
     #[tokio::test]

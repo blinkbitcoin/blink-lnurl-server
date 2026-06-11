@@ -6,6 +6,8 @@ pub const INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED: &str = "wallet_modifier_no
 pub const INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS: &str = "blink_account_exists";
 pub const INTERNAL_ERROR_IDENTIFIER_CONFLICT: &str = "identifier_conflict";
 pub const INTERNAL_ERROR_INTERNAL_SERVER_ERROR: &str = "internal_server_error";
+pub const INTERNAL_ERROR_INVALID_DOMAIN: &str = "invalid_domain";
+pub const INTERNAL_ERROR_NOT_FOUND: &str = "not_found";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateBlinkAccountRequest {
@@ -35,6 +37,32 @@ pub struct InternalAccountIdentifierResponse {
     pub identifier: String,
     pub kind: String,
     pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InternalIdentifierLookupResponse {
+    pub provider: String,
+    pub account_id: String,
+    pub domain: String,
+    pub identifier: String,
+    pub identifier_kind: String,
+    pub description: String,
+    pub requested_wallet: Option<String>,
+    pub provider_details: InternalProviderDetailsResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InternalProviderDetailsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spark_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blink_account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub btc_wallet_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd_wallet_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_wallet: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
