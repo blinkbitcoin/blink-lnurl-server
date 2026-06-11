@@ -375,6 +375,38 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
 
+        if let Some((provider,)) =
+            sqlx::query_as::<_, (String,)>("SELECT provider FROM accounts WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Blink {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+
+            let existing = sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet
+                 FROM blink_accounts
+                 WHERE account_id = $1",
+            )
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet)) = existing
+            else {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            };
+            if blink_account_id != account.blink_account_id
+                || btc_wallet_id != account.btc_wallet_id
+                || usd_wallet_id != account.usd_wallet_id
+                || default_wallet != account.default_wallet.as_str()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+            return Err(LnurlRepositoryError::BlinkAccountExists);
+        }
+
         if sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM blink_accounts WHERE blink_account_id = $1",
         )
@@ -472,25 +504,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 .bind(pubkey)
                 .execute(&mut *tx)
                 .await?;
-
-            let remaining = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM account_identifiers WHERE account_id = $1",
-            )
-            .bind(&account_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            if remaining == 0 {
-                sqlx::query("DELETE FROM spark_accounts WHERE account_id = $1")
-                    .bind(&account_id)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("DELETE FROM accounts WHERE account_id = $1 AND provider = $2")
-                    .bind(&account_id)
-                    .bind(AccountProvider::Spark.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-            }
         }
 
         tx.commit()
