@@ -1,6 +1,6 @@
 use blink_client::{
-    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice,
-    PRODUCTION_GRAPHQL_ENDPOINT,
+    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice, PaymentStatus,
+    PaymentStatusState, PRODUCTION_GRAPHQL_ENDPOINT,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -43,6 +43,23 @@ fn assert_graphql_invoice_request(
             .pointer("/variables/input/expiresIn")
             .and_then(Value::as_u64)
             == Some(30)
+}
+
+fn assert_graphql_payment_status_request(request: &Request, payment_hash: &str) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        return false;
+    };
+
+    body.get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|query| {
+            query.contains("LnInvoicePaymentStatusByHashQuery")
+                && query.contains("lnInvoicePaymentStatusByHash")
+        })
+        && body
+            .pointer("/variables/input/paymentHash")
+            .and_then(Value::as_str)
+            == Some(payment_hash)
 }
 
 async fn mount_invoice_response(
@@ -209,6 +226,137 @@ async fn maps_missing_invoice_fields_to_malformed_response() {
     let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
     let error = client
         .create_btc_invoice(invoice_request("btc-wallet-id"))
+        .await
+        .expect_err("missing payment hash must be rejected");
+
+    assert!(matches!(error, BlinkClientError::MalformedResponse(_)));
+}
+
+#[tokio::test]
+async fn payment_status_maps_paid_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| assert_graphql_payment_status_request(request, "paid-hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoicePaymentStatusByHash": {
+                    "status": "PAID",
+                    "paymentHash": "paid-hash",
+                    "paymentRequest": "lnbc1paid"
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let status = client
+        .payment_status("paid-hash")
+        .await
+        .expect("paid payment status should parse");
+
+    assert_eq!(
+        status,
+        PaymentStatus {
+            state: PaymentStatusState::Paid,
+            settled: true,
+            payment_hash: "paid-hash".to_string(),
+            payment_request: "lnbc1paid".to_string(),
+            preimage: None,
+            amount_received_sat: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn payment_status_maps_unsettled_status_without_optional_fields() {
+    for (blink_status, expected_state) in [
+        ("PENDING", PaymentStatusState::Pending),
+        ("EXPIRED", PaymentStatusState::Expired),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(|request: &Request| {
+                assert_graphql_payment_status_request(request, "unsettled-hash")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "lnInvoicePaymentStatusByHash": {
+                        "status": blink_status,
+                        "paymentHash": "unsettled-hash",
+                        "paymentRequest": "lnbc1unsettled"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+        let status = client
+            .payment_status("unsettled-hash")
+            .await
+            .expect("unsettled payment status should parse");
+
+        assert_eq!(status.state, expected_state);
+        assert!(!status.settled);
+        assert_eq!(status.payment_hash, "unsettled-hash");
+        assert_eq!(status.payment_request, "lnbc1unsettled");
+        // D-06/D-11: current checked-in operation does not select preimage or amount.
+        assert_eq!(status.preimage, None);
+        assert_eq!(status.amount_received_sat, None);
+    }
+}
+
+#[tokio::test]
+async fn payment_status_maps_top_level_graphql_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| assert_graphql_payment_status_request(request, "error-hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [{ "message": "status query failed" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .payment_status("error-hash")
+        .await
+        .expect_err("top-level GraphQL errors must not be accepted as status");
+
+    let BlinkClientError::Graphql(errors) = error else {
+        panic!("expected Graphql error");
+    };
+    assert_eq!(errors[0].message, "status query failed");
+}
+
+#[tokio::test]
+async fn payment_status_rejects_malformed_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| assert_graphql_payment_status_request(request, "bad-hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoicePaymentStatusByHash": {
+                    "status": "PAID",
+                    "paymentRequest": "lnbc1missinghash"
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .payment_status("bad-hash")
         .await
         .expect_err("missing payment hash must be rejected");
 
