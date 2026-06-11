@@ -243,22 +243,13 @@ where
             ));
         }
 
-        let destination_account = state
-            .db
-            .get_account_by_spark_pubkey(&to_pubkey)
-            .await
-            .map_err(|e| spark_transfer_error(e, &username))?
-            .ok_or_else(|| {
-                spark_transfer_error(LnurlRepositoryError::AccountNotFound, &username)
-            })?;
-
         if let Err(e) = state
             .db
             .transfer_identifier(&IdentifierTransfer {
                 domain: domain.clone(),
                 identifier: username.clone(),
                 source_account_id: source_recipient.account_id,
-                destination_account_id: destination_account.account_id,
+                destination_spark_pubkey: to_pubkey.clone(),
                 description: payload.description,
             })
             .await
@@ -2193,6 +2184,14 @@ mod tests {
         assert!(
             transfer.contains("transfer_identifier"),
             "transfer must move ownership through the provider-neutral repository API"
+        );
+        assert!(
+            transfer.contains("destination_spark_pubkey"),
+            "transfer must pass the verified destination Spark pubkey to the repository"
+        );
+        assert!(
+            !transfer.contains("get_account_by_spark_pubkey(&to_pubkey)"),
+            "transfer must not require a pre-existing destination Spark account"
         );
         assert!(
             !transfer.contains("transfer_username"),

@@ -204,7 +204,7 @@ pub struct IdentifierTransfer {
     pub domain: String,
     pub identifier: String,
     pub source_account_id: String,
-    pub destination_account_id: String,
+    pub destination_spark_pubkey: String,
     pub description: String,
 }
 
@@ -728,7 +728,7 @@ pub mod shared_tests {
                 domain: "transfer.example.com".to_string(),
                 identifier: "frank".to_string(),
                 source_account_id: "not_the_owner".to_string(),
-                destination_account_id: "destination".to_string(),
+                destination_spark_pubkey: "destination_pubkey".to_string(),
                 description: "transfer".to_string(),
             })
             .await;
@@ -742,7 +742,6 @@ pub mod shared_tests {
         // CR-02/COMP-01: Spark transfer must update the legacy users row so
         // recover misses for the old owner and succeeds for the new owner.
         let source_account_id = generate_account_id(AccountProvider::Spark);
-        let destination_account_id = generate_account_id(AccountProvider::Spark);
         db.upsert_spark_registration(&NewSparkRegistration {
             account_id: Some(source_account_id.clone()),
             pubkey: "spark_recover_source_pubkey".to_string(),
@@ -756,7 +755,7 @@ pub mod shared_tests {
         .await
         .unwrap();
         db.upsert_spark_registration(&NewSparkRegistration {
-            account_id: Some(destination_account_id.clone()),
+            account_id: Some(generate_account_id(AccountProvider::Spark)),
             pubkey: "spark_recover_destination_pubkey".to_string(),
             identifier: NewAccountIdentifier {
                 domain: "recover-transfer.example.com".to_string(),
@@ -772,7 +771,7 @@ pub mod shared_tests {
             domain: "recover-transfer.example.com".to_string(),
             identifier: "carol".to_string(),
             source_account_id,
-            destination_account_id,
+            destination_spark_pubkey: "spark_recover_destination_pubkey".to_string(),
             description: "after transfer".to_string(),
         })
         .await
@@ -798,6 +797,130 @@ pub mod shared_tests {
             .expect("recover after transfer must return the new Spark owner");
         assert_eq!(recovered.name, "carol");
         assert_eq!(recovered.description, "after transfer");
+    }
+
+    pub async fn transfer_identifier_creates_fresh_destination_spark_account<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(source_account_id.clone()),
+            pubkey: "spark_fresh_transfer_source_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "fresh-transfer.example.com".to_string(),
+                identifier: "freshmove".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "before fresh transfer".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        db.transfer_identifier(&IdentifierTransfer {
+            domain: "fresh-transfer.example.com".to_string(),
+            identifier: "freshmove".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_fresh_transfer_destination_pubkey".to_string(),
+            description: "after fresh transfer".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let destination_account = db
+            .get_account_by_spark_pubkey("spark_fresh_transfer_destination_pubkey")
+            .await
+            .unwrap()
+            .expect("fresh transfer should create destination Spark account");
+        assert_eq!(destination_account.provider, AccountProvider::Spark);
+        let moved = db
+            .resolve_recipient_by_identifier("fresh-transfer.example.com", "freshmove")
+            .await
+            .unwrap()
+            .expect("transferred identifier should resolve");
+        assert_eq!(moved.account_id, destination_account.account_id);
+        assert_eq!(moved.description, "after fresh transfer");
+        assert_eq!(
+            moved.spark_pubkey.as_deref(),
+            Some("spark_fresh_transfer_destination_pubkey")
+        );
+        assert!(
+            db.get_user_by_pubkey(
+                "fresh-transfer.example.com",
+                "spark_fresh_transfer_source_pubkey"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    pub async fn transfer_identifier_replaces_destination_prior_alias<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(source_account_id.clone()),
+            pubkey: "spark_replace_alias_source_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "replace-transfer.example.com".to_string(),
+                identifier: "newname".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "before transfer".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
+            pubkey: "spark_replace_alias_destination_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "replace-transfer.example.com".to_string(),
+                identifier: "oldname".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "old destination alias".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        db.transfer_identifier(&IdentifierTransfer {
+            domain: "replace-transfer.example.com".to_string(),
+            identifier: "newname".to_string(),
+            source_account_id,
+            destination_spark_pubkey: "spark_replace_alias_destination_pubkey".to_string(),
+            description: "replacement transfer".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.resolve_recipient_by_identifier("replace-transfer.example.com", "oldname")
+                .await
+                .unwrap()
+                .is_none(),
+            "destination's prior alias should no longer resolve after transfer"
+        );
+        let transferred = db
+            .resolve_recipient_by_identifier("replace-transfer.example.com", "newname")
+            .await
+            .unwrap()
+            .expect("transferred username should resolve");
+        assert_eq!(
+            transferred.spark_pubkey.as_deref(),
+            Some("spark_replace_alias_destination_pubkey")
+        );
+        let recovered = db
+            .get_user_by_pubkey(
+                "replace-transfer.example.com",
+                "spark_replace_alias_destination_pubkey",
+            )
+            .await
+            .unwrap()
+            .expect("legacy recover should point to transferred identifier");
+        assert_eq!(recovered.name, "newname");
+        assert_eq!(recovered.description, "replacement transfer");
     }
 
     #[allow(clippy::too_many_lines)]

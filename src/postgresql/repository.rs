@@ -561,15 +561,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::SourceNotOwner);
         }
 
-        if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM accounts WHERE account_id = $1")
-            .bind(&transfer.destination_account_id)
-            .fetch_one(&mut *tx)
-            .await?
-            == 0
-        {
-            return Err(LnurlRepositoryError::AccountNotFound);
-        }
-
         let source_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT s.pubkey
              FROM accounts a
@@ -583,18 +574,58 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::InvalidOwnership);
         };
 
-        let destination_pubkey: Option<String> = sqlx::query_scalar(
-            "SELECT s.pubkey
-             FROM accounts a
-             JOIN spark_accounts s ON s.account_id = a.account_id
-             WHERE a.account_id = $1 AND a.provider = 'spark'",
+        let destination_account = sqlx::query_as::<_, (String, String)>(
+            "SELECT s.account_id, a.provider
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
         )
-        .bind(&transfer.destination_account_id)
+        .bind(&transfer.destination_spark_pubkey)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(destination_pubkey) = destination_pubkey else {
-            return Err(LnurlRepositoryError::InvalidProvider);
+
+        let destination_account_id = if let Some((account_id, provider)) = destination_account {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Spark {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+            account_id
+        } else {
+            let account_id = generate_account_id(AccountProvider::Spark);
+            sqlx::query(
+                "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(AccountProvider::Spark.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(&transfer.destination_spark_pubkey)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            account_id
         };
+
+        let has_spark_child: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM accounts a
+                 JOIN spark_accounts s ON s.account_id = a.account_id
+                 WHERE a.account_id = $1 AND a.provider = 'spark'
+             )",
+        )
+        .bind(&destination_account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_spark_child {
+            return Err(LnurlRepositoryError::InvalidProvider);
+        }
 
         sqlx::query(
             "UPDATE account_identifiers
@@ -605,10 +636,23 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         )
         .bind(&transfer.domain)
         .bind(&transfer.identifier)
-        .bind(&transfer.destination_account_id)
+        .bind(&destination_account_id)
         .bind(&transfer.description)
         .bind(now)
         .bind(&transfer.source_account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
         .execute(&mut *tx)
         .await?;
 
@@ -628,7 +672,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,   updated_at = excluded.updated_at",
         )
         .bind(&transfer.domain)
-        .bind(&destination_pubkey)
+        .bind(&transfer.destination_spark_pubkey)
         .bind(&transfer.identifier)
         .bind(&transfer.description)
         .bind(now)
@@ -1566,6 +1610,22 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn transfer_identifier_creates_fresh_destination_spark_account() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_identifier_creates_fresh_destination_spark_account(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_replaces_destination_prior_alias() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_identifier_replaces_destination_prior_alias(&db).await;
+    }
+
+    #[tokio::test]
     async fn side_effect_records_round_trip_account_id() {
         let Some((_, db)) = setup_test_db().await else {
             return;
@@ -1744,7 +1804,7 @@ mod provider_neutral_tests {
             domain: "pg-transfer-success.example.com".to_string(),
             identifier: "moving".to_string(),
             source_account_id: source_account_id.clone(),
-            destination_account_id: destination_account_id.clone(),
+            destination_spark_pubkey: "pg_spark_transfer_destination".to_string(),
             description: "moved".to_string(),
         })
         .await
