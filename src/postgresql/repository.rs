@@ -1481,6 +1481,14 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn metadata_account_id_round_trips_and_legacy_rows_remain_none() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::metadata_account_id_round_trips_and_legacy_rows_remain_none(&db).await;
+    }
+
+    #[tokio::test]
     async fn delete_spark_registration_preserves_account_with_side_effect_ownership() {
         let Some((_, db)) = setup_test_db().await else {
             return;

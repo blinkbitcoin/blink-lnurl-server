@@ -850,6 +850,96 @@ pub mod shared_tests {
         );
     }
 
+    pub async fn metadata_account_id_round_trips_and_legacy_rows_remain_none<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // DATA-02/D-13/D-16: metadata remains callable by legacy Spark pubkey,
+        // while provider-neutral ownership is exposed when side-effect rows carry it.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        let pubkey = "spark_metadata_account_pubkey".to_string();
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: pubkey.clone(),
+            identifier: NewAccountIdentifier {
+                domain: "metadata-account.example.com".to_string(),
+                identifier: "mallory".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "metadata account".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let now = crate::time::now_millis();
+        let owned_hash = "metadata_account_owned_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: Some(account_id.clone()),
+            payment_hash: owned_hash.clone(),
+            user_pubkey: pubkey.clone(),
+            invoice: "lnbc1metadataowned".to_string(),
+            preimage: Some("metadata_owned_preimage".to_string()),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some("metadata-account.example.com".to_string()),
+            amount_received_sat: None,
+        })
+        .await
+        .unwrap();
+        db.upsert_zap(&Zap {
+            account_id: Some(account_id.clone()),
+            payment_hash: owned_hash.clone(),
+            zap_request: r#"{"kind":9734}"#.to_string(),
+            zap_event: None,
+            user_pubkey: pubkey.clone(),
+            invoice_expiry: i64::MAX,
+            updated_at: now,
+            is_user_nostr_key: false,
+        })
+        .await
+        .unwrap();
+        db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: Some(account_id.clone()),
+            comment: "provider-neutral metadata".to_string(),
+            payment_hash: owned_hash.clone(),
+            user_pubkey: pubkey.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        let legacy_hash = "metadata_account_legacy_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: None,
+            payment_hash: legacy_hash.clone(),
+            user_pubkey: pubkey.clone(),
+            invoice: "lnbc1metadatalegacy".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: now.saturating_add(1),
+            updated_at: now.saturating_add(1),
+            domain: Some("metadata-account.example.com".to_string()),
+            amount_received_sat: None,
+        })
+        .await
+        .unwrap();
+
+        let metadata = db.get_metadata_by_pubkey(&pubkey, 0, 10, None).await.unwrap();
+        let owned = metadata
+            .iter()
+            .find(|item| item.payment_hash == owned_hash)
+            .expect("owned metadata row should be returned");
+        assert_eq!(owned.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(owned.sender_comment.as_deref(), Some("provider-neutral metadata"));
+
+        let legacy = metadata
+            .iter()
+            .find(|item| item.payment_hash == legacy_hash)
+            .expect("legacy metadata row should be returned");
+        assert!(legacy.account_id.is_none());
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn delete_spark_registration_preserves_account_with_side_effect_ownership<DB>(db: &DB)
     where

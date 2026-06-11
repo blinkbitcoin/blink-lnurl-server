@@ -1403,6 +1403,14 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn metadata_account_id_round_trips_and_legacy_rows_remain_none() {
+        shared_tests::metadata_account_id_round_trips_and_legacy_rows_remain_none(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn delete_spark_registration_preserves_account_with_side_effect_ownership() {
         shared_tests::delete_spark_registration_preserves_account_with_side_effect_ownership(
             &setup_test_db().await,
