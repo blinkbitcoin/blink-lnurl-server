@@ -128,6 +128,10 @@ struct Args {
     /// for audit/debugging before they are cleaned up periodically.
     #[arg(long, default_value = "90")]
     pub webhook_delivery_ttl_days: u32,
+
+    /// Blink public GraphQL endpoint used for Blink provider invoice/status calls.
+    #[arg(long, default_value = "https://api.blink.sv/graphql")]
+    pub blink_graphql_endpoint: String,
 }
 
 #[tokio::main]
@@ -350,7 +354,9 @@ where
         );
     }
 
-    let providers = Arc::new(ProviderRegistry::new(Arc::clone(&wallet)));
+    let blink_client =
+        blink_client::Client::new(blink_client::ClientConfig::new(args.blink_graphql_endpoint));
+    let providers = Arc::new(ProviderRegistry::new(Arc::clone(&wallet), blink_client));
 
     let state = State {
         db: repository,

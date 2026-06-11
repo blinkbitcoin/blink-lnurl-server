@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::repository::{AccountProvider, ResolvedRecipient, WalletKind};
 use bitcoin::secp256k1::PublicKey;
+use blink_client::BlinkClientError;
 
 const SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL: &str = "DEF-03-SPARK-PAYMENT-STATUS-PHASE-7: Spark payment status remains route-owned until Phase 7 SETL-01 settlement dispatch";
 
@@ -48,10 +49,52 @@ pub enum ProviderError {
     MissingSparkPubkey,
     #[error("invalid Spark pubkey")]
     InvalidSparkPubkey,
+    #[error("missing Blink default wallet")]
+    MissingBlinkDefaultWallet,
+    #[error("missing Blink BTC wallet id")]
+    MissingBlinkBtcWalletId,
+    #[error("missing Blink USD wallet id")]
+    MissingBlinkUsdWalletId,
+    #[error("Blink invoice creation failed: {0}")]
+    BlinkInvoiceCreationFailed(#[source] BlinkClientError),
+    #[error("Blink payment status unavailable: {0}")]
+    BlinkPaymentStatusUnavailable(#[source] BlinkClientError),
     #[error("invoice creation failed: {0}")]
     InvoiceCreationFailed(anyhow::Error),
     #[error("payment status unavailable: {0}")]
     PaymentStatusUnavailable(anyhow::Error),
+}
+
+pub struct BlinkProvider {
+    client: blink_client::Client,
+}
+
+impl BlinkProvider {
+    pub fn new(client: blink_client::Client) -> Self {
+        Self { client }
+    }
+}
+
+fn select_blink_wallet_id(
+    recipient: &ResolvedRecipient,
+    requested_wallet: Option<WalletKind>,
+) -> Result<(WalletKind, &str), ProviderError> {
+    let wallet = requested_wallet
+        .or(recipient.default_wallet)
+        .ok_or(ProviderError::MissingBlinkDefaultWallet)?;
+
+    let wallet_id = match wallet {
+        WalletKind::Btc => recipient
+            .btc_wallet_id
+            .as_deref()
+            .ok_or(ProviderError::MissingBlinkBtcWalletId)?,
+        WalletKind::Usd => recipient
+            .usd_wallet_id
+            .as_deref()
+            .ok_or(ProviderError::MissingBlinkUsdWalletId)?,
+    };
+
+    Ok((wallet, wallet_id))
 }
 
 #[async_trait::async_trait]
@@ -147,14 +190,67 @@ impl LnurlProvider for SparkProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl LnurlProvider for BlinkProvider {
+    async fn create_invoice(
+        &self,
+        request: CreateInvoiceRequest<'_>,
+    ) -> Result<ProviderInvoice, ProviderError> {
+        if request.recipient.provider != AccountProvider::Blink {
+            return Err(ProviderError::UnsupportedProvider(
+                request.recipient.provider,
+            ));
+        }
+
+        let (wallet, wallet_id) = select_blink_wallet_id(request.recipient, request.wallet)?;
+        let client_request = blink_client::CreateInvoiceRequest {
+            wallet_id,
+            amount_sat: request.amount_sat,
+            description_hash_hex: Some(hex::encode(request.description_hash)),
+            // Route-level expiry is seconds, while Blink expects minutes. Phase 4
+            // intentionally omits it until a route-owned conversion policy exists.
+            expires_in_minutes: None,
+        };
+
+        let invoice = match wallet {
+            WalletKind::Btc => self.client.create_btc_invoice(client_request).await,
+            WalletKind::Usd => self.client.create_usd_invoice(client_request).await,
+        }
+        .map_err(ProviderError::BlinkInvoiceCreationFailed)?;
+
+        Ok(ProviderInvoice {
+            bolt11: invoice.bolt11,
+        })
+    }
+
+    async fn payment_status(
+        &self,
+        request: PaymentStatusRequest<'_>,
+    ) -> Result<ProviderPaymentStatus, ProviderError> {
+        let status = self
+            .client
+            .payment_status(request.payment_hash)
+            .await
+            .map_err(ProviderError::BlinkPaymentStatusUnavailable)?;
+
+        Ok(ProviderPaymentStatus {
+            settled: status.settled,
+            preimage: status.preimage,
+            amount_received_sat: status.amount_received_sat,
+        })
+    }
+}
+
 pub struct ProviderRegistry {
     spark: Arc<SparkProvider>,
+    blink: Arc<BlinkProvider>,
 }
 
 impl ProviderRegistry {
-    pub fn new(wallet: Arc<spark_wallet::SparkWallet>) -> Self {
+    pub fn new(wallet: Arc<spark_wallet::SparkWallet>, blink_client: blink_client::Client) -> Self {
         Self {
             spark: Arc::new(SparkProvider::new(wallet)),
+            blink: Arc::new(BlinkProvider::new(blink_client)),
         }
     }
 
@@ -164,9 +260,7 @@ impl ProviderRegistry {
     ) -> Result<&dyn LnurlProvider, ProviderError> {
         match provider {
             AccountProvider::Spark => Ok(self.spark.as_ref()),
-            AccountProvider::Blink => {
-                Err(ProviderError::UnsupportedProvider(AccountProvider::Blink))
-            }
+            AccountProvider::Blink => Ok(self.blink.as_ref()),
         }
     }
 }
@@ -200,16 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_routes_spark_and_rejects_blink() {
+    fn registry_routes_spark_and_blink() {
         let registry = ProviderRegistry {
             spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
+            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
+                blink_client::ClientConfig::new("http://127.0.0.1/graphql"),
+            ))),
         };
 
         assert!(registry.provider_for(AccountProvider::Spark).is_ok());
-        assert!(matches!(
-            registry.provider_for(AccountProvider::Blink),
-            Err(ProviderError::UnsupportedProvider(AccountProvider::Blink))
-        ));
+        assert!(registry.provider_for(AccountProvider::Blink).is_ok());
     }
 
     #[tokio::test]
@@ -339,6 +433,35 @@ mod tests {
         format!("http://{addr}/graphql")
     }
 
+    async fn start_blink_status_mock_server() -> String {
+        let app = axum::Router::new().route(
+            "/graphql",
+            axum::routing::post(
+                |axum::Json(_body): axum::Json<serde_json::Value>| async move {
+                    axum::Json(serde_json::json!({
+                        "data": {
+                            "lnInvoicePaymentStatusByHash": {
+                                "status": "PAID",
+                                "paymentHash": "payment_hash",
+                                "paymentRequest": "lnbc_invoice"
+                            }
+                        }
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener.local_addr().expect("mock listener has addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should serve");
+        });
+        format!("http://{addr}/graphql")
+    }
+
     fn blink_invoice_request<'a>(
         recipient: &'a ResolvedRecipient,
         wallet: Option<WalletKind>,
@@ -368,9 +491,9 @@ mod tests {
 
     #[tokio::test]
     async fn blink_provider_rejects_missing_wallet_selection_and_selected_ids() {
-        let provider = BlinkProvider::new(blink_client::Client::new(blink_client::ClientConfig::new(
-            "http://127.0.0.1/graphql",
-        )));
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new("http://127.0.0.1/graphql"),
+        ));
         let no_default = blink_recipient(None);
         let err = provider
             .create_invoice(blink_invoice_request(&no_default, None))
@@ -399,9 +522,9 @@ mod tests {
     async fn blink_provider_selects_explicit_and_default_wallets_for_btc_and_usd_invoices() {
         let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(2);
         let endpoint = start_blink_mock_server(request_body_tx).await;
-        let provider = BlinkProvider::new(blink_client::Client::new(blink_client::ClientConfig::new(
-            endpoint,
-        )));
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
         let recipient = blink_recipient(Some(WalletKind::Usd));
 
         let btc_invoice = provider
@@ -414,9 +537,20 @@ mod tests {
             .recv()
             .await
             .expect("BTC request body should be captured");
-        assert!(btc_body["query"].as_str().unwrap().contains("lnInvoiceCreateOnBehalfOfRecipient"));
-        assert_eq!(btc_body["variables"]["input"]["recipientWalletId"], "btc_wallet");
-        assert_eq!(btc_body["variables"]["input"]["descriptionHash"], hex::encode([7; 32]));
+        assert!(
+            btc_body["query"]
+                .as_str()
+                .unwrap()
+                .contains("lnInvoiceCreateOnBehalfOfRecipient")
+        );
+        assert_eq!(
+            btc_body["variables"]["input"]["recipientWalletId"],
+            "btc_wallet"
+        );
+        assert_eq!(
+            btc_body["variables"]["input"]["descriptionHash"],
+            hex::encode([7; 32])
+        );
         assert!(btc_body["variables"]["input"].get("expiresIn").is_none());
 
         let usd_invoice = provider
@@ -429,9 +563,39 @@ mod tests {
             .recv()
             .await
             .expect("USD request body should be captured");
-        assert!(usd_body["query"].as_str().unwrap().contains("lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient"));
-        assert_eq!(usd_body["variables"]["input"]["recipientWalletId"], "usd_wallet");
-        assert_eq!(usd_body["variables"]["input"]["descriptionHash"], hex::encode([7; 32]));
+        assert!(
+            usd_body["query"]
+                .as_str()
+                .unwrap()
+                .contains("lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient")
+        );
+        assert_eq!(
+            usd_body["variables"]["input"]["recipientWalletId"],
+            "usd_wallet"
+        );
+        assert_eq!(
+            usd_body["variables"]["input"]["descriptionHash"],
+            hex::encode([7; 32])
+        );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
+    }
+
+    #[tokio::test]
+    async fn blink_provider_maps_payment_status_without_fabricating_optional_fields() {
+        let endpoint = start_blink_status_mock_server().await;
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
+
+        let status = provider
+            .payment_status(PaymentStatusRequest {
+                payment_hash: "payment_hash",
+            })
+            .await
+            .expect("Blink payment status should map through provider");
+
+        assert!(status.settled);
+        assert_eq!(status.preimage, None);
+        assert_eq!(status.amount_received_sat, None);
     }
 }

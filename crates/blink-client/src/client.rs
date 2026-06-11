@@ -74,18 +74,24 @@ impl Client {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let mut input = serde_json::Map::from_iter([
+            ("recipientWalletId".to_string(), json!(request.wallet_id)),
+            ("amount".to_string(), json!(request.amount_sat)),
+        ]);
+        if let Some(description_hash_hex) = request.description_hash_hex {
+            input.insert("descriptionHash".to_string(), json!(description_hash_hex));
+        }
+        if let Some(expires_in_minutes) = request.expires_in_minutes {
+            input.insert("expiresIn".to_string(), json!(expires_in_minutes));
+        }
+
         let response = self
             .http_client
             .post(self.config.endpoint())
             .json(&json!({
                 "query": query,
                 "variables": {
-                    "input": {
-                        "recipientWalletId": request.wallet_id,
-                        "amount": request.amount_sat,
-                        "descriptionHash": request.description_hash_hex,
-                        "expiresIn": request.expires_in_minutes,
-                    }
+                    "input": input
                 }
             }))
             .send()

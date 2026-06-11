@@ -1646,12 +1646,20 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
             error!("failed to create lightning invoice: {err}");
             lnurl_error("failed to create invoice")
         }
+        ProviderError::BlinkInvoiceCreationFailed(err) => {
+            error!("failed to create Blink lightning invoice: {err}");
+            lnurl_error("failed to create invoice")
+        }
         ProviderError::UnsupportedProvider(provider) => {
             error!("unsupported provider for public LNURL invoice: {provider:?}");
             lnurl_error("internal server error")
         }
         ProviderError::MissingSparkPubkey
         | ProviderError::InvalidSparkPubkey
+        | ProviderError::MissingBlinkDefaultWallet
+        | ProviderError::MissingBlinkBtcWalletId
+        | ProviderError::MissingBlinkUsdWalletId
+        | ProviderError::BlinkPaymentStatusUnavailable(_)
         | ProviderError::PaymentStatusUnavailable(_) => {
             error!("invalid provider invoice state: {error}");
             lnurl_error("internal server error")
