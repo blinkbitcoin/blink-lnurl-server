@@ -195,9 +195,34 @@ pub async fn create_invoice<DB>(
 where
     DB: LnurlRepository + Clone + Send + Sync + 'static,
 {
+    create_invoice_for_account(
+        db,
+        payment_hash,
+        None,
+        user_pubkey,
+        invoice,
+        invoice_expiry,
+        domain,
+    )
+    .await
+}
+
+/// Create a new invoice record with optional provider-neutral account ownership.
+pub async fn create_invoice_for_account<DB>(
+    db: &DB,
+    payment_hash: &str,
+    account_id: Option<&str>,
+    user_pubkey: &str,
+    invoice: &str,
+    invoice_expiry: i64,
+    domain: &str,
+) -> Result<(), LnurlRepositoryError>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
     let now = now_millis();
     let invoice_record = Invoice {
-        account_id: None,
+        account_id: account_id.map(str::to_string),
         payment_hash: payment_hash.to_string(),
         user_pubkey: user_pubkey.to_string(),
         invoice: invoice.to_string(),
@@ -246,7 +271,10 @@ mod test_helpers {
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-    use crate::repository::LnurlSenderComment;
+    use crate::repository::{
+        AccountIdentifierKind, AccountProvider, LnurlSenderComment, NewAccountIdentifier,
+        NewSparkRegistration,
+    };
 
     use super::test_helpers::generate_test_invoice;
 
@@ -254,10 +282,29 @@ mod shared_tests {
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_spark_invoice".to_string()),
+            pubkey: "spark_account_invoice_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "account-invoice.example.com".to_string(),
+                identifier: "invoiceowner".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "invoice owner".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("spark_account_invoice_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark account should be created");
+        assert_eq!(account.provider, AccountProvider::Spark);
+
         create_invoice_for_account(
             db,
             "account_invoice_hash",
-            Some("acct_spark_invoice"),
+            Some(account.account_id.as_str()),
             "spark_account_invoice_pubkey",
             "lnbc1accountinvoice",
             i64::MAX,

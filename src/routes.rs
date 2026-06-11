@@ -28,7 +28,8 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     invoice_paid::{
-        HandleInvoicePaidError, create_invoice, handle_invoice_paid, handle_invoices_paid,
+        HandleInvoicePaidError, create_invoice_for_account, handle_invoice_paid,
+        handle_invoices_paid,
     },
     repository::LnurlSenderComment,
     time::{now_millis, now_u64},
@@ -711,17 +712,22 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
         let domain = sanitize_domain(&state, &host).await?;
-        let user = state
+        let recipient = state
             .db
-            .get_user_by_name(&domain, &username)
+            .resolve_recipient_by_identifier(&domain, &username)
             .await
             .map_err(|e| {
                 error!("failed to execute query: {}", e);
                 lnurl_error("internal server error")
             })?;
-        let Some(user) = user else {
+        let Some(recipient) = recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
+        let account_id = recipient.account_id.clone();
+        let user = spark_user_from_recipient(recipient).map_err(|e| {
+            error!("invalid Spark recipient for invoice callback: {e}");
+            lnurl_error("internal server error")
+        })?;
 
         let Some(amount_msat) = params.amount else {
             trace!("missing amount");
@@ -817,7 +823,7 @@ where
         // save to zap event to db
         if let Some(zap_request) = params.nostr {
             let zap = Zap {
-                account_id: None,
+                account_id: Some(account_id.clone()),
                 payment_hash: payment_hash.clone(),
                 zap_request,
                 zap_event: None,
@@ -841,7 +847,7 @@ where
                 && let Err(e) = state
                     .db
                     .insert_lnurl_sender_comment(&LnurlSenderComment {
-                        account_id: None,
+                        account_id: Some(account_id.clone()),
                         comment: comment.to_string(),
                         payment_hash: payment_hash.clone(),
                         user_pubkey: user.pubkey.clone(),
@@ -855,9 +861,10 @@ where
         }
 
         // Store invoice for LUD-21 verify support and webhook delivery
-        if let Err(e) = create_invoice(
+        if let Err(e) = create_invoice_for_account(
             &state.db,
             &payment_hash,
+            Some(&account_id),
             &user.pubkey,
             &res.invoice,
             invoice_expiry,
