@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+pub const INTERNAL_ERROR_INVALID_REQUEST: &str = "invalid_request";
+pub const INTERNAL_ERROR_INVALID_IDENTIFIER: &str = "invalid_identifier";
+pub const INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED: &str = "wallet_modifier_not_allowed";
+pub const INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS: &str = "blink_account_exists";
+pub const INTERNAL_ERROR_IDENTIFIER_CONFLICT: &str = "identifier_conflict";
+pub const INTERNAL_ERROR_INTERNAL_SERVER_ERROR: &str = "internal_server_error";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateBlinkAccountRequest {
     pub domain: String,

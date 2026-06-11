@@ -4,6 +4,9 @@ use crate::identifier::{
 };
 use crate::models::{
     CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
+    INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS, INTERNAL_ERROR_IDENTIFIER_CONFLICT,
+    INTERNAL_ERROR_INTERNAL_SERVER_ERROR, INTERNAL_ERROR_INVALID_IDENTIFIER,
+    INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
     InternalAccountIdentifierResponse, InternalErrorResponse, InvoicePaidRequest,
     InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
     PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
@@ -26,8 +29,8 @@ use lightning_invoice::Bolt11Invoice;
 use nostr::{Alphabet, Event, EventBuilder, JsonUtil, Kind, TagStandard, key::Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::marker::PhantomData;
 use std::str::FromStr;
+use std::{collections::HashSet, marker::PhantomData};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
@@ -1086,25 +1089,31 @@ where
             crate::internal_auth::SCOPE_BLINK_ACCOUNTS_CREATE,
         )?;
 
-        let domain = sanitize_internal_domain(&payload.domain)?;
-        validate_internal_non_empty(&payload.blink_account_id, "blink_account_id is required")?;
-        validate_internal_non_empty(&payload.btc_wallet_id, "btc_wallet_id is required")?;
-        validate_internal_non_empty(&payload.usd_wallet_id, "usd_wallet_id is required")?;
-        validate_description(&payload.description).map_err(internal_value_error)?;
+        let domain = validate_internal_domain(&payload.domain)?;
+        let blink_account_id = validate_internal_required_string(&payload.blink_account_id)?;
+        let btc_wallet_id = validate_internal_required_string(&payload.btc_wallet_id)?;
+        let usd_wallet_id = validate_internal_required_string(&payload.usd_wallet_id)?;
+        let description = validate_internal_description(&payload.description)?;
         if payload.identifiers.is_empty() {
-            return Err(internal_bad_request("identifiers must not be empty"));
+            return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
         }
 
-        let default_wallet = parse_internal_wallet(&payload.default_wallet)?;
+        let default_wallet = parse_internal_default_wallet(&payload.default_wallet)?;
         let mut identifiers = Vec::with_capacity(payload.identifiers.len());
         let mut response_identifiers = Vec::with_capacity(payload.identifiers.len());
+        let mut seen_identifiers = HashSet::with_capacity(payload.identifiers.len());
         for raw_identifier in &payload.identifiers {
             let parsed = parse_public_identifier(raw_identifier).map_err(|e| {
                 trace!("invalid internal account identifier '{raw_identifier}': {e:?}");
-                internal_bad_request("invalid identifier")
+                internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
             })?;
             if parsed.wallet.is_some() {
-                return Err(internal_bad_request("wallet modifiers are not persisted"));
+                return Err(internal_bad_request(
+                    INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
+                ));
+            }
+            if !seen_identifiers.insert((domain.clone(), parsed.canonical.clone())) {
+                return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
             }
             let identifier_kind = match parsed.kind {
                 IdentifierKind::Username => AccountIdentifierKind::Username,
@@ -1115,21 +1124,21 @@ where
                 domain: domain.clone(),
                 identifier: parsed.canonical.clone(),
                 identifier_kind,
-                description: payload.description.clone(),
+                description: description.clone(),
             });
             response_identifiers.push(InternalAccountIdentifierResponse {
                 identifier: parsed.canonical,
                 kind,
-                description: payload.description.clone(),
+                description: description.clone(),
             });
         }
 
         let account_id = generate_account_id(AccountProvider::Blink);
         let account = NewBlinkAccount {
             account_id: Some(account_id.clone()),
-            blink_account_id: payload.blink_account_id.clone(),
-            btc_wallet_id: payload.btc_wallet_id.clone(),
-            usd_wallet_id: payload.usd_wallet_id.clone(),
+            blink_account_id: blink_account_id.clone(),
+            btc_wallet_id: btc_wallet_id.clone(),
+            usd_wallet_id: usd_wallet_id.clone(),
             default_wallet,
             identifiers,
         };
@@ -1143,9 +1152,9 @@ where
         Ok(Json(CreateBlinkAccountResponse {
             account_id,
             provider: AccountProvider::Blink.as_str().to_string(),
-            blink_account_id: payload.blink_account_id,
-            btc_wallet_id: payload.btc_wallet_id,
-            usd_wallet_id: payload.usd_wallet_id,
+            blink_account_id,
+            btc_wallet_id,
+            usd_wallet_id,
             default_wallet: default_wallet.as_str().to_string(),
             domain,
             identifiers: response_identifiers,
@@ -1153,35 +1162,44 @@ where
     }
 }
 
-fn sanitize_internal_domain(
+fn validate_internal_domain(
     domain: &str,
 ) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
     let domain = domain.trim().to_lowercase();
     if domain.is_empty() {
-        Err(internal_bad_request("domain is required"))
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
     } else {
         Ok(domain)
     }
 }
 
-fn validate_internal_non_empty(
+fn validate_internal_required_string(
     value: &str,
-    message: &'static str,
-) -> Result<(), (StatusCode, Json<InternalErrorResponse>)> {
-    if value.trim().is_empty() {
-        Err(internal_bad_request(message))
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
     } else {
-        Ok(())
+        Ok(value.to_string())
     }
 }
 
-fn parse_internal_wallet(
+fn validate_internal_description(
+    description: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let description = validate_internal_required_string(description)?;
+    validate_description(&description)
+        .map(|()| description)
+        .map_err(|(_status, _body)| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
+}
+
+fn parse_internal_default_wallet(
     wallet: &str,
 ) -> Result<WalletKind, (StatusCode, Json<InternalErrorResponse>)> {
     match wallet.trim().to_lowercase().as_str() {
         "btc" => Ok(WalletKind::Btc),
         "usd" => Ok(WalletKind::Usd),
-        _ => Err(internal_bad_request("invalid default_wallet")),
+        _ => Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)),
     }
 }
 
@@ -1189,30 +1207,28 @@ fn internal_account_creation_error(
     error: LnurlRepositoryError,
 ) -> (StatusCode, Json<InternalErrorResponse>) {
     match error {
-        LnurlRepositoryError::BlinkAccountExists | LnurlRepositoryError::IdentifierConflict => (
+        LnurlRepositoryError::BlinkAccountExists => (
             StatusCode::CONFLICT,
             Json(InternalErrorResponse::new(
-                "account or identifier already exists",
+                INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS,
+            )),
+        ),
+        LnurlRepositoryError::IdentifierConflict => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
             )),
         ),
         error => {
             error!("failed to create internal Blink account: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(InternalErrorResponse::new("internal server error")),
+                Json(InternalErrorResponse::new(
+                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                )),
             )
         }
     }
-}
-
-fn internal_value_error(
-    error: (StatusCode, Json<Value>),
-) -> (StatusCode, Json<InternalErrorResponse>) {
-    let (status, Json(value)) = error;
-    let message = value
-        .as_str()
-        .map_or_else(|| "invalid request".to_string(), ToString::to_string);
-    (status, Json(InternalErrorResponse::new(message)))
 }
 
 fn internal_bad_request(message: &'static str) -> (StatusCode, Json<InternalErrorResponse>) {
