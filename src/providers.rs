@@ -277,4 +277,161 @@ mod tests {
         assert!(message.contains("DEF-03-SPARK-PAYMENT-STATUS-PHASE-7"));
         assert!(message.contains("Phase 7 SETL-01"));
     }
+
+    fn blink_recipient(default_wallet: Option<WalletKind>) -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_blink".to_string(),
+            provider: AccountProvider::Blink,
+            domain: "localhost:8080".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Alice".to_string(),
+            spark_pubkey: None,
+            blink_account_id: Some("blink_account".to_string()),
+            btc_wallet_id: Some("btc_wallet".to_string()),
+            usd_wallet_id: Some("usd_wallet".to_string()),
+            default_wallet,
+        }
+    }
+
+    async fn start_blink_mock_server(
+        request_body_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/graphql",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let request_body_tx = request_body_tx.clone();
+                async move {
+                    request_body_tx
+                        .send(body)
+                        .await
+                        .expect("request body receiver should stay open");
+                    axum::Json(serde_json::json!({
+                        "data": {
+                            "lnInvoiceCreateOnBehalfOfRecipient": {
+                                "invoice": {
+                                    "paymentRequest": "lnbc_btc_invoice",
+                                    "paymentHash": "btc_payment_hash"
+                                },
+                                "errors": []
+                            },
+                            "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": {
+                                "invoice": {
+                                    "paymentRequest": "lnbc_usd_invoice",
+                                    "paymentHash": "usd_payment_hash"
+                                },
+                                "errors": []
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener.local_addr().expect("mock listener has addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should serve");
+        });
+        format!("http://{addr}/graphql")
+    }
+
+    fn blink_invoice_request<'a>(
+        recipient: &'a ResolvedRecipient,
+        wallet: Option<WalletKind>,
+    ) -> CreateInvoiceRequest<'a> {
+        CreateInvoiceRequest {
+            recipient,
+            wallet,
+            amount_sat: 21,
+            description_hash: [7; 32],
+            expiry: Some(600),
+            include_spark_address: true,
+        }
+    }
+
+    #[test]
+    fn blink_registry_dispatches_to_blink_provider() {
+        let registry = ProviderRegistry {
+            spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
+            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
+                blink_client::ClientConfig::new("http://127.0.0.1/graphql"),
+            ))),
+        };
+
+        assert!(registry.provider_for(AccountProvider::Spark).is_ok());
+        assert!(registry.provider_for(AccountProvider::Blink).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blink_provider_rejects_missing_wallet_selection_and_selected_ids() {
+        let provider = BlinkProvider::new(blink_client::Client::new(blink_client::ClientConfig::new(
+            "http://127.0.0.1/graphql",
+        )));
+        let no_default = blink_recipient(None);
+        let err = provider
+            .create_invoice(blink_invoice_request(&no_default, None))
+            .await
+            .expect_err("Blink requires explicit or default wallet selection");
+        assert!(matches!(err, ProviderError::MissingBlinkDefaultWallet));
+
+        let mut missing_btc = blink_recipient(Some(WalletKind::Btc));
+        missing_btc.btc_wallet_id = None;
+        let err = provider
+            .create_invoice(blink_invoice_request(&missing_btc, Some(WalletKind::Btc)))
+            .await
+            .expect_err("selected BTC wallet id must be present");
+        assert!(matches!(err, ProviderError::MissingBlinkBtcWalletId));
+
+        let mut missing_usd = blink_recipient(Some(WalletKind::Usd));
+        missing_usd.usd_wallet_id = None;
+        let err = provider
+            .create_invoice(blink_invoice_request(&missing_usd, Some(WalletKind::Usd)))
+            .await
+            .expect_err("selected USD wallet id must be present");
+        assert!(matches!(err, ProviderError::MissingBlinkUsdWalletId));
+    }
+
+    #[tokio::test]
+    async fn blink_provider_selects_explicit_and_default_wallets_for_btc_and_usd_invoices() {
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(2);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let provider = BlinkProvider::new(blink_client::Client::new(blink_client::ClientConfig::new(
+            endpoint,
+        )));
+        let recipient = blink_recipient(Some(WalletKind::Usd));
+
+        let btc_invoice = provider
+            .create_invoice(blink_invoice_request(&recipient, Some(WalletKind::Btc)))
+            .await
+            .expect("BTC invoice should be created");
+        assert_eq!(btc_invoice.bolt11, "lnbc_btc_invoice");
+
+        let btc_body = request_body_rx
+            .recv()
+            .await
+            .expect("BTC request body should be captured");
+        assert!(btc_body["query"].as_str().unwrap().contains("lnInvoiceCreateOnBehalfOfRecipient"));
+        assert_eq!(btc_body["variables"]["input"]["recipientWalletId"], "btc_wallet");
+        assert_eq!(btc_body["variables"]["input"]["descriptionHash"], hex::encode([7; 32]));
+        assert!(btc_body["variables"]["input"].get("expiresIn").is_none());
+
+        let usd_invoice = provider
+            .create_invoice(blink_invoice_request(&recipient, None))
+            .await
+            .expect("default USD invoice should be created");
+        assert_eq!(usd_invoice.bolt11, "lnbc_usd_invoice");
+
+        let usd_body = request_body_rx
+            .recv()
+            .await
+            .expect("USD request body should be captured");
+        assert!(usd_body["query"].as_str().unwrap().contains("lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient"));
+        assert_eq!(usd_body["variables"]["input"]["recipientWalletId"], "usd_wallet");
+        assert_eq!(usd_body["variables"]["input"]["descriptionHash"], hex::encode([7; 32]));
+        assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
+    }
 }

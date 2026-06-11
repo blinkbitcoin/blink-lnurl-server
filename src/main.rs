@@ -492,3 +492,18 @@ fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String,
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blink_graphql_endpoint_default_is_production() {
+        let args = Args::parse_from(["lnurl-server"]);
+
+        assert_eq!(
+            args.blink_graphql_endpoint,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+        );
+    }
+}
