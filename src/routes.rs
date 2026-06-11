@@ -35,7 +35,10 @@ use crate::{
     zap::Zap,
 };
 use crate::{
-    repository::{LnurlRepository, LnurlRepositoryError},
+    repository::{
+        AccountIdentifierKind, AccountProvider, LnurlRepository, LnurlRepositoryError,
+        NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
+    },
     state::State,
     user::User,
 };
@@ -117,9 +120,10 @@ where
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
         let username = canonical_spark_username_for_route(&identifier)?;
-        let user = state
+        let domain = sanitize_domain(&state, &host).await?;
+        let recipient = state
             .db
-            .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
+            .resolve_recipient_by_identifier(&domain, &username)
             .await
             .map_err(|e| {
                 error!("failed to execute query: {}", e);
@@ -130,7 +134,7 @@ where
             })?;
 
         Ok(Json(CheckUsernameAvailableResponse {
-            available: user.is_none(),
+            available: recipient.is_none(),
         }))
     }
 
@@ -150,35 +154,28 @@ where
         )
         .await?;
         validate_description(&payload.description)?;
+        let domain = sanitize_domain(&state, &host).await?;
 
-        let user = User {
-            domain: sanitize_domain(&state, &host).await?,
+        let registration = NewSparkRegistration {
+            account_id: None,
             pubkey: pubkey.to_string(),
-            name: username,
-            description: payload.description,
+            identifier: NewAccountIdentifier {
+                domain: domain.clone(),
+                identifier: username.clone(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: payload.description,
+            },
         };
 
-        if let Err(e) = state.db.upsert_user(&user).await {
-            if let LnurlRepositoryError::NameTaken = e {
-                trace!("name already taken: {}", user.name);
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(Value::String("name already taken".into())),
-                ));
-            }
-
-            error!("failed to execute query: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Value::String("internal server error".into())),
-            ));
+        if let Err(e) = state.db.upsert_spark_registration(&registration).await {
+            return Err(spark_registration_error(e, &username));
         }
 
-        debug!("registered user '{}' for pubkey {}", user.name, pubkey);
-        let lnurl = format!("lnurlp://{}/lnurlp/{}", user.domain, user.name);
+        debug!("registered user '{username}' for pubkey {pubkey}");
+        let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
         Ok(Json(RegisterLnurlPayResponse {
             lnurl,
-            lightning_address: format!("{}@{}", user.name, user.domain),
+            lightning_address: format!("{username}@{domain}"),
         }))
     }
 
@@ -283,7 +280,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<UnregisterLnurlPayRequest>,
     ) -> Result<(), (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
+        let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
             &payload.signature,
@@ -292,18 +289,19 @@ where
             &state,
         )
         .await?;
+        let domain = sanitize_domain(&state, &host).await?;
 
         state
             .db
-            .delete_user(&sanitize_domain(&state, &host).await?, &pubkey.to_string())
+            .get_account_by_spark_pubkey(&pubkey.to_string())
             .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
+            .map_err(storage_error)?;
+
+        state
+            .db
+            .delete_spark_registration(&domain, &pubkey.to_string())
+            .await
+            .map_err(storage_error)?;
         debug!("unregistered user for pubkey {}", pubkey);
         Ok(())
     }
@@ -322,18 +320,25 @@ where
             &state,
         )
         .await?;
+        let domain = sanitize_domain(&state, &host).await?;
+
+        let account = state
+            .db
+            .get_account_by_spark_pubkey(&pubkey.to_string())
+            .await
+            .map_err(storage_error)?;
+        if account.is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(Value::String("user not found".into())),
+            ));
+        }
 
         let user = state
             .db
-            .get_user_by_pubkey(&sanitize_domain(&state, &host).await?, &pubkey.to_string())
+            .get_user_by_pubkey(&domain, &pubkey.to_string())
             .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
+            .map_err(storage_error)?;
 
         match user {
             Some(user) => {
@@ -1500,6 +1505,50 @@ fn get_metadata(domain: &str, user: &User) -> String {
     .to_string()
 }
 
+fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
+    error!("failed to execute query: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(Value::String("internal server error".into())),
+    )
+}
+
+fn spark_registration_error(
+    error: LnurlRepositoryError,
+    username: &str,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
+            trace!("name already taken: {username}");
+            (
+                StatusCode::CONFLICT,
+                Json(Value::String("name already taken".into())),
+            )
+        }
+        error => storage_error(error),
+    }
+}
+
+#[allow(dead_code)]
+fn spark_user_from_recipient(recipient: ResolvedRecipient) -> Result<User, LnurlRepositoryError> {
+    if recipient.provider != AccountProvider::Spark
+        || recipient.identifier_kind != AccountIdentifierKind::Username
+    {
+        return Err(LnurlRepositoryError::InvalidProvider);
+    }
+
+    let Some(pubkey) = recipient.spark_pubkey else {
+        return Err(LnurlRepositoryError::InvalidOwnership);
+    };
+
+    Ok(User {
+        domain: recipient.domain,
+        pubkey,
+        name: recipient.identifier,
+        description: recipient.description,
+    })
+}
+
 fn lnurl_error(message: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::OK,
@@ -1925,9 +1974,7 @@ mod tests {
         let marker = format!("    pub async fn {name}(");
         let start = source.find(&marker).expect("handler must exist");
         let rest = &source[start..];
-        let next = rest
-            .find("\n    pub async fn ")
-            .unwrap_or(rest.len());
+        let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
         &rest[..next]
     }
 
