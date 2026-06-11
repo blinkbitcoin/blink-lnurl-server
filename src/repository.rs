@@ -849,6 +849,220 @@ pub mod shared_tests {
             "legacy comment updates must not clear webhook ownership context"
         );
     }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn delete_spark_registration_preserves_account_with_side_effect_ownership<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // DATA-05/DATA-02: unregistering Spark deletes only active identifier
+        // ownership and the legacy user row. Provider-neutral account rows are
+        // historical ownership anchors for invoices, zaps, and sender comments.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_delete_preserve_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "delete-preserve.example.com".to_string(),
+                identifier: "heidi".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "delete preserve".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let now = crate::time::now_millis();
+        let payment_hash = "delete_preserve_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: Some(account_id.clone()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_delete_preserve_pubkey".to_string(),
+            invoice: "lnbc1deletepreserve".to_string(),
+            preimage: Some("delete_preserve_preimage".to_string()),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some("delete-preserve.example.com".to_string()),
+            amount_received_sat: None,
+        })
+        .await
+        .unwrap();
+        db.upsert_zap(&Zap {
+            account_id: Some(account_id.clone()),
+            payment_hash: payment_hash.clone(),
+            zap_request: r#"{"kind":9734}"#.to_string(),
+            zap_event: None,
+            user_pubkey: "spark_delete_preserve_pubkey".to_string(),
+            invoice_expiry: i64::MAX,
+            updated_at: now,
+            is_user_nostr_key: false,
+        })
+        .await
+        .unwrap();
+        db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: Some(account_id.clone()),
+            comment: "historical ownership".to_string(),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "spark_delete_preserve_pubkey".to_string(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        db.delete_spark_registration(
+            "delete-preserve.example.com",
+            "spark_delete_preserve_pubkey",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_user_by_pubkey(
+                "delete-preserve.example.com",
+                "spark_delete_preserve_pubkey"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "legacy users row should be removed"
+        );
+        assert!(
+            db.resolve_recipient_by_identifier("delete-preserve.example.com", "heidi")
+                .await
+                .unwrap()
+                .is_none(),
+            "active identifier ownership should be removed"
+        );
+
+        let account = db
+            .get_account_by_id(&account_id)
+            .await
+            .unwrap()
+            .expect("historical account row should remain");
+        assert_eq!(account.provider, AccountProvider::Spark);
+        let by_pubkey = db
+            .get_account_by_spark_pubkey("spark_delete_preserve_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark child row should remain addressable");
+        assert_eq!(by_pubkey.account_id, account_id);
+
+        let invoice = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain");
+        assert_eq!(invoice.account_id.as_deref(), Some(account_id.as_str()));
+        let zap = db
+            .get_zap_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("zap should remain");
+        assert_eq!(zap.account_id.as_deref(), Some(account_id.as_str()));
+        let payloads = db
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        let payload = payloads
+            .first()
+            .expect("sender comment should remain available through webhook payload");
+        assert_eq!(payload.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(
+            payload.sender_comment.as_deref(),
+            Some("historical ownership")
+        );
+    }
+
+    pub async fn create_blink_account_rejects_existing_spark_account_id_with_invalid_provider<DB>(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // DATA-06/D-18: caller-supplied account ids already owned by Spark must
+        // return the provider-neutral InvalidProvider error, not a backend
+        // constraint fallback.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_supplied_id_collision_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "supplied-spark.example.com".to_string(),
+                identifier: "ivan".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "spark owner".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(account_id),
+                blink_account_id: "blink_supplied_spark_collision".to_string(),
+                btc_wallet_id: "blink_supplied_spark_btc".to_string(),
+                usd_wallet_id: "blink_supplied_spark_usd".to_string(),
+                default_wallet: WalletKind::Btc,
+                identifiers: vec![NewAccountIdentifier {
+                    domain: "supplied-spark.example.com".to_string(),
+                    identifier: "judy".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "blink claimant".to_string(),
+                }],
+            })
+            .await;
+
+        assert!(matches!(result, Err(LnurlRepositoryError::InvalidProvider)));
+    }
+
+    pub async fn create_blink_account_rejects_existing_inconsistent_blink_account_id_with_invalid_ownership<
+        DB,
+    >(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // DATA-06/D-18: an existing Blink account id with a different Blink
+        // natural key is an ownership mismatch and must not fall through to a
+        // unique constraint or generic storage error.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_existing_owner".to_string(),
+            btc_wallet_id: "blink_existing_owner_btc".to_string(),
+            usd_wallet_id: "blink_existing_owner_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "inconsistent-blink.example.com".to_string(),
+                identifier: "kate".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "first blink owner".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(account_id),
+                blink_account_id: "blink_different_owner".to_string(),
+                btc_wallet_id: "blink_different_owner_btc".to_string(),
+                usd_wallet_id: "blink_different_owner_usd".to_string(),
+                default_wallet: WalletKind::Usd,
+                identifiers: vec![NewAccountIdentifier {
+                    domain: "inconsistent-blink.example.com".to_string(),
+                    identifier: "lara".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "second blink owner".to_string(),
+                }],
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::InvalidOwnership)
+        ));
+    }
 }
 
 #[cfg(test)]

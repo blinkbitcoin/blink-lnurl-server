@@ -1390,6 +1390,30 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn delete_spark_registration_preserves_account_with_side_effect_ownership() {
+        shared_tests::delete_spark_registration_preserves_account_with_side_effect_ownership(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_blink_account_rejects_existing_spark_account_id() {
+        shared_tests::create_blink_account_rejects_existing_spark_account_id_with_invalid_provider(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_blink_account_rejects_existing_inconsistent_blink_account_id() {
+        shared_tests::create_blink_account_rejects_existing_inconsistent_blink_account_id_with_invalid_ownership(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn rejected_spark_phone_identifier_leaves_no_partial_rows() {
         let db = setup_test_db().await;
         let account_id = generate_account_id(AccountProvider::Spark);
