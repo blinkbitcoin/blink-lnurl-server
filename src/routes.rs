@@ -1904,6 +1904,23 @@ mod tests {
         invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
         pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
         created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
+        create_blink_account_error: std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockCreateBlinkAccountError {
+        BlinkAccountExists,
+        IdentifierConflict,
+    }
+
+    impl MockRepository {
+        fn fail_next_blink_account_creation(&self, error: MockCreateBlinkAccountError) {
+            *self.create_blink_account_error.lock().unwrap() = Some(error);
+        }
+
+        fn created_blink_account_count(&self) -> usize {
+            self.created_blink_accounts.lock().unwrap().len()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1949,6 +1966,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(account.clone());
+            if let Some(error) = self.create_blink_account_error.lock().unwrap().take() {
+                return match error {
+                    MockCreateBlinkAccountError::BlinkAccountExists => {
+                        Err(LnurlRepositoryError::BlinkAccountExists)
+                    }
+                    MockCreateBlinkAccountError::IdentifierConflict => {
+                        Err(LnurlRepositoryError::IdentifierConflict)
+                    }
+                };
+            }
             Ok(())
         }
         async fn transfer_identifier(
@@ -2301,6 +2328,86 @@ mod tests {
             },
         );
         repo
+    }
+
+    fn internal_test_token() -> String {
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": "blink:accounts:create accounts:read"
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign")
+    }
+
+    fn internal_auth_state() -> Arc<crate::internal_auth::InternalAuthState> {
+        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
+        Arc::new(
+            crate::internal_auth::InternalAuthState::from_jwks_json(
+                jwks,
+                "https://issuer.internal.test".to_string(),
+                "lnurl-server.internal.test".to_string(),
+            )
+            .expect("test JWKS fixture must load"),
+        )
+    }
+
+    async fn internal_account_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        Router::new()
+            .route(
+                "/internal/blink/accounts",
+                post(LnurlServer::<MockRepository>::create_internal_blink_account),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    fn valid_create_blink_account_payload() -> CreateBlinkAccountRequest {
+        CreateBlinkAccountRequest {
+            domain: "Example.COM".to_string(),
+            blink_account_id: "blink_account_123".to_string(),
+            btc_wallet_id: "btc_wallet_123".to_string(),
+            usd_wallet_id: "usd_wallet_123".to_string(),
+            default_wallet: "usd".to_string(),
+            description: "Blink account".to_string(),
+            identifiers: vec![" Alice_123 ".to_string(), "+573005871212".to_string()],
+        }
+    }
+
+    async fn post_internal_blink_account(
+        app: Router,
+        payload: CreateBlinkAccountRequest,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header("authorization", format!("Bearer {}", internal_test_token()))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = serde_json::from_slice(&body).expect("response body is JSON");
+        (status, body)
     }
 
     // -- Tests -----------------------------------------------------------------
@@ -2793,6 +2900,108 @@ mod tests {
             account.identifiers[1].identifier_kind,
             AccountIdentifierKind::Phone
         );
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_missing_identifiers_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers.clear();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_default_wallet_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.default_wallet = "eur".to_string();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_identifier_without_repository_write()
+    {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["not valid".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_identifier"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_wallet_modifier_without_repository_write() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["alice+btc".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "wallet_modifier_not_allowed"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_duplicate_normalized_identifier_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["Alice_123".to_string(), " alice_123 ".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_duplicate_blink_account_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::BlinkAccountExists);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "blink_account_exists"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_identifier_conflict_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::IdentifierConflict);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
     }
 
     #[tokio::test]
