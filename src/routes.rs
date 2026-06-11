@@ -3446,9 +3446,10 @@ mod tests {
 
         assert!(source_artifacts.contains("/internal/domains/{domain}/identifiers/{identifier}"));
         assert!(source_artifacts.contains("D-22"));
-        assert!(!source_artifacts.contains(
-            "GET /internal/accounts/by-identifier/{identifier}` resolves"
-        ));
+        assert!(
+            !source_artifacts
+                .contains("GET /internal/accounts/by-identifier/{identifier}` resolves")
+        );
     }
 
     #[test]
