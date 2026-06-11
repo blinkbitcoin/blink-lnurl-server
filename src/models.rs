@@ -72,6 +72,7 @@ pub struct ListMetadataResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListMetadataMetadata {
     pub payment_hash: String,
+    pub account_id: Option<String>,
     pub sender_comment: Option<String>,
     pub nostr_zap_request: Option<String>,
     pub nostr_zap_receipt: Option<String>,

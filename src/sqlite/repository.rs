@@ -705,7 +705,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      z.zap_event
              ,      MAX(COALESCE(z.updated_at, 0), COALESCE(sc.updated_at, 0), COALESCE(i.updated_at, 0)) AS updated_at
              ,      i.preimage
-             FROM (
+             ,      COALESCE(i.account_id, z.account_id, sc.account_id) AS account_id
+              FROM (
                  SELECT payment_hash FROM invoices WHERE user_pubkey = $1 AND updated_at > $4
                  UNION
                  SELECT payment_hash FROM zaps WHERE user_pubkey = $1 AND updated_at > $4
@@ -729,6 +730,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .map(|row| {
                 Ok(ListMetadataMetadata {
                     payment_hash: row.try_get(0)?,
+                    account_id: row.try_get(6)?,
                     sender_comment: row.try_get(1)?,
                     nostr_zap_request: row.try_get(2)?,
                     nostr_zap_receipt: row.try_get(3)?,
