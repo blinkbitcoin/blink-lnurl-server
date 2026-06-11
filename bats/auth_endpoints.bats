@@ -66,8 +66,6 @@ teardown_file() {
 
   auth="$(auth_payload "transferuser")"
   to_pubkey="$(json_get "$auth" '.to_pubkey')"
-  docker compose exec -T postgres psql -U user -d lnurl \
-    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('spark_transfer_target', 'spark', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO spark_accounts(account_id, pubkey, created_at, updated_at) VALUES ('spark_transfer_target', '${to_pubkey}', 0, 0) ON CONFLICT (account_id) DO NOTHING" >/dev/null
 
   run transfer_user "transferuser" "localhost:8080" "Transfer target wallet"
   [ "$status" -eq 0 ]
@@ -90,6 +88,51 @@ teardown_file() {
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.username' 'transferuser'
   assert_json_equals "$output" '.description' 'Transfer target wallet'
+}
+
+@test "auth: transfer replaces destination's previous Spark alias" {
+  run register_user "transferreplace" "localhost:8080" "Transfer replacement source"
+  [ "$status" -eq 0 ]
+
+  destination_auth="$(auth_payload "destinationalias")"
+  destination_pubkey="$(json_get "$destination_auth" '.to_pubkey')"
+  destination_timestamp="$(json_get "$destination_auth" '.timestamp')"
+  destination_signature="$(json_get "$destination_auth" '.to_register_signature')"
+  destination_data="{\"username\":\"destinationalias\",\"signature\":\"${destination_signature}\",\"timestamp\":${destination_timestamp},\"description\":\"Destination old alias\"}"
+
+  response="$(http_status_body "POST" "${BASE_URL}/lnurlpay/${destination_pubkey}" "localhost:8080" "$destination_data")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.lightning_address' 'destinationalias@localhost:8080'
+
+  run transfer_user "transferreplace" "localhost:8080" "Transfer replacement target"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.lightning_address' 'transferreplace@localhost:8080'
+
+  run username_available "destinationalias" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/destinationalias" "localhost:8080")"
+  code="${response##*$'\n'}"
+  [ "$code" = "404" ]
+
+  transfer_auth="$(auth_payload "transferreplace")"
+  timestamp="$(json_get "$transfer_auth" '.timestamp')"
+  new_recover_signature="$(json_get "$transfer_auth" '.to_recover_signature')"
+  run curl -fsS \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --data "{\"signature\":\"${new_recover_signature}\",\"timestamp\":${timestamp}}" \
+    "${BASE_URL}/lnurlpay/${destination_pubkey}/recover"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.username' 'transferreplace'
+  assert_json_equals "$output" '.description' 'Transfer replacement target'
+
+  run lnurl_discovery "transferreplace" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_nonempty "$output" '.callback'
 }
 
 @test "auth: re-registration removes stale Spark aliases and preserves recover" {
