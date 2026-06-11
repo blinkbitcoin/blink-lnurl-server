@@ -213,9 +213,7 @@ impl LnurlProvider for BlinkProvider {
             wallet_id,
             amount_sat: request.amount_sat,
             description_hash_hex: Some(hex::encode(request.description_hash)),
-            // Route-level expiry is seconds, while Blink expects minutes. Phase 4
-            // intentionally omits it until a route-owned conversion policy exists.
-            expires_in_minutes: None,
+            expires_in_minutes: request.expiry,
         };
 
         let invoice = match wallet {
@@ -493,7 +491,7 @@ mod tests {
         recipient: &ResolvedRecipient,
         wallet: Option<WalletKind>,
     ) -> CreateInvoiceRequest<'_> {
-        blink_invoice_request_with_expiry(recipient, wallet, Some(600))
+        blink_invoice_request_with_expiry(recipient, wallet, None)
     }
 
     #[test]
