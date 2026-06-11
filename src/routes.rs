@@ -2971,7 +2971,7 @@ mod tests {
 
         let providers_source = include_str!("providers.rs");
         assert!(
-            providers_source.contains("AccountProvider::Blink => Ok(self.blink.as_ref())"),
+            providers_source.contains("AccountProvider::Blink => self.blink.as_ref()"),
             "registry must dispatch Blink centrally through ProviderRegistry"
         );
     }
