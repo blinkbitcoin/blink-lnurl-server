@@ -40,6 +40,7 @@ tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 x509-parser = { version = "0.18.0", features = ["verify"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 
 [features]
 dev = []
@@ -55,3 +56,6 @@ clippy.missing_panics_doc = "allow"
 clippy.must_use_candidate = "allow"
 clippy.struct_field_names = "allow"
 clippy.arithmetic_side_effects = "warn"
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

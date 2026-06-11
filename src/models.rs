@@ -1,6 +1,49 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBlinkAccountRequest {
+    pub domain: String,
+    pub blink_account_id: String,
+    pub btc_wallet_id: String,
+    pub usd_wallet_id: String,
+    pub default_wallet: String,
+    pub description: String,
+    pub identifiers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateBlinkAccountResponse {
+    pub account_id: String,
+    pub provider: String,
+    pub blink_account_id: String,
+    pub btc_wallet_id: String,
+    pub usd_wallet_id: String,
+    pub default_wallet: String,
+    pub domain: String,
+    pub identifiers: Vec<InternalAccountIdentifierResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InternalAccountIdentifierResponse {
+    pub identifier: String,
+    pub kind: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InternalErrorResponse {
+    pub error: String,
+}
+
+impl InternalErrorResponse {
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CheckUsernameAvailableResponse {
     pub available: bool,
 }
