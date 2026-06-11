@@ -762,7 +762,7 @@ pub mod shared_tests {
                 domain: "recover-transfer.example.com".to_string(),
                 identifier: "destination".to_string(),
                 identifier_kind: AccountIdentifierKind::Username,
-                description: "destination placeholder".to_string(),
+                description: "destination current".to_string(),
             },
         })
         .await
