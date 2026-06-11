@@ -36,3 +36,21 @@ pub struct CreatedInvoice {
     pub bolt11: String,
     pub payment_hash: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentStatusState {
+    Paid,
+    Pending,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentStatus {
+    pub state: PaymentStatusState,
+    pub settled: bool,
+    pub payment_hash: String,
+    pub payment_request: String,
+    pub preimage: Option<String>,
+    pub amount_received_sat: Option<i64>,
+}

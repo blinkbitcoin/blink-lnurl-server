@@ -2,7 +2,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::{BlinkClientError, GraphqlError};
-use crate::types::{ClientConfig, CreateInvoiceRequest, CreatedInvoice};
+use crate::types::{
+    ClientConfig, CreateInvoiceRequest, CreatedInvoice, PaymentStatus, PaymentStatusState,
+};
 
 pub const PRODUCTION_GRAPHQL_ENDPOINT: &str = "https://api.blink.sv/graphql";
 pub const STAGING_GRAPHQL_ENDPOINT: &str = "https://api.staging.blink.sv/graphql";
@@ -11,6 +13,8 @@ const BTC_INVOICE_OPERATION: &str =
     include_str!("../graphql/ln_invoice_create_on_behalf_of_recipient.graphql");
 const USD_INVOICE_OPERATION: &str =
     include_str!("../graphql/ln_usd_invoice_btc_denominated_create_on_behalf_of_recipient.graphql");
+const PAYMENT_STATUS_OPERATION: &str =
+    include_str!("../graphql/ln_invoice_payment_status_by_hash.graphql");
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -52,6 +56,16 @@ impl Client {
             .into_created_invoice()
     }
 
+    pub async fn payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentStatus, BlinkClientError> {
+        let data = self
+            .execute_payment_status(PAYMENT_STATUS_OPERATION, payment_hash)
+            .await?;
+        data.ln_invoice_payment_status_by_hash.into_payment_status()
+    }
+
     async fn execute<T>(
         &self,
         query: &'static str,
@@ -87,6 +101,38 @@ impl Client {
             .data
             .ok_or(BlinkClientError::MalformedResponse("missing GraphQL data"))
     }
+
+    async fn execute_payment_status(
+        &self,
+        query: &'static str,
+        payment_hash: &str,
+    ) -> Result<PaymentStatusData, BlinkClientError> {
+        let response = self
+            .http_client
+            .post(self.config.endpoint())
+            .json(&json!({
+                "query": query,
+                "variables": {
+                    "input": {
+                        "paymentHash": payment_hash,
+                    }
+                }
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let envelope = response
+            .json::<GraphqlEnvelope<PaymentStatusData>>()
+            .await?;
+        if !envelope.errors.is_empty() {
+            return Err(BlinkClientError::Graphql(envelope.errors));
+        }
+
+        envelope
+            .data
+            .ok_or(BlinkClientError::MalformedResponse("missing GraphQL data"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +152,12 @@ struct BtcInvoiceData {
 #[serde(rename_all = "camelCase")]
 struct UsdInvoiceData {
     ln_usd_invoice_btc_denominated_create_on_behalf_of_recipient: InvoicePayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PaymentStatusData {
+    ln_invoice_payment_status_by_hash: GraphqlPaymentStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,4 +207,48 @@ impl InvoicePayload {
 struct GraphqlInvoice {
     payment_request: Option<String>,
     payment_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPaymentStatus {
+    status: Option<String>,
+    payment_hash: Option<String>,
+    payment_request: Option<String>,
+}
+
+impl GraphqlPaymentStatus {
+    fn into_payment_status(self) -> Result<PaymentStatus, BlinkClientError> {
+        let Some(status) = self.status else {
+            return Err(BlinkClientError::MalformedResponse(
+                "missing payment status",
+            ));
+        };
+        let Some(payment_hash) = self.payment_hash else {
+            return Err(BlinkClientError::MalformedResponse(
+                "missing status paymentHash",
+            ));
+        };
+        let Some(payment_request) = self.payment_request else {
+            return Err(BlinkClientError::MalformedResponse(
+                "missing status paymentRequest",
+            ));
+        };
+
+        let state = match status.as_str() {
+            "PAID" => PaymentStatusState::Paid,
+            "PENDING" => PaymentStatusState::Pending,
+            "EXPIRED" => PaymentStatusState::Expired,
+            _ => PaymentStatusState::Unknown,
+        };
+
+        Ok(PaymentStatus {
+            state,
+            settled: state == PaymentStatusState::Paid,
+            payment_hash,
+            payment_request,
+            preimage: None,
+            amount_received_sat: None,
+        })
+    }
 }

@@ -1,6 +1,6 @@
 use blink_client::{
-    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice, PaymentStatus,
-    PaymentStatusState, PRODUCTION_GRAPHQL_ENDPOINT,
+    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice,
+    PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
