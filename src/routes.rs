@@ -36,8 +36,8 @@ use crate::{
 };
 use crate::{
     repository::{
-        AccountIdentifierKind, AccountProvider, LnurlRepository, LnurlRepositoryError,
-        NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
+        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
+        LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
     },
     state::State,
     user::User,
@@ -209,61 +209,44 @@ where
         }
 
         let domain = sanitize_domain(&state, &host).await?;
+        let from_pubkey = from_pk.to_string();
+        let to_pubkey = to_pk.to_string();
+
+        let source_recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &username)
+            .await
+            .map_err(|e| spark_transfer_error(e, &username))?
+            .ok_or_else(|| spark_transfer_error(LnurlRepositoryError::SourceNotOwner, &username))?;
+
+        if source_recipient.spark_pubkey.as_deref() != Some(from_pubkey.as_str()) {
+            return Err(spark_transfer_error(
+                LnurlRepositoryError::SourceNotOwner,
+                &username,
+            ));
+        }
+
+        let destination_account = state
+            .db
+            .get_account_by_spark_pubkey(&to_pubkey)
+            .await
+            .map_err(|e| spark_transfer_error(e, &username))?
+            .ok_or_else(|| {
+                spark_transfer_error(LnurlRepositoryError::AccountNotFound, &username)
+            })?;
 
         if let Err(e) = state
             .db
-            .transfer_username(
-                &domain,
-                &from_pk.to_string(),
-                &to_pk.to_string(),
-                &username,
-                &payload.description,
-            )
+            .transfer_identifier(&IdentifierTransfer {
+                domain: domain.clone(),
+                identifier: username.clone(),
+                source_account_id: source_recipient.account_id,
+                destination_account_id: destination_account.account_id,
+                description: payload.description,
+            })
             .await
         {
-            return Err(match e {
-                LnurlRepositoryError::SourceNotOwner => {
-                    trace!("transfer source pubkey does not own username '{username}'");
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(Value::String(
-                            "source pubkey does not own this username".into(),
-                        )),
-                    )
-                }
-                LnurlRepositoryError::NameTaken => {
-                    trace!("name already taken during transfer: {username}");
-                    (
-                        StatusCode::CONFLICT,
-                        Json(Value::String("name already taken".into())),
-                    )
-                }
-                LnurlRepositoryError::IdentifierConflict => {
-                    trace!("identifier conflict during transfer: {username}");
-                    (
-                        StatusCode::CONFLICT,
-                        Json(Value::String("name already taken".into())),
-                    )
-                }
-                LnurlRepositoryError::General(err) => {
-                    error!("failed to execute transfer query: {err}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Value::String("internal server error".into())),
-                    )
-                }
-                LnurlRepositoryError::BlinkAccountExists
-                | LnurlRepositoryError::AccountNotFound
-                | LnurlRepositoryError::InvalidOwnership
-                | LnurlRepositoryError::InvalidProvider
-                | LnurlRepositoryError::InvalidIdentifierKind => {
-                    error!("unexpected provider-neutral repository error during transfer: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Value::String("internal server error".into())),
-                    )
-                }
-            });
+            return Err(spark_transfer_error(e, &username));
         }
 
         debug!("transferred '{username}' from {from_pk} to {to_pk}");
@@ -1513,6 +1496,45 @@ fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn spark_transfer_error(error: LnurlRepositoryError, username: &str) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner => {
+            trace!("transfer source pubkey does not own username '{username}'");
+            (
+                StatusCode::NOT_FOUND,
+                Json(Value::String(
+                    "source pubkey does not own this username".into(),
+                )),
+            )
+        }
+        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
+            trace!("name already taken during transfer: {username}");
+            (
+                StatusCode::CONFLICT,
+                Json(Value::String("name already taken".into())),
+            )
+        }
+        LnurlRepositoryError::General(err) => {
+            error!("failed to execute transfer query: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Value::String("internal server error".into())),
+            )
+        }
+        LnurlRepositoryError::BlinkAccountExists
+        | LnurlRepositoryError::AccountNotFound
+        | LnurlRepositoryError::InvalidOwnership
+        | LnurlRepositoryError::InvalidProvider
+        | LnurlRepositoryError::InvalidIdentifierKind => {
+            error!("unexpected provider-neutral transfer error: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Value::String("internal server error".into())),
+            )
+        }
+    }
+}
+
 fn spark_registration_error(
     error: LnurlRepositoryError,
     username: &str,
@@ -1635,6 +1657,25 @@ mod tests {
             Ok(None)
         }
         async fn upsert_user(&self, _: &User) -> Result<(), LnurlRepositoryError> {
+            Ok(())
+        }
+        async fn resolve_recipient_by_identifier(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+            Ok(None)
+        }
+        async fn get_account_by_spark_pubkey(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::repository::Account>, LnurlRepositoryError> {
+            Ok(None)
+        }
+        async fn transfer_identifier(
+            &self,
+            _: &IdentifierTransfer,
+        ) -> Result<(), LnurlRepositoryError> {
             Ok(())
         }
         async fn transfer_username(
