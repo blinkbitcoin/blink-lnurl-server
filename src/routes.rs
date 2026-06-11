@@ -2170,6 +2170,14 @@ mod tests {
             "unregister must delete only the active Spark registration"
         );
         assert!(
+            unregister.contains("&username"),
+            "unregister must pass the signed canonical username into repository deletion"
+        );
+        assert!(
+            unregister.contains("spark_unregister_error"),
+            "unregister must map not-owned targeted deletion to the public not-found convention"
+        );
+        assert!(
             !unregister.contains("delete_user"),
             "unregister must not delete the legacy user row directly from the route"
         );

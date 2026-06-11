@@ -1441,6 +1441,14 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn spark_re_registration_replaces_stale_alias_identifier() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::spark_re_registration_replaces_stale_alias_identifier(&db).await;
+    }
+
+    #[tokio::test]
     async fn spark_phone_identifier_is_rejected() {
         let Some((_, db)) = setup_test_db().await else {
             return;
@@ -1547,6 +1555,14 @@ mod provider_neutral_tests {
             return;
         };
         shared_tests::transfer_identifier_requires_source_owner(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_moves_legacy_recover_ownership() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_identifier_moves_legacy_recover_ownership(&db).await;
     }
 
     #[tokio::test]
@@ -1748,5 +1764,71 @@ mod provider_neutral_tests {
         assert_eq!(moved.account_id, destination_account_id);
         assert_eq!(moved.description, "moved");
         assert_eq!(stayed.account_id, source_account_id);
+    }
+
+    #[tokio::test]
+    async fn targeted_unregister_deletes_only_signed_identifier() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "pg_spark_targeted_unregister_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "pg-targeted-unregister.example.com".to_string(),
+                identifier: "primary".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "primary stays".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, 'username', $4, $5, $5)",
+        )
+        .bind(&account_id)
+        .bind("pg-targeted-unregister.example.com")
+        .bind("secondary")
+        .bind("secondary deleted")
+        .bind(crate::time::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.delete_spark_registration(
+            "pg-targeted-unregister.example.com",
+            "pg_spark_targeted_unregister_pubkey",
+            "secondary",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.resolve_recipient_by_identifier("pg-targeted-unregister.example.com", "secondary")
+                .await
+                .unwrap()
+                .is_none(),
+            "targeted unregister should remove only the signed identifier"
+        );
+        assert!(
+            db.resolve_recipient_by_identifier("pg-targeted-unregister.example.com", "primary")
+                .await
+                .unwrap()
+                .is_some(),
+            "targeted unregister must not remove unrelated identifiers"
+        );
+        assert_eq!(
+            db.get_user_by_pubkey(
+                "pg-targeted-unregister.example.com",
+                "pg_spark_targeted_unregister_pubkey"
+            )
+            .await
+            .unwrap()
+            .expect("legacy recover row for unsigned identifier should remain")
+            .name,
+            "primary"
+        );
     }
 }
