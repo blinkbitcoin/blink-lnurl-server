@@ -68,11 +68,12 @@ const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
 const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
 
 #[cfg(test)]
-const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 5] {
+const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 6] {
     [
         "unsupported wallet",
         "expiry too long",
         "missing amount",
+        "amount out of range",
         "comment too long",
         "invoice creation failed",
     ]
@@ -759,6 +760,11 @@ where
             return Err(lnurl_error("amount must be a whole sat amount"));
         }
 
+        if amount_msat < state.min_sendable || amount_msat > state.max_sendable {
+            trace!("amount outside advertised minSendable/maxSendable range");
+            return Err(lnurl_error("amount out of range"));
+        }
+
         if let Some(comment) = params.comment.as_deref()
             && comment.trim().len() > MAX_COMMENT_LENGTH
         {
@@ -779,22 +785,22 @@ where
             })
             .transpose()?;
 
-        let desc_hash = if let Some(event) = &params.nostr {
+        let desc_hash = if let Some(raw_event) = &params.nostr {
             if nostr_pubkey.is_none() {
                 trace!("nostr zap not supported");
                 return Err(lnurl_error("nostr zap not supported"));
             }
 
-            if event.len() > MAX_NOSTR_EVENT_SIZE {
+            if raw_event.len() > MAX_NOSTR_EVENT_SIZE {
                 return Err(lnurl_error("nostr event too large"));
             }
 
-            let event = Event::from_json(event).map_err(|e| {
+            let event = Event::from_json(raw_event).map_err(|e| {
                 trace!("invalid nostr event, could not parse: {}", e);
                 lnurl_error("invalid nostr event")
             })?;
             validate_nostr_zap_request(amount_msat, &event)?;
-            sha256::Hash::hash(event.as_json().as_bytes())
+            sha256::Hash::hash(raw_event.as_bytes())
         } else {
             let metadata = get_metadata_for_recipient(
                 &public_recipient.recipient,
@@ -3436,6 +3442,7 @@ mod tests {
                 "unsupported wallet",
                 "expiry too long",
                 "missing amount",
+                "amount out of range",
                 "comment too long",
                 "invoice creation failed",
             ]
@@ -3635,6 +3642,13 @@ mod tests {
 
         for (params, expected) in [
             (LnurlPayCallbackParams::default(), "missing amount"),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(0),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "amount out of range",
+            ),
             (
                 LnurlPayCallbackParams {
                     amount: Some(1_000),
