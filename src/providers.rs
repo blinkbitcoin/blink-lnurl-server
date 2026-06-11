@@ -19,11 +19,13 @@ pub struct ProviderInvoice {
     pub bolt11: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PaymentStatusRequest<'a> {
     pub payment_hash: &'a str,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPaymentStatus {
     pub settled: bool,
@@ -57,6 +59,7 @@ pub trait LnurlProvider: Send + Sync {
         request: CreateInvoiceRequest<'_>,
     ) -> Result<ProviderInvoice, ProviderError>;
 
+    #[allow(dead_code)]
     async fn payment_status(
         &self,
         request: PaymentStatusRequest<'_>,

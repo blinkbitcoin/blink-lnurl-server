@@ -184,6 +184,7 @@ where
 }
 
 /// Create a new invoice record for LUD-21 and NIP-57 support.
+#[allow(dead_code)]
 pub async fn create_invoice<DB>(
     db: &DB,
     payment_hash: &str,

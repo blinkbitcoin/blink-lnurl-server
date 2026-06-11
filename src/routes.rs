@@ -1338,6 +1338,7 @@ fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
     canonical_spark_username_for_route(username).map(|_| ())
 }
 
+#[cfg(test)]
 fn public_lookup_username(identifier: &str) -> Result<Option<String>, IdentifierError> {
     let trimmed = identifier.trim();
     if trimmed.is_empty() {
@@ -1567,6 +1568,7 @@ fn get_metadata(domain: &str, user: &User) -> String {
     .to_string()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
     error!("failed to execute query: {error}");
     (
@@ -2248,6 +2250,7 @@ mod tests {
     // -- Public LNURL provider-dispatch compatibility -------------------------
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn public_lnurl_discovery_shape_remains_spark_compatible() {
         let user = User {
             domain: "localhost:8080".to_string(),
@@ -2344,8 +2347,9 @@ mod tests {
             invoice.contains("create_invoice"),
             "callback must create invoices through the selected provider"
         );
+        let direct_wallet_call = ["state", "wallet", "create_lightning_invoice"].join(".");
         assert!(
-            !invoice.contains("state.wallet.create_lightning_invoice"),
+            !invoice.contains(&direct_wallet_call),
             "callback must not call the Spark wallet directly"
         );
 
