@@ -786,10 +786,10 @@ where
             .transpose()?;
 
         let desc_hash = if let Some(raw_event) = &params.nostr {
-            if nostr_pubkey.is_none() {
+            let Some(expected_nostr_pubkey) = nostr_pubkey else {
                 trace!("nostr zap not supported");
                 return Err(lnurl_error("nostr zap not supported"));
-            }
+            };
 
             if raw_event.len() > MAX_NOSTR_EVENT_SIZE {
                 return Err(lnurl_error("nostr event too large"));
@@ -799,7 +799,7 @@ where
                 trace!("invalid nostr event, could not parse: {}", e);
                 lnurl_error("invalid nostr event")
             })?;
-            validate_nostr_zap_request(amount_msat, &event)?;
+            validate_nostr_zap_request(amount_msat, &event, expected_nostr_pubkey)?;
             sha256::Hash::hash(raw_event.as_bytes())
         } else {
             let metadata = get_metadata_for_recipient(
@@ -840,6 +840,19 @@ where
         if !matches!(invoice.description(), Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0.to_string() == desc_hash.to_string())
         {
             error!("provider returned invoice with unexpected description hash");
+            return Err(lnurl_error("internal server error"));
+        }
+
+        let Some(invoice_amount_msat) = invoice.amount_milli_satoshis() else {
+            error!("provider returned invoice without an amount");
+            return Err(lnurl_error("internal server error"));
+        };
+
+        if invoice_amount_msat != amount_msat {
+            error!(
+                "provider returned invoice amount {} msat, expected {} msat",
+                invoice_amount_msat, amount_msat
+            );
             return Err(lnurl_error("internal server error"));
         }
 
@@ -1533,6 +1546,7 @@ where
 fn validate_nostr_zap_request(
     amount_msat: u64,
     event: &Event,
+    expected_nostr_pubkey: XOnlyPublicKey,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     if event.kind != Kind::ZapRequest {
         trace!("nostr event is incorrect kind");
@@ -1551,16 +1565,25 @@ fn validate_nostr_zap_request(
         return Err(lnurl_error("invalid nostr event"));
     }
 
-    // 3. It MUST have only one p tag
-    if event
+    // 3. It MUST have only one p tag for the advertised recipient pubkey.
+    let mut p_tags = event
         .tags
         .iter()
-        .filter_map(nostr::Tag::single_letter_tag)
-        .filter(|t| t.is_lowercase() && t.character == Alphabet::P)
-        .count()
-        != 1
-    {
+        .filter(|tag| {
+            tag.single_letter_tag()
+                .is_some_and(|t| t.is_lowercase() && t.character == Alphabet::P)
+        })
+        .filter_map(nostr::Tag::content);
+    let Some(p_tag) = p_tags.next() else {
+        trace!("invalid nostr event, missing 'p' tag");
+        return Err(lnurl_error("invalid nostr event"));
+    };
+    if p_tags.next().is_some() {
         trace!("invalid nostr event, missing or multiple 'p' tags");
+        return Err(lnurl_error("invalid nostr event"));
+    }
+    if p_tag != expected_nostr_pubkey.to_string() {
+        trace!("invalid nostr event, 'p' tag does not match recipient pubkey");
         return Err(lnurl_error("invalid nostr event"));
     }
 
@@ -3677,6 +3700,27 @@ mod tests {
                 "{expected} must happen before provider dispatch"
             );
         }
+
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let before = calls.load(Ordering::SeqCst);
+        assert_lnurl_error(
+            get_public_invoice(
+                state,
+                "alice",
+                LnurlPayCallbackParams {
+                    amount: Some(2_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "internal server error",
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before + 1,
+            "provider amount mismatch is rejected after provider dispatch"
+        );
 
         let spark_repo =
             MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
