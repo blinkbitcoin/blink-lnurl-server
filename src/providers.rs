@@ -474,18 +474,26 @@ mod tests {
         format!("http://{addr}/graphql")
     }
 
-    fn blink_invoice_request(
+    fn blink_invoice_request_with_expiry(
         recipient: &ResolvedRecipient,
         wallet: Option<WalletKind>,
+        expiry: Option<u32>,
     ) -> CreateInvoiceRequest<'_> {
         CreateInvoiceRequest {
             recipient,
             wallet,
             amount_sat: 21,
             description_hash: [7; 32],
-            expiry: Some(600),
+            expiry,
             include_spark_address: true,
         }
+    }
+
+    fn blink_invoice_request(
+        recipient: &ResolvedRecipient,
+        wallet: Option<WalletKind>,
+    ) -> CreateInvoiceRequest<'_> {
+        blink_invoice_request_with_expiry(recipient, wallet, Some(600))
     }
 
     #[test]
@@ -596,6 +604,160 @@ mod tests {
             hex::encode([7; 32])
         );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_invoice_metadata_covers_blink_wallet_selection_and_spark_capability_rules() {
+        // COMP-04, LNURL-04, LNURL-05, D-12, and D-13: provider invoices expose
+        // selected wallet metadata while Spark remains BTC/default only.
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(3);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let blink_provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
+        let default_btc_recipient = blink_recipient(Some(WalletKind::Btc));
+
+        let default_invoice = blink_provider
+            .create_invoice(blink_invoice_request_with_expiry(
+                &default_btc_recipient,
+                None,
+                None,
+            ))
+            .await
+            .expect("default BTC invoice should be created");
+        assert_eq!(default_invoice.wallet_kind, WalletKind::Btc);
+        assert_eq!(default_invoice.wallet_id.as_deref(), Some("btc_wallet"));
+        assert_eq!(
+            default_invoice.provider_payment_hash.as_deref(),
+            Some("btc_payment_hash")
+        );
+        let _default_body = request_body_rx
+            .recv()
+            .await
+            .expect("default BTC request body should be captured");
+
+        let explicit_btc_invoice = blink_provider
+            .create_invoice(blink_invoice_request_with_expiry(
+                &default_btc_recipient,
+                Some(WalletKind::Btc),
+                None,
+            ))
+            .await
+            .expect("explicit BTC invoice should be created");
+        assert_eq!(explicit_btc_invoice.wallet_kind, WalletKind::Btc);
+        assert_eq!(
+            explicit_btc_invoice.wallet_id.as_deref(),
+            Some("btc_wallet")
+        );
+        let explicit_btc_body = request_body_rx
+            .recv()
+            .await
+            .expect("explicit BTC request body should be captured");
+        assert_eq!(
+            explicit_btc_body["variables"]["input"]["recipientWalletId"],
+            "btc_wallet"
+        );
+
+        let explicit_usd_invoice = blink_provider
+            .create_invoice(blink_invoice_request_with_expiry(
+                &default_btc_recipient,
+                Some(WalletKind::Usd),
+                None,
+            ))
+            .await
+            .expect("explicit USD invoice should be created");
+        assert_eq!(explicit_usd_invoice.wallet_kind, WalletKind::Usd);
+        assert_eq!(
+            explicit_usd_invoice.wallet_id.as_deref(),
+            Some("usd_wallet")
+        );
+        assert_eq!(
+            explicit_usd_invoice.provider_payment_hash.as_deref(),
+            Some("usd_payment_hash")
+        );
+        let explicit_usd_body = request_body_rx
+            .recv()
+            .await
+            .expect("explicit USD request body should be captured");
+        assert_eq!(
+            explicit_usd_body["variables"]["input"]["recipientWalletId"],
+            "usd_wallet"
+        );
+
+        let spark_provider = spark_provider_for_unit_tests();
+        let spark_recipient = recipient(AccountProvider::Spark, None);
+        let err = spark_provider
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &spark_recipient,
+                wallet: Some(WalletKind::Usd),
+                amount_sat: 1,
+                description_hash: [0; 32],
+                expiry: Some(1),
+                include_spark_address: false,
+            })
+            .await
+            .expect_err("Spark must reject USD wallet intent before wallet use");
+        assert!(matches!(
+            err,
+            ProviderError::UnsupportedWallet {
+                provider: AccountProvider::Spark,
+                wallet: WalletKind::Usd,
+            }
+        ));
+
+        for wallet in [None, Some(WalletKind::Btc)] {
+            let result = spark_provider
+                .create_invoice(CreateInvoiceRequest {
+                    recipient: &spark_recipient,
+                    wallet,
+                    amount_sat: 1,
+                    description_hash: [0; 32],
+                    expiry: Some(2),
+                    include_spark_address: false,
+                })
+                .await;
+            assert!(
+                !matches!(result, Err(ProviderError::UnsupportedWallet { .. })),
+                "Spark default/BTC intent should pass COMP-04 capability gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_expiry_forwards_route_validated_minutes_without_provider_policy() {
+        // LNURL-04/D-05/D-06/D-07/D-08/D-09/D-10: route-owned callback code
+        // converts public seconds and enforces limits; provider forwards already
+        // accepted minute values unchanged and omits expiry when absent.
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(3);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
+        let recipient = blink_recipient(Some(WalletKind::Btc));
+
+        for expiry in [None, Some(1), Some(2)] {
+            provider
+                .create_invoice(blink_invoice_request_with_expiry(
+                    &recipient,
+                    Some(WalletKind::Btc),
+                    expiry,
+                ))
+                .await
+                .expect("Blink invoice should be created for provider-ready expiry");
+            let body = request_body_rx
+                .recv()
+                .await
+                .expect("Blink request body should be captured");
+
+            match expiry {
+                Some(minutes) => {
+                    assert_eq!(body["variables"]["input"]["expiresIn"], minutes);
+                }
+                None => {
+                    assert!(body["variables"]["input"].get("expiresIn").is_none());
+                }
+            }
+        }
     }
 
     #[tokio::test]
