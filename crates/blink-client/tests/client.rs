@@ -89,6 +89,31 @@ async fn mount_invoice_response(
         .await;
 }
 
+trait PaymentRequestAssertions {
+    fn assert_none(&self);
+    fn assert_some_eq(&self, expected: &str);
+}
+
+impl PaymentRequestAssertions for String {
+    fn assert_none(&self) {
+        panic!("payment_request should be None, got {self}");
+    }
+
+    fn assert_some_eq(&self, expected: &str) {
+        assert_eq!(self, expected);
+    }
+}
+
+impl PaymentRequestAssertions for Option<String> {
+    fn assert_none(&self) {
+        assert_eq!(self, &None);
+    }
+
+    fn assert_some_eq(&self, expected: &str) {
+        assert_eq!(self, &Some(expected.to_string()));
+    }
+}
+
 #[tokio::test]
 async fn creates_btc_invoice_with_selected_wallet() {
     let server = MockServer::start().await;
@@ -268,10 +293,11 @@ async fn payment_status_maps_paid_status() {
             amount_received_sat: None,
         }
     );
+    status.payment_request.assert_some_eq("lnbc1paid");
 }
 
 #[tokio::test]
-async fn payment_status_maps_unsettled_status_without_optional_fields() {
+async fn payment_status_maps_unsettled_status_without_payment_request() {
     for (blink_status, expected_state) in [
         ("PENDING", PaymentStatusState::Pending),
         ("EXPIRED", PaymentStatusState::Expired),
@@ -286,8 +312,7 @@ async fn payment_status_maps_unsettled_status_without_optional_fields() {
                 "data": {
                     "lnInvoicePaymentStatusByHash": {
                         "status": blink_status,
-                        "paymentHash": "unsettled-hash",
-                        "paymentRequest": "lnbc1unsettled"
+                        "paymentHash": "unsettled-hash"
                     }
                 }
             })))
@@ -304,7 +329,7 @@ async fn payment_status_maps_unsettled_status_without_optional_fields() {
         assert_eq!(status.state, expected_state);
         assert!(!status.settled);
         assert_eq!(status.payment_hash, "unsettled-hash");
-        assert_eq!(status.payment_request, "lnbc1unsettled");
+        status.payment_request.assert_none();
         // D-06/D-11: current checked-in operation does not select preimage or amount.
         assert_eq!(status.preimage, None);
         assert_eq!(status.amount_received_sat, None);
