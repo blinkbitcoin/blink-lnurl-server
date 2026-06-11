@@ -627,7 +627,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::InvalidProvider);
         }
 
-        sqlx::query(
+        let update_result = sqlx::query(
             "UPDATE account_identifiers
              SET account_id = $3
              ,   description = $4
@@ -642,6 +642,9 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&transfer.source_account_id)
         .execute(&mut *tx)
         .await?;
+        if update_result.rows_affected() != 1 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
 
         sqlx::query(
             "DELETE FROM account_identifiers
