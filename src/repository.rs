@@ -1102,6 +1102,7 @@ pub mod shared_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn invoice_provider_metadata_round_trips<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -1161,7 +1162,7 @@ pub mod shared_tests {
             wallet_id: Some("blink_usd_wallet_round_trip".to_string()),
             provider_payment_hash: Some("blink_provider_hash_round_trip".to_string()),
             payment_hash: "round_trip_blink_hash".to_string(),
-            user_pubkey: "".to_string(),
+            user_pubkey: String::new(),
             invoice: "lnbc1roundtripblink".to_string(),
             preimage: None,
             invoice_expiry: now.saturating_add(120_000),

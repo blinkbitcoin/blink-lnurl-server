@@ -605,6 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn provider_invoice_metadata_covers_blink_wallet_selection_and_spark_capability_rules() {
         // COMP-04, LNURL-04, LNURL-05, D-12, and D-13: provider invoices expose
         // selected wallet metadata while Spark remains BTC/default only.

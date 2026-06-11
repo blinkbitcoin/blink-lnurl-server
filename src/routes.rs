@@ -67,6 +67,7 @@ const MAX_COMMENT_LENGTH: usize = 255;
 const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
 const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
 
+#[cfg(test)]
 const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 5] {
     [
         "unsupported wallet",
@@ -1832,6 +1833,7 @@ fn parse_pubkey(pubkey: &str) -> Result<PublicKey, (StatusCode, Json<Value>)> {
     Ok(pubkey)
 }
 
+#[cfg(test)]
 fn get_metadata(domain: &str, user: &User) -> String {
     json!(vec![
         vec!["text/plain", &user.description],
@@ -3349,6 +3351,30 @@ mod tests {
     }
 
     #[test]
+    fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
+        // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
+        // alice+usd are public route identities only. Storage and dispatch must
+        // use the resolved canonical recipient/account metadata instead.
+        let invoice = handler_source("handle_invoice");
+        assert!(
+            invoice.contains("public_recipient.callback_identifier"),
+            "callback metadata hashing should preserve requested public identity"
+        );
+        assert!(
+            invoice.contains("Some(&account_id)")
+                && invoice.contains("public_recipient.recipient.provider")
+                && invoice.contains("res.wallet_id.as_deref()"),
+            "invoice persistence must use resolved account/provider/wallet metadata"
+        );
+        assert!(
+            !invoice.contains("identifier+btc")
+                && !invoice.contains("identifier+usd")
+                && !invoice.contains("callback_identifier.clone()"),
+            "virtual aliases must not be persisted as account identifiers"
+        );
+    }
+
+    #[test]
     fn blink_provider_source_boundaries_remain_route_and_registry_owned() {
         let routes_source = include_str!("routes.rs");
         let route_runtime_source = routes_source
@@ -3521,7 +3547,7 @@ mod tests {
             let repo =
                 MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
             let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
-            get_public_invoice(
+            let _ = get_public_invoice(
                 state,
                 identifier,
                 LnurlPayCallbackParams {
