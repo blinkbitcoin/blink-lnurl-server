@@ -2382,8 +2382,39 @@ mod tests {
         );
 
         let providers_source = include_str!("providers.rs");
-        assert!(!providers_source.contains("use axum"));
-        assert!(!providers_source.contains("serde_json"));
+        let provider_runtime_source = providers_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("providers source should have runtime section");
+        assert!(!provider_runtime_source.contains("use axum"));
+        assert!(!provider_runtime_source.contains("serde_json"));
+    }
+
+    #[test]
+    fn blink_provider_source_boundaries_remain_route_and_registry_owned() {
+        let routes_source = include_str!("routes.rs");
+        let route_runtime_source = routes_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("routes source should have runtime section");
+        assert!(
+            !route_runtime_source.contains("blink_client"),
+            "routes must not call Blink GraphQL client directly"
+        );
+        assert!(
+            routes_source.contains("ProviderError::MissingBlinkDefaultWallet")
+                && routes_source.contains("ProviderError::MissingBlinkBtcWalletId")
+                && routes_source.contains("ProviderError::MissingBlinkUsdWalletId")
+                && routes_source.contains("ProviderError::BlinkInvoiceCreationFailed")
+                && routes_source.contains("ProviderError::BlinkPaymentStatusUnavailable"),
+            "route provider-error mapping must cover Blink provider failures"
+        );
+
+        let providers_source = include_str!("providers.rs");
+        assert!(
+            providers_source.contains("AccountProvider::Blink => Ok(self.blink.as_ref())"),
+            "registry must dispatch Blink centrally through ProviderRegistry"
+        );
     }
 
     #[test]
