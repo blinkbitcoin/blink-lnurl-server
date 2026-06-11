@@ -165,11 +165,13 @@ fn bearer_token(req: &Request) -> Result<&str, InternalAuthError> {
         .get(AUTHORIZATION)
         .and_then(|header| header.to_str().ok())
         .ok_or(InternalAuthError::MissingBearer)?;
-    header
+    let token = header
         .strip_prefix("Bearer ")
-        .filter(|token| !token.trim().is_empty())
-        .map(str::trim)
-        .ok_or(InternalAuthError::MissingBearer)
+        .ok_or(InternalAuthError::MissingBearer)?;
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return Err(InternalAuthError::MissingBearer);
+    }
+    Ok(token)
 }
 
 fn parse_scopes(claims: &InternalClaims) -> HashSet<String> {
@@ -195,7 +197,7 @@ fn extend_scopes(scopes: &mut HashSet<String>, value: Option<&Value>, shape: Sco
     };
     match (value, shape) {
         (Value::String(scope_string), _) => scopes.extend(split_scope_string(scope_string)),
-        (Value::Array(items), ScopeShape::StringOrArray) => {
+        (Value::Array(items), ScopeShape::StringOrArray) if items.iter().all(Value::is_string) => {
             scopes.extend(
                 items
                     .iter()
@@ -230,10 +232,10 @@ mod tests {
         .expect("test JWKS fixture must load")
     }
 
-    fn test_token_with_header_and_claims(header: &Header, claims: Value) -> String {
+    fn test_token_with_header_and_claims(header: &Header, claims: &Value) -> String {
         encode(
             header,
-            &claims,
+            claims,
             &EncodingKey::from_rsa_pem(include_bytes!(
                 "../tests/fixtures/internal_auth_private.pem"
             ))
@@ -248,7 +250,7 @@ mod tests {
         header
     }
 
-    fn valid_claims(scopes: Value) -> Value {
+    fn valid_claims(scopes: &Value) -> Value {
         serde_json::json!({
             "sub": "blink-core-test-service",
             "iss": TEST_ISSUER,
@@ -262,7 +264,7 @@ mod tests {
     fn valid_test_token() -> String {
         test_token_with_header_and_claims(
             &rs256_header(Some(TEST_KID)),
-            valid_claims(Value::String(SCOPE_BLINK_ACCOUNTS_CREATE.to_string())),
+            &valid_claims(&Value::String(SCOPE_BLINK_ACCOUNTS_CREATE.to_string())),
         )
     }
 
@@ -351,8 +353,8 @@ mod tests {
         .expect("claims parse");
         let scopes = parse_scopes(&claims);
         assert!(!scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-        assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
-        assert_eq!(scopes.len(), 1);
+        assert!(!scopes.contains(SCOPE_ACCOUNTS_READ));
+        assert!(scopes.is_empty());
     }
 
     #[test]
@@ -385,7 +387,10 @@ mod tests {
         ] {
             let req = request_with_authorization(header.as_deref());
 
-            assert!(matches!(bearer_token(&req), Err(InternalAuthError::MissingBearer)));
+            assert!(matches!(
+                bearer_token(&req),
+                Err(InternalAuthError::MissingBearer)
+            ));
         }
     }
 
@@ -406,11 +411,11 @@ mod tests {
         let state = test_auth_state();
         let missing_kid = test_token_with_header_and_claims(
             &rs256_header(None),
-            valid_claims(serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("accounts:read")),
         );
         let unknown_kid = test_token_with_header_and_claims(
             &rs256_header(Some("unknown-kid")),
-            valid_claims(serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("accounts:read")),
         );
 
         assert!(matches!(
@@ -431,7 +436,7 @@ mod tests {
         hs_header.kid = Some(TEST_KID.to_string());
         let wrong_alg = encode(
             &hs_header,
-            &valid_claims(serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("accounts:read")),
             &EncodingKey::from_secret(b"not-the-internal-secret"),
         )
         .expect("HS256 token signs for negative test");
@@ -489,7 +494,7 @@ mod tests {
         ];
 
         for claims in cases {
-            let token = test_token_with_header_and_claims(&header, claims);
+            let token = test_token_with_header_and_claims(&header, &claims);
 
             assert!(matches!(
                 validate_internal_token(&state, &token),

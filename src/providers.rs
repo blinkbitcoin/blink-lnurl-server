@@ -254,13 +254,10 @@ impl ProviderRegistry {
         }
     }
 
-    pub fn provider_for(
-        &self,
-        provider: AccountProvider,
-    ) -> Result<&dyn LnurlProvider, ProviderError> {
+    pub fn provider_for(&self, provider: AccountProvider) -> &dyn LnurlProvider {
         match provider {
-            AccountProvider::Spark => Ok(self.spark.as_ref()),
-            AccountProvider::Blink => Ok(self.blink.as_ref()),
+            AccountProvider::Spark => self.spark.as_ref(),
+            AccountProvider::Blink => self.blink.as_ref(),
         }
     }
 }
@@ -302,8 +299,14 @@ mod tests {
             ))),
         };
 
-        assert!(registry.provider_for(AccountProvider::Spark).is_ok());
-        assert!(registry.provider_for(AccountProvider::Blink).is_ok());
+        assert!(std::ptr::addr_eq(
+            registry.provider_for(AccountProvider::Spark),
+            registry.spark.as_ref() as &dyn LnurlProvider,
+        ));
+        assert!(std::ptr::addr_eq(
+            registry.provider_for(AccountProvider::Blink),
+            registry.blink.as_ref() as &dyn LnurlProvider,
+        ));
     }
 
     #[tokio::test]
@@ -462,10 +465,10 @@ mod tests {
         format!("http://{addr}/graphql")
     }
 
-    fn blink_invoice_request<'a>(
-        recipient: &'a ResolvedRecipient,
+    fn blink_invoice_request(
+        recipient: &ResolvedRecipient,
         wallet: Option<WalletKind>,
-    ) -> CreateInvoiceRequest<'a> {
+    ) -> CreateInvoiceRequest<'_> {
         CreateInvoiceRequest {
             recipient,
             wallet,
@@ -485,8 +488,14 @@ mod tests {
             ))),
         };
 
-        assert!(registry.provider_for(AccountProvider::Spark).is_ok());
-        assert!(registry.provider_for(AccountProvider::Blink).is_ok());
+        assert!(std::ptr::addr_eq(
+            registry.provider_for(AccountProvider::Spark),
+            registry.spark.as_ref() as &dyn LnurlProvider,
+        ));
+        assert!(std::ptr::addr_eq(
+            registry.provider_for(AccountProvider::Blink),
+            registry.blink.as_ref() as &dyn LnurlProvider,
+        ));
     }
 
     #[tokio::test]

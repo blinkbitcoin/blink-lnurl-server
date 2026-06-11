@@ -783,7 +783,6 @@ where
         let res = state
             .providers
             .provider_for(public_recipient.recipient.provider)
-            .map_err(map_provider_invoice_error)?
             .create_invoice(CreateInvoiceRequest {
                 recipient: &public_recipient.recipient,
                 wallet: public_recipient.wallet,
@@ -1181,7 +1180,7 @@ where
             .db
             .resolve_recipient_by_identifier(&domain, &parsed.canonical)
             .await
-            .map_err(internal_lookup_storage_error)?;
+            .map_err(|e| internal_lookup_storage_error(&e))?;
         let Some(recipient) = recipient else {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -1309,7 +1308,7 @@ fn internal_account_creation_error(
 }
 
 fn internal_lookup_storage_error(
-    error: LnurlRepositoryError,
+    error: &LnurlRepositoryError,
 ) -> (StatusCode, Json<InternalErrorResponse>) {
     error!("failed to resolve internal identifier lookup: {error}");
     (
@@ -2483,6 +2482,10 @@ mod tests {
 
     async fn internal_account_app(repo: MockRepository) -> Router {
         let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_account_app_with_state(state)
+    }
+
+    fn internal_account_app_with_state(state: State<MockRepository>) -> Router {
         Router::new()
             .route(
                 "/internal/blink/accounts",
@@ -2497,6 +2500,10 @@ mod tests {
 
     async fn internal_lookup_app(repo: MockRepository) -> Router {
         let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_lookup_app_with_state(state)
+    }
+
+    fn internal_lookup_app_with_state(state: State<MockRepository>) -> Router {
         Router::new()
             .route(
                 "/internal/domains/{domain}/identifiers/{identifier}",
@@ -2540,7 +2547,11 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body reads");
-        let body = serde_json::from_slice(&body).expect("response body is JSON");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
         (status, body)
     }
 
@@ -3215,6 +3226,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_blink_account_fails_closed_when_internal_auth_config_is_absent() {
+        // D-03/D-07/D-27: absent configured internal auth state returns 401 before handler writes.
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let app = internal_account_app_with_state(state);
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, Value::Null);
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_requires_create_scope_before_repository_write() {
+        // D-09/D-10: valid internal JWTs without the route scope receive 403.
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope("accounts:read")),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&valid_create_blink_account_payload())
+                    .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body: Value = serde_json::from_slice(&body).expect("response body is JSON");
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
     async fn internal_identifier_lookup_blink_parses_btc_modifier_before_repository_lookup() {
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
         let app = internal_lookup_app(repo.clone()).await;
@@ -3363,6 +3420,32 @@ mod tests {
         let main_source = include_str!("main.rs");
         assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
         assert!(!main_source.contains("accounts/by-identifier"));
+    }
+
+    #[test]
+    fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
+        // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
+        // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
+        let main_source = include_str!("main.rs");
+        let internal_mount = main_source
+            .find(".nest(\"/internal\", internal_router)")
+            .expect("internal router must be nested separately");
+        let spark_auth = main_source
+            .find("auth::auth::<DB>")
+            .expect("Spark compatibility routes must keep certificate auth");
+        let public_lnurl = main_source
+            .find("/.well-known/lnurlp/{identifier}")
+            .expect("public LNURL route must remain mounted");
+        let internal_auth = main_source
+            .find("internal_auth::internal_auth::<DB>")
+            .expect("internal router must use internal JWT middleware");
+
+        assert!(internal_auth < internal_mount);
+        assert!(internal_mount < spark_auth);
+        assert!(spark_auth < public_lnurl);
+        assert!(main_source.contains("/blink/accounts"));
+        assert!(main_source.contains("/lnurlpay/{pubkey}"));
+        assert!(main_source.contains("/lnurlp/{identifier}"));
     }
 
     #[tokio::test]
