@@ -923,7 +923,7 @@ where
 
     /// Invoice-paid notification endpoint (single invoice).
     /// Deprecated: use `invoices_paid` instead, which supports batch notifications.
-    /// TODO: Remove this endpoint after all clients have migrated to `invoices_paid`.
+    /// TODO(DEF-legacy-invoice-paid): Remove after all clients have migrated to `invoices_paid`.
     pub async fn invoice_paid(
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
@@ -1319,7 +1319,7 @@ fn validate_nostr_zap_request(
     // NOTE: Assuming the tag is well-formed and contains the necessary fields, because it's standard.
 
     // 8. There MUST be 0 or 1 P tags. If there is one, it MUST be equal to the zap receipt's pubkey.
-    // TODO: Implement this check.
+    // TODO(Phase 7): Enforce optional NIP-57 P-tag recipient checks when provider-neutral zap receipt keys are migrated.
     Ok(())
 }
 
