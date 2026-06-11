@@ -137,7 +137,7 @@ impl LnurlProvider for SparkProvider {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         let _ = request;
         Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
-            "red phase placeholder"
+            "Spark payment status remains route-owned until settlement dispatch migration"
         )))
     }
 }
