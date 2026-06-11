@@ -37,6 +37,7 @@ mod identifier;
 mod invoice_paid;
 mod models;
 mod postgresql;
+mod providers;
 mod repository;
 mod routes;
 mod sqlite;
