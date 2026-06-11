@@ -2017,6 +2017,7 @@ mod tests {
     enum MockCreateBlinkAccountError {
         BlinkAccountExists,
         IdentifierConflict,
+        NameTaken,
     }
 
     impl MockRepository {
@@ -2093,6 +2094,7 @@ mod tests {
                     MockCreateBlinkAccountError::IdentifierConflict => {
                         Err(LnurlRepositoryError::IdentifierConflict)
                     }
+                    MockCreateBlinkAccountError::NameTaken => Err(LnurlRepositoryError::NameTaken),
                 };
             }
             Ok(())
@@ -3215,6 +3217,20 @@ mod tests {
     async fn internal_blink_account_conflict_maps_identifier_conflict_to_409() {
         let repo = MockRepository::default();
         repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::IdentifierConflict);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_name_taken_fallback_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::NameTaken);
         let app = internal_account_app(repo.clone()).await;
 
         let (status, body) =
