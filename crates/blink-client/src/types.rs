@@ -50,7 +50,7 @@ pub struct PaymentStatus {
     pub state: PaymentStatusState,
     pub settled: bool,
     pub payment_hash: String,
-    pub payment_request: String,
+    pub payment_request: Option<String>,
     pub preimage: Option<String>,
     pub amount_received_sat: Option<i64>,
 }

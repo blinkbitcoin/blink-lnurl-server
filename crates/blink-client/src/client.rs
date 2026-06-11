@@ -235,12 +235,6 @@ impl GraphqlPaymentStatus {
                 "missing status paymentHash",
             ));
         };
-        let Some(payment_request) = self.payment_request else {
-            return Err(BlinkClientError::MalformedResponse(
-                "missing status paymentRequest",
-            ));
-        };
-
         let state = match status.as_str() {
             "PAID" => PaymentStatusState::Paid,
             "PENDING" => PaymentStatusState::Pending,
@@ -252,7 +246,7 @@ impl GraphqlPaymentStatus {
             state,
             settled: state == PaymentStatusState::Paid,
             payment_hash,
-            payment_request,
+            payment_request: self.payment_request,
             preimage: None,
             amount_received_sat: None,
         })
