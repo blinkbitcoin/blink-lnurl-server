@@ -3439,6 +3439,19 @@ mod tests {
     }
 
     #[test]
+    fn auth_08_source_artifacts_record_restful_identifier_lookup_route() {
+        let requirements = include_str!("../.planning/REQUIREMENTS.md");
+        let roadmap = include_str!("../.planning/ROADMAP.md");
+        let source_artifacts = format!("{requirements}\n{roadmap}");
+
+        assert!(source_artifacts.contains("/internal/domains/{domain}/identifiers/{identifier}"));
+        assert!(source_artifacts.contains("D-22"));
+        assert!(!source_artifacts.contains(
+            "GET /internal/accounts/by-identifier/{identifier}` resolves"
+        ));
+    }
+
+    #[test]
     fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
         // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
         // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
