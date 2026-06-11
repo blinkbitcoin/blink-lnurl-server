@@ -67,6 +67,16 @@ const MAX_COMMENT_LENGTH: usize = 255;
 const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
 const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
 
+const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 5] {
+    [
+        "unsupported wallet",
+        "expiry too long",
+        "missing amount",
+        "comment too long",
+        "invoice creation failed",
+    ]
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LnurlPayCallbackParams {
     pub amount: Option<u64>,
