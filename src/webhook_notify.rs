@@ -134,6 +134,10 @@ mod shared_tests {
         let now = now_millis();
         let invoice = Invoice {
             account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "enqueue_pubkey".to_string(),
             invoice: invoice_str,
@@ -181,6 +185,10 @@ mod shared_tests {
         let now = now_millis();
         let invoice = Invoice {
             account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "no_domain_pubkey".to_string(),
             invoice: invoice_str,
@@ -220,6 +228,10 @@ mod shared_tests {
         let now = now_millis();
         let invoice = Invoice {
             account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "idem_pubkey".to_string(),
             invoice: invoice_str,

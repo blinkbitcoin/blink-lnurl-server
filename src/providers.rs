@@ -20,6 +20,9 @@ pub struct CreateInvoiceRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderInvoice {
     pub bolt11: String,
+    pub wallet_kind: WalletKind,
+    pub wallet_id: Option<String>,
+    pub provider_payment_hash: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -176,6 +179,9 @@ impl LnurlProvider for SparkProvider {
 
         Ok(ProviderInvoice {
             bolt11: invoice.invoice,
+            wallet_kind: WalletKind::Btc,
+            wallet_id: None,
+            provider_payment_hash: None,
         })
     }
 
@@ -220,6 +226,9 @@ impl LnurlProvider for BlinkProvider {
 
         Ok(ProviderInvoice {
             bolt11: invoice.bolt11,
+            wallet_kind: wallet,
+            wallet_id: Some(wallet_id.to_string()),
+            provider_payment_hash: Some(invoice.payment_hash),
         })
     }
 

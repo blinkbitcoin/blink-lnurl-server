@@ -916,8 +916,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn upsert_invoice(&self, invoice: &Invoice) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
               ON CONFLICT(payment_hash) DO UPDATE
               SET user_pubkey = excluded.user_pubkey
              ,   invoice = excluded.invoice
@@ -926,7 +926,11 @@ impl crate::repository::LnurlRepository for LnurlRepository {
               ,   updated_at = excluded.updated_at
               ,   domain = excluded.domain
               ,   amount_received_sat = excluded.amount_received_sat
-              ,   account_id = COALESCE(excluded.account_id, invoices.account_id)",
+              ,   account_id = COALESCE(excluded.account_id, invoices.account_id)
+              ,   provider = COALESCE(excluded.provider, invoices.provider)
+              ,   wallet_kind = COALESCE(excluded.wallet_kind, invoices.wallet_kind)
+              ,   wallet_id = COALESCE(excluded.wallet_id, invoices.wallet_id)
+              ,   provider_payment_hash = COALESCE(excluded.provider_payment_hash, invoices.provider_payment_hash)",
         )
         .bind(&invoice.payment_hash)
         .bind(&invoice.user_pubkey)
@@ -938,6 +942,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&invoice.domain)
         .bind(invoice.amount_received_sat)
         .bind(invoice.account_id.as_deref())
+        .bind(invoice.provider.map(AccountProvider::as_str))
+        .bind(invoice.wallet_kind.map(WalletKind::as_str))
+        .bind(invoice.wallet_id.as_deref())
+        .bind(invoice.provider_payment_hash.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -959,14 +967,32 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let updated_ats: Vec<i64> = invoices.iter().map(|i| i.updated_at).collect();
         let account_ids: Vec<Option<&str>> =
             invoices.iter().map(|i| i.account_id.as_deref()).collect();
+        let providers: Vec<Option<&str>> = invoices
+            .iter()
+            .map(|i| i.provider.map(AccountProvider::as_str))
+            .collect();
+        let wallet_kinds: Vec<Option<&str>> = invoices
+            .iter()
+            .map(|i| i.wallet_kind.map(WalletKind::as_str))
+            .collect();
+        let wallet_ids: Vec<Option<&str>> =
+            invoices.iter().map(|i| i.wallet_id.as_deref()).collect();
+        let provider_payment_hashes: Vec<Option<&str>> = invoices
+            .iter()
+            .map(|i| i.provider_payment_hash.as_deref())
+            .collect();
 
         let rows = sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, account_id)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::bigint[], $8::text[])
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], $7::bigint[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[])
               ON CONFLICT(payment_hash) DO UPDATE
               SET preimage = excluded.preimage
               ,   updated_at = excluded.updated_at
               ,   account_id = COALESCE(excluded.account_id, invoices.account_id)
+              ,   provider = COALESCE(excluded.provider, invoices.provider)
+              ,   wallet_kind = COALESCE(excluded.wallet_kind, invoices.wallet_kind)
+              ,   wallet_id = COALESCE(excluded.wallet_id, invoices.wallet_id)
+              ,   provider_payment_hash = COALESCE(excluded.provider_payment_hash, invoices.provider_payment_hash)
               WHERE invoices.user_pubkey = excluded.user_pubkey AND invoices.preimage IS NULL
               RETURNING payment_hash",
         )
@@ -978,6 +1004,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&created_ats)
         .bind(&updated_ats)
         .bind(&account_ids)
+        .bind(&providers)
+        .bind(&wallet_kinds)
+        .bind(&wallet_ids)
+        .bind(&provider_payment_hashes)
         .fetch_all(&self.pool)
         .await?;
 
@@ -993,7 +1023,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         payment_hash: &str,
     ) -> Result<Option<Invoice>, LnurlRepositoryError> {
         let maybe_invoice = sqlx::query(
-            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id
+            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash
              FROM invoices
              WHERE payment_hash = $1",
         )
@@ -1001,6 +1031,16 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
+            let provider = row
+                .try_get::<Option<String>, _>(10)?
+                .map(|provider| AccountProvider::from_database_value(&provider))
+                .transpose()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+            let wallet_kind = row
+                .try_get::<Option<String>, _>(11)?
+                .map(|wallet| WalletKind::from_database_value(&wallet))
+                .transpose()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
             Ok::<_, sqlx::Error>(Invoice {
                 payment_hash: row.try_get(0)?,
                 user_pubkey: row.try_get(1)?,
@@ -1012,6 +1052,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 domain: row.try_get(7)?,
                 amount_received_sat: row.try_get(8)?,
                 account_id: row.try_get(9)?,
+                provider,
+                wallet_kind,
+                wallet_id: row.try_get(12)?,
+                provider_payment_hash: row.try_get(13)?,
             })
         })
         .transpose()?;
@@ -1041,6 +1085,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      i.updated_at     AS i_updated_at
              ,      i.domain         AS i_domain
              ,      i.amount_received_sat AS i_amount_received_sat
+             ,      i.provider       AS i_provider
+             ,      i.wallet_kind    AS i_wallet_kind
+             ,      i.wallet_id      AS i_wallet_id
+             ,      i.provider_payment_hash AS i_provider_payment_hash
              FROM (SELECT $1::text AS payment_hash) ph
              LEFT JOIN zaps z ON z.payment_hash = ph.payment_hash
              LEFT JOIN invoices i ON i.payment_hash = ph.payment_hash",
@@ -1068,10 +1116,24 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let invoice = row
             .try_get::<Option<String>, _>("i_payment_hash")?
             .map(|ph| {
+                let provider = row
+                    .try_get::<Option<String>, _>("i_provider")?
+                    .map(|provider| AccountProvider::from_database_value(&provider))
+                    .transpose()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let wallet_kind = row
+                    .try_get::<Option<String>, _>("i_wallet_kind")?
+                    .map(|wallet| WalletKind::from_database_value(&wallet))
+                    .transpose()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
                 Ok::<_, sqlx::Error>(Invoice {
                     payment_hash: ph,
                     user_pubkey: row.try_get("i_user_pubkey")?,
                     account_id: row.try_get("i_account_id")?,
+                    provider,
+                    wallet_kind,
+                    wallet_id: row.try_get("i_wallet_id")?,
+                    provider_payment_hash: row.try_get("i_provider_payment_hash")?,
                     invoice: row.try_get("i_invoice")?,
                     preimage: row.try_get("i_preimage")?,
                     invoice_expiry: row.try_get("i_invoice_expiry")?,
@@ -1634,6 +1696,14 @@ mod provider_neutral_tests {
             return;
         };
         shared_tests::side_effect_records_round_trip_account_id(&db).await;
+    }
+
+    #[tokio::test]
+    async fn invoice_provider_metadata_round_trips() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::invoice_provider_metadata_round_trips(&db).await;
     }
 
     #[tokio::test]

@@ -37,8 +37,8 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     invoice_paid::{
-        HandleInvoicePaidError, create_invoice_for_account, handle_invoice_paid,
-        handle_invoices_paid,
+        HandleInvoicePaidError, create_invoice_for_account, create_provider_invoice_for_account,
+        handle_invoice_paid, handle_invoices_paid,
     },
     repository::LnurlSenderComment,
     time::{now_millis, now_u64},
@@ -863,10 +863,14 @@ where
         }
 
         // Store invoice for LUD-21 verify support and webhook delivery
-        if let Err(e) = create_invoice_for_account(
+        if let Err(e) = create_provider_invoice_for_account(
             &state.db,
             &payment_hash,
             Some(&account_id),
+            Some(public_recipient.recipient.provider),
+            Some(res.wallet_kind),
+            res.wallet_id.as_deref(),
+            res.provider_payment_hash.as_deref(),
             &user.pubkey,
             &res.bolt11,
             invoice_expiry,
@@ -2437,6 +2441,10 @@ mod tests {
             payment_hash.clone(),
             Invoice {
                 account_id: None,
+                provider: None,
+                wallet_kind: None,
+                wallet_id: None,
+                provider_payment_hash: None,
                 payment_hash,
                 user_pubkey: receiver_pubkey.to_string(),
                 invoice: "lnbc1...".to_string(),
@@ -2923,8 +2931,14 @@ mod tests {
         assert_eq!(invoice.wallet_kind, Some(WalletKind::Btc));
         assert!(invoice.wallet_id.is_none());
         assert!(invoice.provider_payment_hash.is_none());
-        assert_eq!(invoice.account_id.as_deref(), Some("acct_spark_provider_metadata"));
-        assert_eq!(invoice.domain.as_deref(), Some("provider-metadata.example.com"));
+        assert_eq!(
+            invoice.account_id.as_deref(),
+            Some("acct_spark_provider_metadata")
+        );
+        assert_eq!(
+            invoice.domain.as_deref(),
+            Some("provider-metadata.example.com")
+        );
 
         let provider_invoice = crate::providers::ProviderInvoice {
             bolt11: invoice.invoice.clone(),
@@ -3875,6 +3889,10 @@ mod tests {
             payment_hash.clone(),
             Invoice {
                 account_id: None,
+                provider: None,
+                wallet_kind: None,
+                wallet_id: None,
+                provider_payment_hash: None,
                 payment_hash: payment_hash.clone(),
                 user_pubkey: TEST_RECEIVER_PUBKEY.to_string(),
                 invoice: "lnbc1...".to_string(),

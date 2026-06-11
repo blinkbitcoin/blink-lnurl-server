@@ -225,6 +225,10 @@ pub struct LnurlSenderComment {
 #[derive(Debug, Clone)]
 pub struct Invoice {
     pub account_id: Option<String>,
+    pub provider: Option<AccountProvider>,
+    pub wallet_kind: Option<WalletKind>,
+    pub wallet_id: Option<String>,
+    pub provider_payment_hash: Option<String>,
     pub payment_hash: String,
     pub user_pubkey: String,
     pub invoice: String,
@@ -957,6 +961,10 @@ pub mod shared_tests {
 
         db.upsert_invoice(&Invoice {
             account_id: Some(account_id.clone()),
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "spark_side_effect_pubkey".to_string(),
             invoice: "lnbc1sideeffect".to_string(),
@@ -1025,6 +1033,10 @@ pub mod shared_tests {
 
         db.upsert_invoice(&Invoice {
             account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "spark_side_effect_pubkey".to_string(),
             invoice: "lnbc1sideeffect-updated".to_string(),
@@ -1090,6 +1102,127 @@ pub mod shared_tests {
         );
     }
 
+    pub async fn invoice_provider_metadata_round_trips<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // PROV-04/LNURL-05/D-11/D-12/D-13/D-15: both Spark-shaped and
+        // Blink-shaped invoice rows preserve typed provider metadata without
+        // introducing a raw provider JSON payload field.
+        let now = crate::time::now_millis();
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_round_trip_spark".to_string()),
+            pubkey: "round_trip_spark_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "round-trip.example.com".to_string(),
+                identifier: "sparkmeta".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "spark metadata".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some("acct_round_trip_blink".to_string()),
+            blink_account_id: "blink_round_trip_account".to_string(),
+            btc_wallet_id: "blink_btc_wallet_round_trip".to_string(),
+            usd_wallet_id: "blink_usd_wallet_round_trip".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "round-trip.example.com".to_string(),
+                identifier: "blinkmeta".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "blink metadata".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let spark_invoice = Invoice {
+            account_id: Some("acct_round_trip_spark".to_string()),
+            provider: Some(AccountProvider::Spark),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: None,
+            provider_payment_hash: None,
+            payment_hash: "round_trip_spark_hash".to_string(),
+            user_pubkey: "round_trip_spark_pubkey".to_string(),
+            invoice: "lnbc1roundtripspark".to_string(),
+            preimage: None,
+            invoice_expiry: now.saturating_add(60_000),
+            created_at: now,
+            updated_at: now,
+            domain: Some("round-trip.example.com".to_string()),
+            amount_received_sat: None,
+        };
+        let blink_invoice = Invoice {
+            account_id: Some("acct_round_trip_blink".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Usd),
+            wallet_id: Some("blink_usd_wallet_round_trip".to_string()),
+            provider_payment_hash: Some("blink_provider_hash_round_trip".to_string()),
+            payment_hash: "round_trip_blink_hash".to_string(),
+            user_pubkey: "".to_string(),
+            invoice: "lnbc1roundtripblink".to_string(),
+            preimage: None,
+            invoice_expiry: now.saturating_add(120_000),
+            created_at: now,
+            updated_at: now,
+            domain: Some("round-trip.example.com".to_string()),
+            amount_received_sat: None,
+        };
+
+        db.upsert_invoice(&spark_invoice).await.unwrap();
+        db.upsert_invoice(&blink_invoice).await.unwrap();
+
+        let stored_spark = db
+            .get_invoice_by_payment_hash("round_trip_spark_hash")
+            .await
+            .unwrap()
+            .expect("Spark invoice should round-trip");
+        assert_eq!(stored_spark.provider, Some(AccountProvider::Spark));
+        assert_eq!(stored_spark.wallet_kind, Some(WalletKind::Btc));
+        assert!(stored_spark.wallet_id.is_none());
+        assert!(stored_spark.provider_payment_hash.is_none());
+        assert_eq!(
+            stored_spark.account_id.as_deref(),
+            Some("acct_round_trip_spark")
+        );
+        assert_eq!(
+            stored_spark.domain.as_deref(),
+            Some("round-trip.example.com")
+        );
+        assert_eq!(stored_spark.payment_hash, "round_trip_spark_hash");
+        assert_eq!(stored_spark.invoice, "lnbc1roundtripspark");
+        assert_eq!(stored_spark.invoice_expiry, spark_invoice.invoice_expiry);
+
+        let stored_blink = db
+            .get_invoice_by_payment_hash("round_trip_blink_hash")
+            .await
+            .unwrap()
+            .expect("Blink invoice should round-trip");
+        assert_eq!(stored_blink.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored_blink.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(
+            stored_blink.wallet_id.as_deref(),
+            Some("blink_usd_wallet_round_trip")
+        );
+        assert_eq!(
+            stored_blink.provider_payment_hash.as_deref(),
+            Some("blink_provider_hash_round_trip")
+        );
+        assert_eq!(
+            stored_blink.account_id.as_deref(),
+            Some("acct_round_trip_blink")
+        );
+        assert_eq!(
+            stored_blink.domain.as_deref(),
+            Some("round-trip.example.com")
+        );
+        assert_eq!(stored_blink.payment_hash, "round_trip_blink_hash");
+        assert_eq!(stored_blink.invoice, "lnbc1roundtripblink");
+        assert_eq!(stored_blink.invoice_expiry, blink_invoice.invoice_expiry);
+    }
+
     pub async fn metadata_account_id_round_trips_and_legacy_rows_remain_none<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -1115,6 +1248,10 @@ pub mod shared_tests {
         let owned_hash = "metadata_account_owned_hash".to_string();
         db.upsert_invoice(&Invoice {
             account_id: Some(account_id.clone()),
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: owned_hash.clone(),
             user_pubkey: pubkey.clone(),
             invoice: "lnbc1metadataowned".to_string(),
@@ -1152,6 +1289,10 @@ pub mod shared_tests {
         let legacy_hash = "metadata_account_legacy_hash".to_string();
         db.upsert_invoice(&Invoice {
             account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: legacy_hash.clone(),
             user_pubkey: pubkey.clone(),
             invoice: "lnbc1metadatalegacy".to_string(),
@@ -1212,6 +1353,10 @@ pub mod shared_tests {
         let payment_hash = "delete_preserve_hash".to_string();
         db.upsert_invoice(&Invoice {
             account_id: Some(account_id.clone()),
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "spark_delete_preserve_pubkey".to_string(),
             invoice: "lnbc1deletepreserve".to_string(),
