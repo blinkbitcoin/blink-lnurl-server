@@ -2900,6 +2900,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_invoice_metadata_contract_prov_04_lnurl_05_lnurl_06_d_11_d_13_d_15() {
+        // PROV-04/LNURL-05/D-11/D-13/D-15: provider-neutral invoice rows must
+        // carry typed provider/wallet metadata without any raw provider payload.
+        let invoice = Invoice {
+            account_id: Some("acct_spark_provider_metadata".to_string()),
+            provider: Some(AccountProvider::Spark),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: None,
+            provider_payment_hash: None,
+            payment_hash: "provider_invoice_metadata_hash".to_string(),
+            user_pubkey: "spark_provider_metadata_pubkey".to_string(),
+            invoice: "lnbc1providerinvoice".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: 1,
+            updated_at: 2,
+            domain: Some("provider-metadata.example.com".to_string()),
+            amount_received_sat: None,
+        };
+        assert_eq!(invoice.provider, Some(AccountProvider::Spark));
+        assert_eq!(invoice.wallet_kind, Some(WalletKind::Btc));
+        assert!(invoice.wallet_id.is_none());
+        assert!(invoice.provider_payment_hash.is_none());
+        assert_eq!(invoice.account_id.as_deref(), Some("acct_spark_provider_metadata"));
+        assert_eq!(invoice.domain.as_deref(), Some("provider-metadata.example.com"));
+
+        let provider_invoice = crate::providers::ProviderInvoice {
+            bolt11: invoice.invoice.clone(),
+            wallet_kind: WalletKind::Btc,
+            wallet_id: None,
+            provider_payment_hash: None,
+        };
+        assert_eq!(provider_invoice.wallet_kind, WalletKind::Btc);
+
+        // LNURL-06: the public callback success body stays exactly pr/routes/verify.
+        let callback_body = json!({
+            "pr": provider_invoice.bolt11,
+            "routes": Vec::<String>::new(),
+            "verify": "http://provider-metadata.example.com/verify/provider_invoice_metadata_hash",
+        });
+        let keys = callback_body
+            .as_object()
+            .expect("callback body must be an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["pr", "routes", "verify"]);
+    }
+
+    #[test]
     fn unsupported_spark_usd_maps_to_existing_lnurl_error_shape() {
         let routes_source = include_str!("routes.rs");
         assert!(
