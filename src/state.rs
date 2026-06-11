@@ -6,10 +6,13 @@ use spark_wallet::DefaultSigner;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{Mutex, RwLock, watch};
 
+use crate::providers::ProviderRegistry;
+
 pub struct State<DB> {
     pub db: DB,
     pub webhook_service: crate::webhooks::WebhookService<DB>,
     pub wallet: Arc<spark_wallet::SparkWallet>,
+    pub providers: Arc<ProviderRegistry>,
     pub scheme: String,
     pub min_sendable: u64,
     pub max_sendable: u64,
@@ -38,6 +41,7 @@ where
             db: self.db.clone(),
             webhook_service: self.webhook_service.clone(),
             wallet: Arc::clone(&self.wallet),
+            providers: Arc::clone(&self.providers),
             scheme: self.scheme.clone(),
             min_sendable: self.min_sendable,
             max_sendable: self.max_sendable,

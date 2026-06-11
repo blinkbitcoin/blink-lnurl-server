@@ -1,4 +1,6 @@
-use crate::{repository::LnurlRepository, routes::LnurlServer, state::State};
+use crate::{
+    providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
+};
 use anyhow::anyhow;
 use axum::{
     Extension, Router,
@@ -348,10 +350,13 @@ where
         );
     }
 
+    let providers = Arc::new(ProviderRegistry::new(Arc::clone(&wallet)));
+
     let state = State {
         db: repository,
         webhook_service,
         wallet,
+        providers,
         scheme: args.scheme,
         min_sendable: args.min_sendable,
         max_sendable: args.max_sendable,
