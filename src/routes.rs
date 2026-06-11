@@ -37,8 +37,8 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
     invoice_paid::{
-        HandleInvoicePaidError, create_invoice_for_account, create_provider_invoice_for_account,
-        handle_invoice_paid, handle_invoices_paid,
+        HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
+        handle_invoices_paid,
     },
     repository::LnurlSenderComment,
     time::{now_millis, now_u64},
@@ -64,6 +64,8 @@ const MAX_NOSTR_RELAYS: usize = 10;
 const MAX_NOSTR_EVENT_SIZE: usize = 32_768;
 /// Maximum length of a sender comment (LUD-12).
 const MAX_COMMENT_LENGTH: usize = 255;
+const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
+const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LnurlPayCallbackParams {
@@ -729,10 +731,12 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
         let account_id = public_recipient.recipient.account_id.clone();
-        let user = spark_user_from_recipient(public_recipient.recipient.clone()).map_err(|e| {
-            error!("invalid Spark recipient for invoice callback: {e}");
-            lnurl_error("internal server error")
-        })?;
+        let legacy_user_pubkey = public_recipient
+            .recipient
+            .spark_pubkey
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
 
         let Some(amount_msat) = params.amount else {
             trace!("missing amount");
@@ -742,6 +746,12 @@ where
         if amount_msat % 1000 != 0 {
             trace!("not a full sat amount");
             return Err(lnurl_error("amount must be a whole sat amount"));
+        }
+
+        if let Some(comment) = params.comment.as_deref()
+            && comment.trim().len() > MAX_COMMENT_LENGTH
+        {
+            return Err(lnurl_error("comment too long"));
         }
 
         let nostr_pubkey = state
@@ -775,9 +785,19 @@ where
             validate_nostr_zap_request(amount_msat, &event)?;
             sha256::Hash::hash(event.as_json().as_bytes())
         } else {
-            let metadata = get_metadata(&user.domain, &user);
+            let metadata = get_metadata_for_recipient(
+                &public_recipient.recipient,
+                &public_recipient.callback_identifier,
+            );
             sha256::Hash::hash(metadata.as_bytes())
         };
+
+        let expiry = callback_expiry_for_provider(
+            public_recipient.recipient.provider,
+            public_recipient.wallet,
+            public_recipient.recipient.default_wallet,
+            params.expiry,
+        )?;
 
         let res = state
             .providers
@@ -787,7 +807,7 @@ where
                 wallet: public_recipient.wallet,
                 amount_sat: amount_msat / 1000,
                 description_hash: desc_hash.to_byte_array(),
-                expiry: params.expiry,
+                expiry,
                 include_spark_address: state.include_spark_address,
             })
             .await
@@ -828,7 +848,7 @@ where
                 payment_hash: payment_hash.clone(),
                 zap_request,
                 zap_event: None,
-                user_pubkey: user.pubkey.clone(),
+                user_pubkey: legacy_user_pubkey.clone(),
                 invoice_expiry,
                 updated_at,
                 is_user_nostr_key: false,
@@ -841,9 +861,6 @@ where
 
         if let Some(comment) = params.comment {
             let comment = comment.trim();
-            if comment.len() > MAX_COMMENT_LENGTH {
-                return Err(lnurl_error("comment too long"));
-            }
             if !comment.is_empty()
                 && let Err(e) = state
                     .db
@@ -851,7 +868,7 @@ where
                         account_id: Some(account_id.clone()),
                         comment: comment.to_string(),
                         payment_hash: payment_hash.clone(),
-                        user_pubkey: user.pubkey.clone(),
+                        user_pubkey: legacy_user_pubkey.clone(),
                         updated_at,
                     })
                     .await
@@ -870,7 +887,7 @@ where
             Some(res.wallet_kind),
             res.wallet_id.as_deref(),
             res.provider_payment_hash.as_deref(),
-            &user.pubkey,
+            &legacy_user_pubkey,
             &res.bolt11,
             invoice_expiry,
             &domain,
@@ -1824,6 +1841,36 @@ fn get_metadata_for_recipient(recipient: &ResolvedRecipient, requested_identifie
     .to_string()
 }
 
+fn callback_expiry_for_provider(
+    provider: AccountProvider,
+    requested_wallet: Option<WalletKind>,
+    default_wallet: Option<WalletKind>,
+    expiry_secs: Option<u32>,
+) -> Result<Option<u32>, (StatusCode, Json<Value>)> {
+    if provider != AccountProvider::Blink {
+        return Ok(expiry_secs);
+    }
+
+    let Some(seconds) = expiry_secs else {
+        return Ok(None);
+    };
+    let Some(wallet) = requested_wallet.or(default_wallet) else {
+        error!("Blink callback has no selected or default wallet for expiry policy");
+        return Err(lnurl_error("internal server error"));
+    };
+
+    let limit = match wallet {
+        WalletKind::Btc => BLINK_BTC_EXPIRY_LIMIT_SECS,
+        WalletKind::Usd => BLINK_USD_EXPIRY_LIMIT_SECS,
+    };
+    if seconds > limit {
+        trace!("Blink {wallet:?} callback expiry {seconds}s exceeds limit {limit}s");
+        return Err(lnurl_error("expiry too long"));
+    }
+
+    Ok(Some(seconds.div_ceil(60)))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
     error!("failed to execute query: {error}");
@@ -1909,11 +1956,11 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
         }
         ProviderError::InvoiceCreationFailed(err) => {
             error!("failed to create lightning invoice: {err}");
-            lnurl_error("failed to create invoice")
+            lnurl_error("invoice creation failed")
         }
         ProviderError::BlinkInvoiceCreationFailed(err) => {
             error!("failed to create Blink lightning invoice: {err}");
-            lnurl_error("failed to create invoice")
+            lnurl_error("invoice creation failed")
         }
         ProviderError::UnsupportedProvider(provider) => {
             error!("unsupported provider for public LNURL invoice: {provider:?}");
