@@ -1905,7 +1905,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Request, StatusCode};
     use axum::middleware;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::collections::HashMap;
@@ -1921,6 +1921,8 @@ mod tests {
         pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
         created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
         create_blink_account_error: std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
+        resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
+        resolve_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[derive(Clone, Copy)]
@@ -1936,6 +1938,15 @@ mod tests {
 
         fn created_blink_account_count(&self) -> usize {
             self.created_blink_accounts.lock().unwrap().len()
+        }
+
+        fn with_resolved_recipient(self, recipient: ResolvedRecipient) -> Self {
+            *self.resolved_recipient.lock().unwrap() = Some(recipient);
+            self
+        }
+
+        fn resolve_calls(&self) -> Vec<(String, String)> {
+            self.resolve_calls.lock().unwrap().clone()
         }
     }
 
@@ -1963,10 +1974,14 @@ mod tests {
         }
         async fn resolve_recipient_by_identifier(
             &self,
-            _: &str,
-            _: &str,
+            domain: &str,
+            identifier: &str,
         ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
-            Ok(None)
+            self.resolve_calls
+                .lock()
+                .unwrap()
+                .push((domain.to_string(), identifier.to_string()));
+            Ok(self.resolved_recipient.lock().unwrap().clone())
         }
         async fn get_account_by_spark_pubkey(
             &self,
@@ -2391,6 +2406,20 @@ mod tests {
             .layer(Extension(state))
     }
 
+    async fn internal_lookup_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        Router::new()
+            .route(
+                "/internal/domains/{domain}/identifiers/{identifier}",
+                get(LnurlServer::<MockRepository>::get_internal_identifier),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
     fn valid_create_blink_account_payload() -> CreateBlinkAccountRequest {
         CreateBlinkAccountRequest {
             domain: "Example.COM".to_string(),
@@ -2424,6 +2453,78 @@ mod tests {
             .expect("response body reads");
         let body = serde_json::from_slice(&body).expect("response body is JSON");
         (status, body)
+    }
+
+    async fn get_internal_identifier(app: Router, path: &str, token: String) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
+    fn internal_test_token_with_scope(scope: &str) -> String {
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": scope
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign")
+    }
+
+    fn blink_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_blink_lookup".to_string(),
+            provider: AccountProvider::Blink,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Alice Blink account".to_string(),
+            spark_pubkey: None,
+            blink_account_id: Some("blink_account_123".to_string()),
+            btc_wallet_id: Some("btc_wallet_123".to_string()),
+            usd_wallet_id: Some("usd_wallet_123".to_string()),
+            default_wallet: Some(WalletKind::Usd),
+        }
+    }
+
+    fn spark_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_spark_lookup".to_string(),
+            provider: AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "bob".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Bob Spark account".to_string(),
+            spark_pubkey: Some("spark_pubkey_123".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        }
     }
 
     // -- Tests -----------------------------------------------------------------
@@ -3018,6 +3119,137 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, json!({"error": "identifier_conflict"}));
         assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_blink_parses_btc_modifier_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+btc",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "alice".to_string())]);
+        assert_eq!(body["provider"], "blink");
+        assert_eq!(body["account_id"], "acct_blink_lookup");
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["identifier_kind"], "username");
+        assert_eq!(body["description"], "Alice Blink account");
+        assert_eq!(body["requested_wallet"], "btc");
+        assert_eq!(body["provider_details"]["blink_account_id"], "blink_account_123");
+        assert_eq!(body["provider_details"]["btc_wallet_id"], "btc_wallet_123");
+        assert_eq!(body["provider_details"]["usd_wallet_id"], "usd_wallet_123");
+        assert_eq!(body["provider_details"]["default_wallet"], "usd");
+        assert!(body["provider_details"].get("spark_pubkey").is_none_or(Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_spark_returns_spark_details_and_usd_wallet_intent() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/Example.COM/identifiers/bob+usd",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "bob".to_string())]);
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(body["account_id"], "acct_spark_lookup");
+        assert_eq!(body["requested_wallet"], "usd");
+        assert_eq!(body["provider_details"]["spark_pubkey"], "spark_pubkey_123");
+        assert!(body["provider_details"].get("blink_account_id").is_none_or(Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_requires_accounts_read_scope_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("blink:accounts:create"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_returns_not_found_for_missing_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({"error": "not_found"}));
+        assert_eq!(repo.resolve_calls(), vec![("example.com".to_string(), "alice".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_rejects_invalid_domain_and_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (domain_status, domain_body) = get_internal_identifier(
+            app.clone(),
+            "/internal/domains/%20%20/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+        let (identifier_status, identifier_body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+eur",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(domain_status, StatusCode::BAD_REQUEST);
+        assert_eq!(domain_body, json!({"error": "invalid_domain"}));
+        assert_eq!(identifier_status, StatusCode::BAD_REQUEST);
+        assert_eq!(identifier_body, json!({"error": "invalid_identifier"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_rpc_style_identifier_lookup_route_is_not_mounted() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, _body) = get_internal_identifier(
+            app,
+            "/internal/accounts/by-identifier/alice?domain=example.com",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[test]
+    fn internal_identifier_lookup_route_shape_is_locked_to_restful_path() {
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
+        assert!(!main_source.contains("accounts/by-identifier"));
     }
 
     #[tokio::test]
