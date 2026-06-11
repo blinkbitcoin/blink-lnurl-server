@@ -1,6 +1,8 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::repository::{AccountProvider, ResolvedRecipient, WalletKind};
+use bitcoin::secp256k1::PublicKey;
 
 #[derive(Debug, Clone)]
 pub struct CreateInvoiceRequest<'a> {
@@ -84,10 +86,49 @@ impl LnurlProvider for SparkProvider {
         &self,
         request: CreateInvoiceRequest<'_>,
     ) -> Result<ProviderInvoice, ProviderError> {
-        let _ = request;
-        Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
-            "red phase placeholder"
-        )))
+        if request.recipient.provider != AccountProvider::Spark {
+            return Err(ProviderError::UnsupportedProvider(
+                request.recipient.provider,
+            ));
+        }
+
+        match request.wallet {
+            None | Some(WalletKind::Btc) => {}
+            Some(WalletKind::Usd) => {
+                return Err(ProviderError::UnsupportedWallet {
+                    provider: AccountProvider::Spark,
+                    wallet: WalletKind::Usd,
+                });
+            }
+        }
+
+        let Some(spark_pubkey) = request.recipient.spark_pubkey.as_deref() else {
+            return Err(ProviderError::MissingSparkPubkey);
+        };
+        let pubkey =
+            PublicKey::from_str(spark_pubkey).map_err(|_| ProviderError::InvalidSparkPubkey)?;
+        let Some(wallet) = self.wallet.as_ref() else {
+            return Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
+                "Spark wallet unavailable in provider unit test"
+            )));
+        };
+
+        let invoice = wallet
+            .create_lightning_invoice(
+                request.amount_sat,
+                Some(spark_wallet::InvoiceDescription::DescriptionHash(
+                    request.description_hash,
+                )),
+                Some(pubkey),
+                request.expiry,
+                request.include_spark_address,
+            )
+            .await
+            .map_err(|e| ProviderError::InvoiceCreationFailed(e.into()))?;
+
+        Ok(ProviderInvoice {
+            bolt11: invoice.invoice,
+        })
     }
 
     async fn payment_status(
@@ -117,8 +158,10 @@ impl ProviderRegistry {
         provider: AccountProvider,
     ) -> Result<&dyn LnurlProvider, ProviderError> {
         match provider {
-            AccountProvider::Spark => Err(ProviderError::UnsupportedProvider(AccountProvider::Spark)),
-            AccountProvider::Blink => Err(ProviderError::UnsupportedProvider(AccountProvider::Blink)),
+            AccountProvider::Spark => Ok(self.spark.as_ref()),
+            AccountProvider::Blink => {
+                Err(ProviderError::UnsupportedProvider(AccountProvider::Blink))
+            }
         }
     }
 }
