@@ -302,6 +302,7 @@ pub trait LnurlRepository {
         &self,
         _domain: &str,
         _pubkey: &str,
+        _identifier: &str,
     ) -> Result<(), LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
@@ -1009,6 +1010,7 @@ pub mod shared_tests {
         db.delete_spark_registration(
             "delete-preserve.example.com",
             "spark_delete_preserve_pubkey",
+            "heidi",
         )
         .await
         .unwrap();

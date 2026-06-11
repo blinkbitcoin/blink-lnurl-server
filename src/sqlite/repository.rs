@@ -162,7 +162,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&user.pubkey)
         .bind(&user.name)
         .bind(&user.description)
-        .bind(now())
+        .bind(crate::time::now())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -290,6 +290,19 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         {
             return Err(LnurlRepositoryError::InvalidOwnership);
         }
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&account_id)
+        .bind(&registration.identifier.domain)
+        .bind(&registration.identifier.identifier)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             "INSERT INTO accounts (account_id, provider, created_at, updated_at)
@@ -476,6 +489,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         &self,
         domain: &str,
         pubkey: &str,
+        identifier: &str,
     ) -> Result<(), LnurlRepositoryError> {
         let mut tx = self
             .pool
@@ -489,18 +503,30 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 .fetch_optional(&mut *tx)
                 .await?;
 
-        if let Some(account_id) = account_id {
-            sqlx::query("DELETE FROM account_identifiers WHERE account_id = $1 AND domain = $2")
-                .bind(&account_id)
-                .bind(domain)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2")
-                .bind(domain)
-                .bind(pubkey)
-                .execute(&mut *tx)
-                .await?;
+        let Some(account_id) = account_id else {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        };
+
+        let delete_result = sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1 AND domain = $2 AND identifier = $3",
+        )
+        .bind(&account_id)
+        .bind(domain)
+        .bind(identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        if delete_result.rows_affected() == 0 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
         }
+
+        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
+            .bind(domain)
+            .bind(pubkey)
+            .bind(identifier)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit()
             .await
@@ -540,6 +566,32 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::AccountNotFound);
         }
 
+        let source_pubkey: Option<String> = sqlx::query_scalar(
+            "SELECT s.pubkey
+             FROM accounts a
+             JOIN spark_accounts s ON s.account_id = a.account_id
+             WHERE a.account_id = $1 AND a.provider = 'spark'",
+        )
+        .bind(&transfer.source_account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source_pubkey) = source_pubkey else {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        };
+
+        let destination_pubkey: Option<String> = sqlx::query_scalar(
+            "SELECT s.pubkey
+             FROM accounts a
+             JOIN spark_accounts s ON s.account_id = a.account_id
+             WHERE a.account_id = $1 AND a.provider = 'spark'",
+        )
+        .bind(&transfer.destination_account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(destination_pubkey) = destination_pubkey else {
+            return Err(LnurlRepositoryError::InvalidProvider);
+        };
+
         sqlx::query(
             "UPDATE account_identifiers
              SET account_id = $3
@@ -553,6 +605,29 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&transfer.description)
         .bind(now)
         .bind(&transfer.source_account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
+            .bind(&transfer.domain)
+            .bind(&source_pubkey)
+            .bind(&transfer.identifier)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO users (domain, pubkey, name, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(domain, pubkey) DO UPDATE
+             SET name = excluded.name
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&transfer.domain)
+        .bind(&destination_pubkey)
+        .bind(&transfer.identifier)
+        .bind(&transfer.description)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
 
@@ -1520,30 +1595,31 @@ mod provider_neutral_tests {
     #[tokio::test]
     async fn transfer_identifier_moves_only_requested_identifier() {
         let db = setup_test_db().await;
-        let source_account_id = generate_account_id(AccountProvider::Blink);
+        let source_account_id = generate_account_id(AccountProvider::Spark);
         let destination_account_id = generate_account_id(AccountProvider::Spark);
 
-        db.create_blink_account(&NewBlinkAccount {
+        db.upsert_spark_registration(&NewSparkRegistration {
             account_id: Some(source_account_id.clone()),
-            blink_account_id: "blink_transfer_account".to_string(),
-            btc_wallet_id: "blink_transfer_btc".to_string(),
-            usd_wallet_id: "blink_transfer_usd".to_string(),
-            default_wallet: WalletKind::Btc,
-            identifiers: vec![
-                NewAccountIdentifier {
-                    domain: "transfer-success.example.com".to_string(),
-                    identifier: "moving".to_string(),
-                    identifier_kind: AccountIdentifierKind::Username,
-                    description: "moves".to_string(),
-                },
-                NewAccountIdentifier {
-                    domain: "transfer-success.example.com".to_string(),
-                    identifier: "stays".to_string(),
-                    identifier_kind: AccountIdentifierKind::Username,
-                    description: "stays".to_string(),
-                },
-            ],
+            pubkey: "spark_transfer_source".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "transfer-success.example.com".to_string(),
+                identifier: "moving".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "moves".to_string(),
+            },
         })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, 'username', $4, $5, $5)",
+        )
+        .bind(&source_account_id)
+        .bind("transfer-success.example.com")
+        .bind("stays")
+        .bind("stays")
+        .bind(crate::time::now())
+        .execute(&db.pool)
         .await
         .unwrap();
         db.upsert_spark_registration(&NewSparkRegistration {

@@ -299,10 +299,10 @@ where
 
         state
             .db
-            .delete_spark_registration(&domain, &pubkey.to_string())
+            .delete_spark_registration(&domain, &pubkey.to_string(), &username)
             .await
-            .map_err(storage_error)?;
-        debug!("unregistered user for pubkey {}", pubkey);
+            .map_err(|e| spark_unregister_error(e, &username))?;
+        debug!("unregistered user '{username}' for pubkey {pubkey}");
         Ok(())
     }
 
@@ -1613,6 +1613,19 @@ fn spark_transfer_error(error: LnurlRepositoryError, username: &str) -> (StatusC
                 Json(Value::String("internal server error".into())),
             )
         }
+    }
+}
+
+fn spark_unregister_error(
+    error: LnurlRepositoryError,
+    username: &str,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner => {
+            trace!("unregister pubkey does not own username '{username}'");
+            (StatusCode::NOT_FOUND, Json(Value::String(String::new())))
+        }
+        error => storage_error(error),
     }
 }
 
