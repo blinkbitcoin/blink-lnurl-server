@@ -672,10 +672,6 @@ where
         let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let user = spark_user_from_recipient(public_recipient.recipient).map_err(|e| {
-            error!("invalid Spark recipient for LNURL discovery: {e}");
-            lnurl_error("internal server error")
-        })?;
 
         let (allows_nostr, nostr_pubkey) = if let Some(nostr_keys) = state.nostr_keys.as_ref() {
             let xonly_pubkey = nostr_keys.public_key.xonly().map_err(|e| {
@@ -692,12 +688,15 @@ where
         Ok(Json(PayResponse {
             callback: format!(
                 "{}://{}/lnurlp/{}/invoice",
-                state.scheme, &user.domain, public_recipient.callback_identifier
+                state.scheme, domain, public_recipient.callback_identifier
             ),
             max_sendable: state.max_sendable,
             min_sendable: state.min_sendable,
             tag: Tag::Pay,
-            metadata: get_metadata(&user.domain, &user),
+            metadata: get_metadata_for_recipient(
+                &public_recipient.recipient,
+                &public_recipient.callback_identifier,
+            ),
             #[allow(clippy::cast_possible_truncation)]
             comment_allowed: Some(MAX_COMMENT_LENGTH as u32),
             allows_nostr,
@@ -1814,6 +1813,17 @@ fn get_metadata(domain: &str, user: &User) -> String {
     .to_string()
 }
 
+fn get_metadata_for_recipient(recipient: &ResolvedRecipient, requested_identifier: &str) -> String {
+    json!(vec![
+        vec!["text/plain", &recipient.description],
+        vec![
+            "text/identifier",
+            &format!("{}@{}", requested_identifier, recipient.domain),
+        ],
+    ])
+    .to_string()
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
     error!("failed to execute query: {error}");
@@ -2922,7 +2932,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_username_metadata_uses_description_and_requested_identity_lnurl_01_lnurl_02_d_01_d_02_d_19() {
+    async fn blink_public_discovery_username_metadata_uses_description_and_requested_identity_lnurl_01_lnurl_02_d_01_d_02_d_19()
+     {
         // LNURL-01/LNURL-02/D-01/D-02/D-19: public discovery must resolve a
         // Blink recipient by canonical identifier, expose the requested
         // Lightning Address identity, and not require Spark-only metadata.
@@ -2946,13 +2957,17 @@ mod tests {
             metadata_entries(&response.metadata),
             vec![
                 ("text/plain".to_string(), "Alice Blink account".to_string()),
-                ("text/identifier".to_string(), "alice@example.com".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "alice@example.com".to_string()
+                ),
             ]
         );
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_wallet_alias_preserves_public_identity_but_looks_up_canonical_lnurl_01_lnurl_02_d_03_comp_04() {
+    async fn blink_public_discovery_wallet_alias_preserves_public_identity_but_looks_up_canonical_lnurl_01_lnurl_02_d_03_comp_04()
+     {
         // LNURL-01/LNURL-02/D-03/COMP-04: virtual +usd aliases influence only
         // public metadata/callback identity and wallet intent; repository lookup
         // remains canonical and never persists identifier+usd.
@@ -2988,10 +3003,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_phone_identifier_keeps_requested_phone_identity_lnurl_01_lnurl_02_d_04() {
+    async fn blink_public_discovery_phone_identifier_keeps_requested_phone_identity_lnurl_01_lnurl_02_d_04()
+     {
         // LNURL-01/LNURL-02/D-04: payer-supplied public phone identifiers are
         // allowed in metadata identity and must not be masked by description.
-        let repo = MockRepository::default().with_resolved_recipient(phone_blink_resolved_recipient());
+        let repo =
+            MockRepository::default().with_resolved_recipient(phone_blink_resolved_recipient());
         let state = internal_route_test_state(repo.clone(), None).await;
 
         let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
@@ -3023,7 +3040,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_missing_and_invalid_phone_like_identifiers_keep_spark_not_found_shape_d_19() {
+    async fn blink_public_discovery_missing_and_invalid_phone_like_identifiers_keep_spark_not_found_shape_d_19()
+     {
         // D-19: missing/invalid Blink-looking public discovery must not leak
         // Blink-specific provider, account, phone, or existence details.
         let missing_repo = MockRepository::default();
