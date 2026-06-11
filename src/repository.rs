@@ -925,13 +925,19 @@ pub mod shared_tests {
         .await
         .unwrap();
 
-        let metadata = db.get_metadata_by_pubkey(&pubkey, 0, 10, None).await.unwrap();
+        let metadata = db
+            .get_metadata_by_pubkey(&pubkey, 0, 10, None)
+            .await
+            .unwrap();
         let owned = metadata
             .iter()
             .find(|item| item.payment_hash == owned_hash)
             .expect("owned metadata row should be returned");
         assert_eq!(owned.account_id.as_deref(), Some(account_id.as_str()));
-        assert_eq!(owned.sender_comment.as_deref(), Some("provider-neutral metadata"));
+        assert_eq!(
+            owned.sender_comment.as_deref(),
+            Some("provider-neutral metadata")
+        );
 
         let legacy = metadata
             .iter()
