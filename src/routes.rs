@@ -1,4 +1,6 @@
-use crate::identifier::{IdentifierError, canonical_spark_username, parse_public_identifier};
+use crate::identifier::{
+    IdentifierError, WalletModifier, canonical_spark_username, parse_public_identifier,
+};
 use crate::models::{
     CheckUsernameAvailableResponse, InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest,
     ListMetadataResponse, PublishZapReceiptRequest, PublishZapReceiptResponse,
@@ -36,9 +38,11 @@ use crate::{
     zap::Zap,
 };
 use crate::{
+    providers::{CreateInvoiceRequest, ProviderError},
     repository::{
         AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
         LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
+        WalletKind,
     },
     state::State,
     user::User,
@@ -105,6 +109,18 @@ pub struct PayResponse {
     #[serde(rename = "nostrPubkey")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<XOnlyPublicKey>,
+}
+
+struct PublicIdentifierIntent {
+    canonical: String,
+    wallet: Option<WalletKind>,
+    callback_identifier: String,
+}
+
+struct PublicRecipient {
+    recipient: ResolvedRecipient,
+    wallet: Option<WalletKind>,
+    callback_identifier: String,
 }
 
 pub struct LnurlServer<DB> {
@@ -645,25 +661,23 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let Some(username) = public_lookup_username(&identifier).map_err(|e| {
-            trace!("invalid public identifier '{identifier}': {e:?}");
-            lnurl_error("invalid identifier")
-        })?
+        let domain = sanitize_domain(&state, &host).await?;
+        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
+            .map_err(|e| {
+                trace!("invalid public identifier '{identifier}': {e:?}");
+                lnurl_error("invalid identifier")
+            })?
         else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let user = state
-            .db
-            .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
-            .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                lnurl_error("internal server error")
-            })?;
-
-        let Some(user) = user else {
+        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
+        let user = spark_user_from_recipient(public_recipient.recipient).map_err(|e| {
+            error!("invalid Spark recipient for LNURL discovery: {e}");
+            lnurl_error("internal server error")
+        })?;
 
         let (allows_nostr, nostr_pubkey) = if let Some(nostr_keys) = state.nostr_keys.as_ref() {
             let xonly_pubkey = nostr_keys.public_key.xonly().map_err(|e| {
@@ -680,7 +694,7 @@ where
         Ok(Json(PayResponse {
             callback: format!(
                 "{}://{}/lnurlp/{}/invoice",
-                state.scheme, &user.domain, user.name
+                state.scheme, &user.domain, public_recipient.callback_identifier
             ),
             max_sendable: state.max_sendable,
             min_sendable: state.min_sendable,
@@ -704,27 +718,21 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let Some(username) = public_lookup_username(&identifier).map_err(|e| {
-            trace!("invalid public identifier '{identifier}': {e:?}");
-            lnurl_error("invalid identifier")
-        })?
+        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
+            .map_err(|e| {
+                trace!("invalid public identifier '{identifier}': {e:?}");
+                lnurl_error("invalid identifier")
+            })?
         else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
         let domain = sanitize_domain(&state, &host).await?;
-        let recipient = state
-            .db
-            .resolve_recipient_by_identifier(&domain, &username)
-            .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                lnurl_error("internal server error")
-            })?;
-        let Some(recipient) = recipient else {
+        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let account_id = recipient.account_id.clone();
-        let user = spark_user_from_recipient(recipient).map_err(|e| {
+        let account_id = public_recipient.recipient.account_id.clone();
+        let user = spark_user_from_recipient(public_recipient.recipient.clone()).map_err(|e| {
             error!("invalid Spark recipient for invoice callback: {e}");
             lnurl_error("internal server error")
         })?;
@@ -774,27 +782,24 @@ where
             sha256::Hash::hash(metadata.as_bytes())
         };
 
-        let pubkey = parse_pubkey(&user.pubkey)?;
         let res = state
-            .wallet
-            .create_lightning_invoice(
-                amount_msat / 1000,
-                Some(spark_wallet::InvoiceDescription::DescriptionHash(
-                    desc_hash.to_byte_array(),
-                )),
-                Some(pubkey),
-                params.expiry,
-                state.include_spark_address,
-            )
+            .providers
+            .provider_for(public_recipient.recipient.provider)
+            .map_err(map_provider_invoice_error)?
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &public_recipient.recipient,
+                wallet: public_recipient.wallet,
+                amount_sat: amount_msat / 1000,
+                description_hash: desc_hash.to_byte_array(),
+                expiry: params.expiry,
+                include_spark_address: state.include_spark_address,
+            })
             .await
-            .map_err(|e| {
-                error!("failed to create lightning invoice: {}", e);
-                lnurl_error("failed to create invoice")
-            })?;
+            .map_err(map_provider_invoice_error)?;
 
         debug!("Created lightning invoice: {:?}", res);
 
-        let invoice = Bolt11Invoice::from_str(&res.invoice).map_err(|e| {
+        let invoice = Bolt11Invoice::from_str(&res.bolt11).map_err(|e| {
             error!("failed to parse invoice: {}", e);
             lnurl_error("internal server error")
         })?;
@@ -866,7 +871,7 @@ where
             &payment_hash,
             Some(&account_id),
             &user.pubkey,
-            &res.invoice,
+            &res.bolt11,
             invoice_expiry,
             &domain,
         )
@@ -879,7 +884,7 @@ where
         let verify_url = format!("{}://{}/verify/{}", state.scheme, domain, payment_hash);
 
         Ok(Json(json!({
-            "pr": res.invoice,
+            "pr": res.bolt11,
             "routes": Vec::<String>::new(),
             "verify": verify_url,
         })))
@@ -1351,6 +1356,73 @@ fn public_lookup_username(identifier: &str) -> Result<Option<String>, Identifier
     }
 }
 
+fn parse_public_identifier_for_public_route(
+    identifier: &str,
+) -> Result<Option<PublicIdentifierIntent>, IdentifierError> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return Err(IdentifierError::EmptyIdentifier);
+    }
+
+    match parse_public_identifier(trimmed) {
+        Ok(parsed) => {
+            let wallet = parsed.wallet.map(wallet_modifier_to_kind);
+            let callback_identifier = match parsed.wallet {
+                Some(WalletModifier::Btc) => format!("{}+btc", parsed.canonical),
+                Some(WalletModifier::Usd) => format!("{}+usd", parsed.canonical),
+                None => parsed.canonical.clone(),
+            };
+            Ok(Some(PublicIdentifierIntent {
+                canonical: parsed.canonical,
+                wallet,
+                callback_identifier,
+            }))
+        }
+        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
+            Ok(Some(PublicIdentifierIntent {
+                canonical: sanitize_username(trimmed),
+                wallet: None,
+                callback_identifier: sanitize_username(trimmed),
+            }))
+        }
+        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+const fn wallet_modifier_to_kind(modifier: WalletModifier) -> WalletKind {
+    match modifier {
+        WalletModifier::Btc => WalletKind::Btc,
+        WalletModifier::Usd => WalletKind::Usd,
+    }
+}
+
+async fn resolve_public_recipient<DB>(
+    state: &State<DB>,
+    domain: &str,
+    intent: PublicIdentifierIntent,
+) -> Result<Option<PublicRecipient>, (StatusCode, Json<Value>)>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    let recipient = state
+        .db
+        .resolve_recipient_by_identifier(domain, &intent.canonical)
+        .await
+        .map_err(|e| {
+            error!("failed to execute query: {}", e);
+            lnurl_error("internal server error")
+        })?;
+
+    Ok(recipient.map(|recipient| PublicRecipient {
+        recipient,
+        wallet: intent.wallet,
+        callback_identifier: intent.callback_identifier,
+    }))
+}
+
 fn is_legacy_spark_lookup_candidate(identifier: &str) -> bool {
     !is_phone_like_public_identifier(identifier)
         && !identifier.char_indices().skip(1).any(|(_, ch)| ch == '+')
@@ -1555,6 +1627,29 @@ fn spark_registration_error(
             )
         }
         error => storage_error(error),
+    }
+}
+
+fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>) {
+    match error {
+        ProviderError::UnsupportedWallet { provider, wallet } => {
+            trace!("unsupported wallet {wallet:?} for provider {provider:?}");
+            lnurl_error("unsupported wallet")
+        }
+        ProviderError::InvoiceCreationFailed(err) => {
+            error!("failed to create lightning invoice: {err}");
+            lnurl_error("failed to create invoice")
+        }
+        ProviderError::UnsupportedProvider(provider) => {
+            error!("unsupported provider for public LNURL invoice: {provider:?}");
+            lnurl_error("internal server error")
+        }
+        ProviderError::MissingSparkPubkey
+        | ProviderError::InvalidSparkPubkey
+        | ProviderError::PaymentStatusUnavailable(_) => {
+            error!("invalid provider invoice state: {error}");
+            lnurl_error("internal server error")
+        }
     }
 }
 
@@ -2173,7 +2268,10 @@ mod tests {
 
         let body = serde_json::to_value(response).expect("PayResponse serializes");
         assert_eq!(body["tag"], "payRequest");
-        assert_eq!(body["callback"], "http://localhost:8080/lnurlp/alice/invoice");
+        assert_eq!(
+            body["callback"],
+            "http://localhost:8080/lnurlp/alice/invoice"
+        );
         assert_eq!(body["minSendable"], 1_000);
         assert_eq!(body["maxSendable"], 1_000_000);
         assert_eq!(body["commentAllowed"], MAX_COMMENT_LENGTH);
@@ -2191,7 +2289,10 @@ mod tests {
         });
         assert_eq!(invoice_body["pr"], "lnbc1testinvoice");
         assert_eq!(invoice_body["routes"].as_array().unwrap().len(), 0);
-        assert_eq!(invoice_body["verify"], "http://localhost:8080/verify/payment_hash");
+        assert_eq!(
+            invoice_body["verify"],
+            "http://localhost:8080/verify/payment_hash"
+        );
         assert!(invoice_body.get("provider").is_none());
         assert!(invoice_body.get("account_id").is_none());
 
@@ -2232,8 +2333,8 @@ mod tests {
             "callback must parse wallet modifiers before provider dispatch"
         );
         assert!(
-            invoice.contains("resolve_recipient_by_identifier"),
-            "callback must resolve account-backed recipients"
+            invoice.contains("resolve_public_recipient"),
+            "callback must resolve account-backed recipients through the public lookup helper"
         );
         assert!(
             invoice.contains("provider_for"),
@@ -2280,7 +2381,7 @@ mod tests {
     fn invoice_callback_writes_account_owned_side_effects() {
         let invoice_callback = handler_source("handle_invoice");
         assert!(
-            invoice_callback.contains("recipient.account_id"),
+            invoice_callback.contains("account_id"),
             "invoice callback must carry resolved account ownership into side effects"
         );
         assert!(
@@ -2288,7 +2389,8 @@ mod tests {
             "invoice callback must use account-aware invoice construction"
         );
         assert!(
-            !invoice_callback.contains("create_invoice("),
+            !invoice_callback.contains("crate::invoice_paid::create_invoice(")
+                && !invoice_callback.contains("invoice_paid::create_invoice("),
             "migrated invoice callback must not use the legacy account-less helper"
         );
     }
