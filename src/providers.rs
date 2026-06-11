@@ -4,6 +4,8 @@ use std::sync::Arc;
 use crate::repository::{AccountProvider, ResolvedRecipient, WalletKind};
 use bitcoin::secp256k1::PublicKey;
 
+const SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL: &str = "DEF-03-SPARK-PAYMENT-STATUS-PHASE-7: Spark payment status remains route-owned until Phase 7 SETL-01 settlement dispatch";
+
 #[derive(Debug, Clone)]
 pub struct CreateInvoiceRequest<'a> {
     pub recipient: &'a ResolvedRecipient,
@@ -140,7 +142,7 @@ impl LnurlProvider for SparkProvider {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         let _ = request;
         Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
-            "Spark payment status remains route-owned until settlement dispatch migration"
+            SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL
         )))
     }
 }
@@ -258,5 +260,21 @@ mod tests {
                 "default/BTC wallet intent must pass Spark capability gate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn spark_payment_status_error_carries_phase_7_deferral_marker() {
+        let provider = spark_provider_for_unit_tests();
+
+        let err = provider
+            .payment_status(PaymentStatusRequest {
+                payment_hash: "payment_hash",
+            })
+            .await
+            .expect_err("Spark payment status remains deferred to Phase 7");
+
+        let message = err.to_string();
+        assert!(message.contains("DEF-03-SPARK-PAYMENT-STATUS-PHASE-7"));
+        assert!(message.contains("Phase 7 SETL-01"));
     }
 }
