@@ -64,6 +64,11 @@ teardown_file() {
   run register_user "transferuser" "localhost:8080" "Transfer source wallet"
   [ "$status" -eq 0 ]
 
+  auth="$(auth_payload "transferuser")"
+  to_pubkey="$(json_get "$auth" '.to_pubkey')"
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('spark_transfer_target', 'spark', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO spark_accounts(account_id, pubkey, created_at, updated_at) VALUES ('spark_transfer_target', '${to_pubkey}', 0, 0) ON CONFLICT (account_id) DO NOTHING" >/dev/null
+
   run transfer_user "transferuser" "localhost:8080" "Transfer target wallet"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.lightning_address' 'transferuser@localhost:8080'
