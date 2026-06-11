@@ -1,0 +1,62 @@
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+type Query {
+  lnInvoicePaymentStatusByHash(input: LnInvoicePaymentStatusByHashInput!): LnInvoicePaymentStatus
+}
+
+type Mutation {
+  lnInvoiceCreateOnBehalfOfRecipient(input: LnInvoiceCreateOnBehalfOfRecipientInput!): LnInvoicePayload!
+  lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient(input: LnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipientInput!): LnInvoicePayload!
+}
+
+input LnInvoiceCreateOnBehalfOfRecipientInput {
+  recipientWalletId: WalletId!
+  amount: SatAmount!
+  descriptionHash: String
+  expiresIn: Minutes
+}
+
+input LnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipientInput {
+  recipientWalletId: WalletId!
+  amount: SatAmount!
+  descriptionHash: String
+  expiresIn: Minutes
+}
+
+input LnInvoicePaymentStatusByHashInput {
+  paymentHash: PaymentHash!
+}
+
+type LnInvoicePayload {
+  invoice: LnInvoice
+  errors: [GraphQLError!]!
+}
+
+type LnInvoice {
+  paymentRequest: String!
+  paymentHash: PaymentHash!
+}
+
+type LnInvoicePaymentStatus {
+  status: LnInvoicePaymentStatusType!
+  paymentHash: PaymentHash!
+  paymentRequest: String
+}
+
+type GraphQLError {
+  message: String!
+}
+
+enum LnInvoicePaymentStatusType {
+  EXPIRED
+  PAID
+  PENDING
+}
+
+scalar WalletId
+scalar SatAmount
+scalar Minutes
+scalar PaymentHash

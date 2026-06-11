@@ -4,6 +4,7 @@ edition = "2024"
 version = "0.1.1-dev"
 
 [workspace]
+members = ["crates/blink-client"]
 
 [[bin]]
 name = "lnurl-server"
@@ -16,6 +17,7 @@ axum = { version = "0.8.4", features = ["macros"] }
 axum-extra = { version = "0.10.1" }
 base64 = "0.22.1"
 bitcoin = { version = "0.32.6", features = ["serde"] }
+blink-client = { path = "crates/blink-client" }
 clap = { version = "4.5.40", features = ["derive"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
 hex = "0.4.3"
