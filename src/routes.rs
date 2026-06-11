@@ -2018,6 +2018,79 @@ mod tests {
     }
 
     #[test]
+    fn transfer_route_uses_provider_neutral_identifier_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "transfer must build the provider-neutral IdentifierTransfer DTO"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "transfer must move ownership through the provider-neutral repository API"
+        );
+        assert!(
+            !transfer.contains("transfer_username"),
+            "transfer must not rely exclusively on legacy username transfer"
+        );
+        assert!(
+            transfer.contains("verify_transfer_signature"),
+            "transfer must preserve both Spark signature checks"
+        );
+    }
+
+    #[test]
+    fn transfer_provider_neutral_conflicts_keep_legacy_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_transfer_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+
+        let (status, Json(body)) =
+            spark_transfer_error(LnurlRepositoryError::SourceNotOwner, "alice");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            Value::String("source pubkey does not own this username".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_response_preserves_account_id_field() {
+        let field_names: Vec<_> = serde_json::to_value(ListMetadataMetadata {
+            payment_hash: "metadata_hash".to_string(),
+            account_id: Some("acct_spark_metadata".to_string()),
+            sender_comment: None,
+            nostr_zap_request: None,
+            nostr_zap_receipt: None,
+            updated_at: 42,
+            preimage: None,
+        })
+        .expect("metadata should serialize")
+        .as_object()
+        .expect("metadata should serialize as object")
+        .keys()
+        .cloned()
+        .collect();
+
+        assert_eq!(
+            field_names,
+            vec![
+                "account_id",
+                "nostr_zap_receipt",
+                "nostr_zap_request",
+                "payment_hash",
+                "preimage",
+                "sender_comment",
+                "updated_at",
+            ]
+        );
+    }
+
+    #[test]
     fn spark_registration_conflicts_keep_duplicate_name_contract() {
         for error in [
             LnurlRepositoryError::NameTaken,
