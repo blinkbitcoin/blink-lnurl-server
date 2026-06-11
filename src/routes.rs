@@ -3366,6 +3366,32 @@ mod tests {
     }
 
     #[test]
+    fn phase_6_public_lnurl_error_reason_contract_is_explicit_and_plain() {
+        // D-16/D-17/D-18/D-19: public LNURL error categories must stay stable,
+        // plain, and provider-neutral so Blink internals never leak through
+        // user-correctable or upstream provider failures.
+        assert_eq!(
+            public_lnurl_phase_6_error_reasons(),
+            [
+                "unsupported wallet",
+                "expiry too long",
+                "missing amount",
+                "comment too long",
+                "invoice creation failed",
+            ]
+        );
+
+        for reason in public_lnurl_phase_6_error_reasons() {
+            let (status, Json(body)) = lnurl_error(reason);
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "ERROR");
+            assert_eq!(body["reason"], reason);
+            assert!(body.get("provider").is_none());
+            assert!(body.get("account_id").is_none());
+        }
+    }
+
+    #[test]
     fn spark_recipient_adapts_to_legacy_recover_fields() {
         let recipient = crate::repository::ResolvedRecipient {
             account_id: "acct_spark_test".to_string(),
