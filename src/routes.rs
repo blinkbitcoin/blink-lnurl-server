@@ -1289,7 +1289,7 @@ fn internal_account_creation_error(
                 INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS,
             )),
         ),
-        LnurlRepositoryError::IdentifierConflict => (
+        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
             StatusCode::CONFLICT,
             Json(InternalErrorResponse::new(
                 INTERNAL_ERROR_IDENTIFIER_CONFLICT,
