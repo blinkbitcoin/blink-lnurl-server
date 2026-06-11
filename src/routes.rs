@@ -1918,6 +1918,93 @@ mod tests {
         }
     }
 
+    // -- Spark management account-backed compatibility ------------------------
+
+    fn handler_source(name: &str) -> &'static str {
+        let source = include_str!("routes.rs");
+        let marker = format!("    pub async fn {name}(");
+        let start = source.find(&marker).expect("handler must exist");
+        let rest = &source[start..];
+        let next = rest
+            .find("\n    pub async fn ")
+            .unwrap_or(rest.len());
+        &rest[..next]
+    }
+
+    #[test]
+    fn spark_management_routes_use_provider_neutral_repository_calls() {
+        let register = handler_source("register");
+        assert!(
+            register.contains("upsert_spark_registration"),
+            "register must write through the account-backed Spark registration API"
+        );
+        assert!(
+            !register.contains("upsert_user"),
+            "register must not write exclusively through the legacy user API"
+        );
+
+        let available = handler_source("available");
+        assert!(
+            available.contains("resolve_recipient_by_identifier"),
+            "availability must resolve account-backed identifiers"
+        );
+        assert!(
+            !available.contains("get_user_by_name"),
+            "availability must not rely exclusively on legacy user lookup"
+        );
+
+        let recover = handler_source("recover");
+        assert!(
+            recover.contains("get_account_by_spark_pubkey"),
+            "recover must prove Spark account ownership through provider-neutral lookup"
+        );
+
+        let unregister = handler_source("unregister");
+        assert!(
+            unregister.contains("delete_spark_registration"),
+            "unregister must delete only the active Spark registration"
+        );
+        assert!(
+            !unregister.contains("delete_user"),
+            "unregister must not delete the legacy user row directly from the route"
+        );
+    }
+
+    #[test]
+    fn spark_registration_conflicts_keep_duplicate_name_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_registration_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+    }
+
+    #[test]
+    fn spark_recipient_adapts_to_legacy_recover_fields() {
+        let recipient = crate::repository::ResolvedRecipient {
+            account_id: "acct_spark_test".to_string(),
+            provider: crate::repository::AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: crate::repository::AccountIdentifierKind::Username,
+            description: "Alice wallet".to_string(),
+            spark_pubkey: Some("spark_pubkey".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        };
+
+        let user = spark_user_from_recipient(recipient).expect("Spark recipient should adapt");
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.domain, "example.com");
+        assert_eq!(user.pubkey, "spark_pubkey");
+        assert_eq!(user.description, "Alice wallet");
+    }
+
     #[tokio::test]
     async fn webhook_valid_payment_marks_invoice_paid() {
         let repo = setup_repo_with_invoice(TEST_PREIMAGE_HEX, TEST_RECEIVER_PUBKEY);
