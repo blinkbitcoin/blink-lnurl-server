@@ -20,6 +20,7 @@ use crate::{models::InternalErrorResponse, state::State};
 pub const SCOPE_BLINK_ACCOUNTS_CREATE: &str = "blink:accounts:create";
 pub const SCOPE_ACCOUNTS_READ: &str = "accounts:read";
 pub const SCOPE_SETTLEMENT_WRITE: &str = "settlement:write";
+pub const SCOPE_TRANSFER_WRITE: &str = "transfer:write";
 
 #[derive(Debug, Clone)]
 pub struct InternalAuthState {
@@ -288,8 +289,8 @@ mod tests {
         let scopes = parse_scopes(&claims);
         assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
         assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
-        assert!(scopes.contains("settlement:write"));
-        assert!(scopes.contains("transfer:write"));
+        assert!(scopes.contains(SCOPE_SETTLEMENT_WRITE));
+        assert!(scopes.contains(SCOPE_TRANSFER_WRITE));
     }
 
     #[test]

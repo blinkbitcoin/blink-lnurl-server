@@ -52,6 +52,24 @@ pub struct InternalIdentifierLookupResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct InternalTransferToSparkRequest {
+    pub domain: String,
+    pub identifier: String,
+    pub destination_spark_pubkey: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InternalTransferToSparkResponse {
+    pub domain: String,
+    pub identifier: String,
+    pub provider: String,
+    pub spark_pubkey: String,
+    pub lightning_address: String,
+    pub lnurl: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InternalProviderDetailsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_pubkey: Option<String>,

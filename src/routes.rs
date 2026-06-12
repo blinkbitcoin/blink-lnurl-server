@@ -9,11 +9,11 @@ use crate::models::{
     INTERNAL_ERROR_INVALID_IDENTIFIER, INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND,
     INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
     InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
-    InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse,
-    PublishZapReceiptRequest, PublishZapReceiptResponse, RecoverLnurlPayRequest,
-    RecoverLnurlPayResponse, RegisterLnurlPayRequest, RegisterLnurlPayResponse,
-    TransferLnurlPayRequest, TransferLnurlPayResponse, UnregisterLnurlPayRequest,
-    sanitize_username,
+    InternalTransferToSparkRequest, InternalTransferToSparkResponse, InvoicePaidRequest,
+    InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
+    PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+    RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
+    TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
 };
 use axum::{
     Extension, Json,
@@ -50,9 +50,9 @@ use crate::{
         parse_blink_settlement_notification,
     },
     repository::{
-        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
-        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
-        ResolvedRecipient, WalletKind, generate_account_id,
+        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
+        LnurlRepository, LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount,
+        NewSparkRegistration, ResolvedRecipient, WalletKind, generate_account_id,
     },
     state::State,
     user::User,
@@ -1213,6 +1213,25 @@ where
         Ok(())
     }
 
+    pub async fn transfer_identifier_to_spark(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Extension(_state): Extension<State<DB>>,
+        Json(_payload): Json<InternalTransferToSparkRequest>,
+    ) -> Result<Json<InternalTransferToSparkResponse>, (StatusCode, Json<InternalErrorResponse>)>
+    {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )?;
+
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+            )),
+        ))
+    }
+
     pub async fn create_internal_blink_account(
         Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
         Extension(state): Extension<State<DB>>,
@@ -2264,6 +2283,7 @@ mod tests {
         create_blink_account_error: std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
         resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
         resolve_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
     }
 
     #[derive(Clone, Copy)]
@@ -2289,6 +2309,14 @@ mod tests {
 
         fn resolve_calls(&self) -> Vec<(String, String)> {
             self.resolve_calls.lock().unwrap().clone()
+        }
+
+        fn blink_to_spark_transfer_count(&self) -> usize {
+            self.blink_to_spark_transfers.lock().unwrap().len()
+        }
+
+        fn blink_to_spark_transfers(&self) -> Vec<BlinkToSparkIdentifierTransfer> {
+            self.blink_to_spark_transfers.lock().unwrap().clone()
         }
     }
 
@@ -2356,6 +2384,16 @@ mod tests {
             &self,
             _: &IdentifierTransfer,
         ) -> Result<(), LnurlRepositoryError> {
+            Ok(())
+        }
+        async fn transfer_blink_identifier_to_spark(
+            &self,
+            transfer: &BlinkToSparkIdentifierTransfer,
+        ) -> Result<(), LnurlRepositoryError> {
+            self.blink_to_spark_transfers
+                .lock()
+                .unwrap()
+                .push(transfer.clone());
             Ok(())
         }
         async fn transfer_username(
@@ -3024,6 +3062,55 @@ mod tests {
             .layer(Extension(state))
     }
 
+    fn internal_transfer_to_spark_app_with_state(state: State<MockRepository>) -> Router {
+        Router::new()
+            .route(
+                "/internal/identifiers/transfer-to-spark",
+                post(LnurlServer::<MockRepository>::transfer_identifier_to_spark),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    async fn internal_transfer_to_spark_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_transfer_to_spark_app_with_state(state)
+    }
+
+    async fn post_internal_transfer_to_spark(
+        app: Router,
+        payload: InternalTransferToSparkRequest,
+        scope: &str,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/identifiers/transfer-to-spark")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope(scope)),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
     async fn post_internal_blink_invoice_paid(
         app: Router,
         payload: Value,
@@ -3184,6 +3271,15 @@ mod tests {
             btc_wallet_id: None,
             usd_wallet_id: None,
             default_wallet: None,
+        }
+    }
+
+    fn valid_internal_transfer_to_spark_payload() -> InternalTransferToSparkRequest {
+        InternalTransferToSparkRequest {
+            domain: "Example.COM".to_string(),
+            identifier: " Alice ".to_string(),
+            destination_spark_pubkey: "destination_spark_pubkey".to_string(),
+            description: "Moved to Spark".to_string(),
         }
     }
 
@@ -4776,6 +4872,76 @@ mod tests {
         assert!(invoice.preimage.is_none());
         assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
         assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_requires_transfer_scope() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "blink:accounts:create accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_spark_owned_source() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_moves_blink_identifier_to_spark() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(body["spark_pubkey"], "destination_spark_pubkey");
+        assert_eq!(body["lightning_address"], "alice@example.com");
+        assert_eq!(body["lnurl"], "lnurlp://example.com/lnurlp/alice");
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(repo.blink_to_spark_transfers().len(), 1);
+        let transfer = repo.blink_to_spark_transfers().remove(0);
+        assert_eq!(transfer.domain, "example.com");
+        assert_eq!(transfer.identifier, "alice");
+        assert_eq!(transfer.source_account_id, "acct_blink_lookup");
+        assert_eq!(
+            transfer.destination_spark_pubkey,
+            "destination_spark_pubkey"
+        );
+        assert_eq!(transfer.description, "Moved to Spark");
     }
 
     #[tokio::test]
