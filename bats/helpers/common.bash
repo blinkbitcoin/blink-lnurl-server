@@ -253,7 +253,7 @@ blink_settlement_notify() {
     --header "Content-Type: application/json" \
     --header "Authorization: Bearer ${token}" \
     --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg preimage "${preimage}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{preImage:$preimage}}}')" \
-    "${BASE_URL}/internal/blink/invoice-paid" | jq -cer '.'
+    "${BASE_URL}/internal/blink/invoice-paid"
 }
 
 internal_identifier_lookup() {
@@ -293,7 +293,7 @@ blink_settlement_notify_without_preimage() {
     --header "Content-Type: application/json" \
     --header "Authorization: Bearer ${token}" \
     --data "$(jq -cn --arg payment_hash "${payment_hash}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{type:"SettlementViaIntraLedger"}}}')" \
-    "${BASE_URL}/internal/blink/invoice-paid" | jq -cer '.'
+    "${BASE_URL}/internal/blink/invoice-paid"
 }
 
 blink_settlement_notify_status_body() {
@@ -337,6 +337,14 @@ identifier_owner_provider() {
   sql_identifier="$(sql_literal_escape "${identifier}")"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
     -c "SELECT a.provider FROM account_identifiers ai JOIN accounts a ON a.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = '${sql_identifier}'"
+}
+
+account_identifier_exists() {
+  local identifier="${1:?identifier is required}"
+  local sql_identifier
+  sql_identifier="$(sql_literal_escape "${identifier}")"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT CASE WHEN EXISTS (SELECT 1 FROM account_identifiers WHERE domain = 'localhost:8080' AND identifier = '${sql_identifier}') THEN 'true' ELSE 'false' END"
 }
 
 invoice_account_provider() {

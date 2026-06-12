@@ -53,6 +53,29 @@ teardown_file() {
   [ "$(invoice_wallet_kind "${payment_hash}")" = "usd" ]
 }
 
+@test "blink: default usd and explicit btc wallet selection use mocked graphql" {
+  create_blink_account "blinkdefaultusd10" "Blink default USD wallet" "usd" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinkdefaultusd10")"
+  callback_url="$(json_get "$discovery" '.callback')"
+
+  run blink_lnurl_callback "$callback_url" "1000"
+  [ "$status" -eq 0 ]
+  assert_json_nonempty "$output" '.pr'
+  payment_hash="$(json_get "$output" '.verify' | awk -F/ '{print $NF}')"
+  [ "$(invoice_wallet_kind "${payment_hash}")" = "usd" ]
+
+  create_blink_account "blinkbtcoverride10" "Blink BTC override wallet" "usd" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinkbtcoverride10+btc")"
+  callback_url="$(json_get "$discovery" '.callback')"
+
+  run blink_lnurl_callback "$callback_url" "1000"
+  [ "$status" -eq 0 ]
+  assert_json_nonempty "$output" '.pr'
+  payment_hash="$(json_get "$output" '.verify' | awk -F/ '{print $NF}')"
+  [ "$(invoice_wallet_kind "${payment_hash}")" = "btc" ]
+  [ "$(account_identifier_exists "blinkbtcoverride10+btc")" = "false" ]
+}
+
 @test "blink: verify settlement fallback marks paid" {
   create_blink_account "blinkpaid" "Blink paid fallback wallet" "btc" "btc-wallet-paid-fallback" >/dev/null
   discovery="$(blink_lnurl_discovery "blinkpaid")"
@@ -65,6 +88,43 @@ teardown_file() {
   assert_json_equals "$output" '.settled' 'true'
   payment_hash="${verify_url##*/}"
   [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
+}
+
+@test "blink: settlement webhook with supplied preimage marks invoice paid" {
+  create_blink_account "blinksettlepreimage10" "Blink settlement preimage wallet" "btc" "btc-wallet-paid-fallback" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinksettlepreimage10")"
+  invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
+  payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
+
+  run blink_settlement_notify "$payment_hash" "0909090909090909090909090909090909090909090909090909090909090909"
+  [ "$status" -eq 0 ]
+  [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
+}
+
+@test "blink: settlement webhook without preimage falls back to payment status" {
+  create_blink_account "blinksettlefallback10" "Blink settlement fallback wallet" "btc" "btc-wallet-paid-fallback-hooks" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinksettlefallback10")"
+  invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
+  payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
+
+  run blink_settlement_notify_without_preimage "$payment_hash"
+  [ "$status" -eq 0 ]
+  [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
+}
+
+@test "blink: verify unsettled returns false without persisting preimage" {
+  create_blink_account "blinkunsettled10" "Blink unsettled wallet" "btc" "btc-wallet-unsettled10" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinkunsettled10")"
+  invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
+  verify_url="$(json_get "$invoice" '.verify')"
+
+  run curl -fsS "$verify_url"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.status' 'OK'
+  assert_json_equals "$output" '.settled' 'false'
+  assert_json_equals "$output" '.preimage' 'null'
+  payment_hash="${verify_url##*/}"
+  [ "$(invoice_has_preimage "${payment_hash}")" = "false" ]
 }
 
 @test "blink: zap and webhook side effects use provider-neutral ownership" {
