@@ -303,7 +303,10 @@ teardown_file() {
 }
 
 @test "blink: phone identifier registration resolves through public discovery" {
-  for local_part in "+573005871212" "573005871212" "00573005871212"; do
+  create_blink_account_multi "acct-phone10" "Phone wallet" "btc" \
+    "btc-wallet-phone10" "usd-wallet-phone10" "+573005871213" >/dev/null
+
+  for local_part in "+573005871213" "573005871213" "00573005871213"; do
     run blink_lnurl_discovery "${local_part}"
     [ "$status" -eq 0 ]
     assert_json_equals "$output" '.tag' 'payRequest'
