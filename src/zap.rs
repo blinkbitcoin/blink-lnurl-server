@@ -419,6 +419,59 @@ mod shared_tests {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{Event, JsonUtil, Kind, TagStandard, key::Keys};
+
+    const ZAP_REQUEST_JSON: &str = r#"{"pubkey":"32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245","content":"","id":"d9cc14d50fcb8c27539aacf776882942c1a11ea4472f8cdec1dea82fab66279d","created_at":1674164539,"sig":"77127f636577e9029276be060332ea565deaf89ff215a494ccff16ae3f757065e2bc59b2e8c113dd407917a010b3abd36c8d7ad84c0e3ab7dab3a0b0caa9835d","kind":9734,"tags":[["e","3624762a1274dd9636e0c552b53086d70bc88c165bc4dc0f9e836a1eaf86c3b8"],["p","32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245"],["relays","wss://relay.damus.io"]]}"#;
+
+    #[test]
+    fn zap_receipt_preserves_original_description_and_excludes_account_id() {
+        let server_keys = Keys::generate();
+        let zap_request = Event::from_json(ZAP_REQUEST_JSON).unwrap();
+        let zap = Zap {
+            account_id: Some("acct_blink_internal_only".to_string()),
+            payment_hash: "zap_receipt_hash".to_string(),
+            zap_request: ZAP_REQUEST_JSON.to_string(),
+            zap_event: None,
+            user_pubkey: String::new(),
+            invoice_expiry: i64::MAX,
+            updated_at: 0,
+            is_user_nostr_key: false,
+        };
+        let bolt11 = "lnbc1providerneutralzap";
+        let preimage = "abcdef0123456789";
+
+        let zap_receipt = build_zap_receipt_event(&server_keys, &zap, bolt11, preimage).unwrap();
+
+        assert_eq!(zap_receipt.kind, Kind::ZapReceipt);
+        assert_eq!(zap_receipt.pubkey, server_keys.public_key());
+
+        let tag_values: Vec<Vec<String>> = zap_receipt
+            .tags
+            .iter()
+            .map(|tag| tag.as_vec())
+            .collect();
+        assert!(tag_values.iter().any(|tag| tag == &["description", ZAP_REQUEST_JSON]));
+        assert!(tag_values.iter().any(|tag| tag == &["bolt11", bolt11]));
+        assert!(tag_values.iter().any(|tag| tag == &["preimage", preimage]));
+        assert!(!tag_values
+            .iter()
+            .flatten()
+            .any(|value| value == "account_id" || value == "acct_blink_internal_only"));
+        assert!(zap_receipt.as_json().contains("description"));
+        assert!(zap_receipt.as_json().contains("bolt11"));
+        assert!(zap_receipt.as_json().contains("preimage"));
+        assert!(!zap_receipt.as_json().contains("account_id"));
+        assert_eq!(zap_request.as_json(), ZAP_REQUEST_JSON);
+        assert!(zap_receipt
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_standardized(), Some(TagStandard::Description(_)))));
+    }
+}
+
+#[cfg(test)]
 mod sqlite_tests {
     use super::shared_tests;
 
