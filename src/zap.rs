@@ -457,14 +457,13 @@ mod shared_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{Event, JsonUtil, Kind, TagStandard, key::Keys};
+    use nostr::{JsonUtil, Kind, TagStandard, key::Keys};
 
     const ZAP_REQUEST_JSON: &str = r#"{"pubkey":"32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245","content":"","id":"d9cc14d50fcb8c27539aacf776882942c1a11ea4472f8cdec1dea82fab66279d","created_at":1674164539,"sig":"77127f636577e9029276be060332ea565deaf89ff215a494ccff16ae3f757065e2bc59b2e8c113dd407917a010b3abd36c8d7ad84c0e3ab7dab3a0b0caa9835d","kind":9734,"tags":[["e","3624762a1274dd9636e0c552b53086d70bc88c165bc4dc0f9e836a1eaf86c3b8"],["p","32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245"],["relays","wss://relay.damus.io"]]}"#;
 
     #[test]
     fn zap_receipt_preserves_original_description_and_excludes_account_id() {
         let server_keys = Keys::generate();
-        let zap_request = Event::from_json(ZAP_REQUEST_JSON).unwrap();
         let zap = Zap {
             account_id: Some("acct_blink_internal_only".to_string()),
             payment_hash: "zap_receipt_hash".to_string(),
