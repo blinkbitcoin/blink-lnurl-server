@@ -1610,6 +1610,8 @@ where
 #[derive(Debug, thiserror::Error)]
 enum BlinkSettlementError {
     #[error(transparent)]
+    Repository(#[from] LnurlRepositoryError),
+    #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
     InvoicePaid(#[from] HandleInvoicePaidError),
@@ -1623,6 +1625,13 @@ async fn settle_blink_invoice_by_payment_hash<DB>(
 where
     DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
+    let Some(invoice) = state.db.get_invoice_by_payment_hash(payment_hash).await? else {
+        return Ok(None);
+    };
+    if invoice.provider != Some(AccountProvider::Blink) {
+        return Ok(None);
+    }
+
     if let Some(preimage) = supplied_preimage {
         handle_invoice_paid(
             &state.db,
@@ -4623,6 +4632,51 @@ mod tests {
                 .contains_key(&payment_hash)
         );
         assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_does_not_settle_non_blink_invoices() {
+        for provider in [Some(AccountProvider::Spark), None] {
+            let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+            let (endpoint, calls, _) =
+                start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                    .await;
+            let repo = MockRepository::default();
+            repo.upsert_invoice(&route_test_invoice(
+                provider,
+                payment_hash.clone(),
+                "lnbc1notblink",
+                None,
+            ))
+            .await
+            .unwrap();
+            let state = internal_route_test_state_with_blink_endpoint(
+                repo.clone(),
+                Some(internal_auth_state()),
+                &endpoint,
+            )
+            .await;
+            let app = internal_blink_invoice_paid_app_with_state(state);
+
+            let (status, body) = post_internal_blink_invoice_paid(
+                app,
+                blink_settlement_payload("receive.lightning", "success", &payment_hash),
+                crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+            )
+            .await;
+
+            assert!(status.is_success());
+            assert_eq!(body, Value::Null);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let invoice = repo
+                .get_invoice_by_payment_hash(&payment_hash)
+                .await
+                .unwrap()
+                .expect("invoice exists");
+            assert!(invoice.preimage.is_none());
+            assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+            assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
