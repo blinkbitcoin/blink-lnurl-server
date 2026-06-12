@@ -1,9 +1,19 @@
+use crate::identifier::{
+    IdentifierError, IdentifierKind, WalletModifier, canonical_spark_username,
+    parse_public_identifier,
+};
 use crate::models::{
-    CheckUsernameAvailableResponse, InvoicePaidRequest, InvoicesPaidRequest, ListMetadataRequest,
-    ListMetadataResponse, PublishZapReceiptRequest, PublishZapReceiptResponse,
-    RecoverLnurlPayRequest, RecoverLnurlPayResponse, RegisterLnurlPayRequest,
-    RegisterLnurlPayResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
-    UnregisterLnurlPayRequest, sanitize_username,
+    CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
+    INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS, INTERNAL_ERROR_IDENTIFIER_CONFLICT,
+    INTERNAL_ERROR_INTERNAL_SERVER_ERROR, INTERNAL_ERROR_INVALID_DOMAIN,
+    INTERNAL_ERROR_INVALID_IDENTIFIER, INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND,
+    INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
+    InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
+    InternalTransferToSparkRequest, InternalTransferToSparkResponse, InvoicePaidRequest,
+    InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
+    PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+    RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
+    TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
 };
 use axum::{
     Extension, Json,
@@ -17,27 +27,35 @@ use bitcoin::{
     hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256},
     secp256k1::{PublicKey, XOnlyPublicKey, ecdsa::Signature},
 };
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use nostr::{Alphabet, Event, EventBuilder, JsonUtil, Kind, TagStandard, key::Keys};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::marker::PhantomData;
 use std::str::FromStr;
+use std::{collections::HashSet, marker::PhantomData};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
     invoice_paid::{
-        HandleInvoicePaidError, create_invoice, handle_invoice_paid, handle_invoices_paid,
+        HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
+        handle_invoices_paid,
     },
     repository::LnurlSenderComment,
     time::{now_millis, now_u64},
     zap::Zap,
 };
 use crate::{
-    repository::{LnurlRepository, LnurlRepositoryError},
+    providers::{
+        CreateInvoiceRequest, PaymentStatusRequest, ProviderError,
+        parse_blink_settlement_notification,
+    },
+    repository::{
+        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
+        LnurlRepository, LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount,
+        NewSparkRegistration, ResolvedRecipient, WalletKind, generate_account_id,
+    },
     state::State,
-    user::{USERNAME_VALIDATION_REGEX, User},
+    user::User,
 };
 
 const ACCEPTABLE_TIME_DIFF_SECS: u64 = 600;
@@ -49,6 +67,20 @@ const MAX_NOSTR_RELAYS: usize = 10;
 const MAX_NOSTR_EVENT_SIZE: usize = 32_768;
 /// Maximum length of a sender comment (LUD-12).
 const MAX_COMMENT_LENGTH: usize = 255;
+const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
+const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
+
+#[cfg(test)]
+const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 6] {
+    [
+        "unsupported wallet",
+        "expiry too long",
+        "missing amount",
+        "amount out of range",
+        "comment too long",
+        "invoice creation failed",
+    ]
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LnurlPayCallbackParams {
@@ -103,6 +135,18 @@ pub struct PayResponse {
     pub nostr_pubkey: Option<XOnlyPublicKey>,
 }
 
+struct PublicIdentifierIntent {
+    canonical: String,
+    wallet: Option<WalletKind>,
+    callback_identifier: String,
+}
+
+struct PublicRecipient {
+    recipient: ResolvedRecipient,
+    wallet: Option<WalletKind>,
+    callback_identifier: String,
+}
+
 pub struct LnurlServer<DB> {
     db: PhantomData<DB>,
 }
@@ -116,11 +160,11 @@ where
         Path(identifier): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&identifier);
-        validate_username(&username)?;
-        let user = state
+        let username = canonical_spark_username_for_route(&identifier)?;
+        let domain = sanitize_domain(&state, &host).await?;
+        let recipient = state
             .db
-            .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
+            .resolve_recipient_by_identifier(&domain, &username)
             .await
             .map_err(|e| {
                 error!("failed to execute query: {}", e);
@@ -131,7 +175,7 @@ where
             })?;
 
         Ok(Json(CheckUsernameAvailableResponse {
-            available: user.is_none(),
+            available: recipient.is_none(),
         }))
     }
 
@@ -141,8 +185,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterLnurlPayRequest>,
     ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
-        validate_username(&username)?;
+        let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
             &payload.signature,
@@ -152,35 +195,28 @@ where
         )
         .await?;
         validate_description(&payload.description)?;
+        let domain = sanitize_domain(&state, &host).await?;
 
-        let user = User {
-            domain: sanitize_domain(&state, &host).await?,
+        let registration = NewSparkRegistration {
+            account_id: None,
             pubkey: pubkey.to_string(),
-            name: username,
-            description: payload.description,
+            identifier: NewAccountIdentifier {
+                domain: domain.clone(),
+                identifier: username.clone(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: payload.description,
+            },
         };
 
-        if let Err(e) = state.db.upsert_user(&user).await {
-            if let LnurlRepositoryError::NameTaken = e {
-                trace!("name already taken: {}", user.name);
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(Value::String("name already taken".into())),
-                ));
-            }
-
-            error!("failed to execute query: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Value::String("internal server error".into())),
-            ));
+        if let Err(e) = state.db.upsert_spark_registration(&registration).await {
+            return Err(spark_registration_error(e, &username));
         }
 
-        debug!("registered user '{}' for pubkey {}", user.name, pubkey);
-        let lnurl = format!("lnurlp://{}/lnurlp/{}", user.domain, user.name);
+        debug!("registered user '{username}' for pubkey {pubkey}");
+        let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
         Ok(Json(RegisterLnurlPayResponse {
             lnurl,
-            lightning_address: format!("{}@{}", user.name, user.domain),
+            lightning_address: format!("{username}@{domain}"),
         }))
     }
 
@@ -190,8 +226,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<TransferLnurlPayRequest>,
     ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
-        validate_username(&username)?;
+        let username = canonical_spark_username_for_route(&payload.username)?;
         validate_description(&payload.description)?;
 
         let message = format!("transfer:{username}-{to_pubkey}");
@@ -215,43 +250,35 @@ where
         }
 
         let domain = sanitize_domain(&state, &host).await?;
+        let from_pubkey = from_pk.to_string();
+        let to_pubkey = to_pk.to_string();
+
+        let source_recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &username)
+            .await
+            .map_err(|e| spark_transfer_error(e, &username))?
+            .ok_or_else(|| spark_transfer_error(LnurlRepositoryError::SourceNotOwner, &username))?;
+
+        if source_recipient.spark_pubkey.as_deref() != Some(from_pubkey.as_str()) {
+            return Err(spark_transfer_error(
+                LnurlRepositoryError::SourceNotOwner,
+                &username,
+            ));
+        }
 
         if let Err(e) = state
             .db
-            .transfer_username(
-                &domain,
-                &from_pk.to_string(),
-                &to_pk.to_string(),
-                &username,
-                &payload.description,
-            )
+            .transfer_identifier(&IdentifierTransfer {
+                domain: domain.clone(),
+                identifier: username.clone(),
+                source_account_id: source_recipient.account_id,
+                destination_spark_pubkey: to_pubkey.clone(),
+                description: payload.description,
+            })
             .await
         {
-            return Err(match e {
-                LnurlRepositoryError::SourceNotOwner => {
-                    trace!("transfer source pubkey does not own username '{username}'");
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(Value::String(
-                            "source pubkey does not own this username".into(),
-                        )),
-                    )
-                }
-                LnurlRepositoryError::NameTaken => {
-                    trace!("name already taken during transfer: {username}");
-                    (
-                        StatusCode::CONFLICT,
-                        Json(Value::String("name already taken".into())),
-                    )
-                }
-                LnurlRepositoryError::General(err) => {
-                    error!("failed to execute transfer query: {err}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Value::String("internal server error".into())),
-                    )
-                }
-            });
+            return Err(spark_transfer_error(e, &username));
         }
 
         debug!("transferred '{username}' from {from_pk} to {to_pk}");
@@ -268,7 +295,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<UnregisterLnurlPayRequest>,
     ) -> Result<(), (StatusCode, Json<Value>)> {
-        let username = sanitize_username(&payload.username);
+        let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
             &payload.signature,
@@ -277,19 +304,20 @@ where
             &state,
         )
         .await?;
+        let domain = sanitize_domain(&state, &host).await?;
 
         state
             .db
-            .delete_user(&sanitize_domain(&state, &host).await?, &pubkey.to_string())
+            .get_account_by_spark_pubkey(&pubkey.to_string())
             .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
-        debug!("unregistered user for pubkey {}", pubkey);
+            .map_err(storage_error)?;
+
+        state
+            .db
+            .delete_spark_registration(&domain, &pubkey.to_string(), &username)
+            .await
+            .map_err(|e| spark_unregister_error(e, &username))?;
+        debug!("unregistered user '{username}' for pubkey {pubkey}");
         Ok(())
     }
 
@@ -307,18 +335,25 @@ where
             &state,
         )
         .await?;
+        let domain = sanitize_domain(&state, &host).await?;
+
+        let account = state
+            .db
+            .get_account_by_spark_pubkey(&pubkey.to_string())
+            .await
+            .map_err(storage_error)?;
+        if account.is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(Value::String("user not found".into())),
+            ));
+        }
 
         let user = state
             .db
-            .get_user_by_pubkey(&sanitize_domain(&state, &host).await?, &pubkey.to_string())
+            .get_user_by_pubkey(&domain, &pubkey.to_string())
             .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
+            .map_err(storage_error)?;
 
         match user {
             Some(user) => {
@@ -641,17 +676,17 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let username = sanitize_username(&identifier);
-        let user = state
-            .db
-            .get_user_by_name(&sanitize_domain(&state, &host).await?, &username)
-            .await
+        let domain = sanitize_domain(&state, &host).await?;
+        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
             .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                lnurl_error("internal server error")
-            })?;
-
-        let Some(user) = user else {
+                trace!("invalid public identifier '{identifier}': {e:?}");
+                lnurl_error("invalid identifier")
+            })?
+        else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
 
@@ -670,12 +705,15 @@ where
         Ok(Json(PayResponse {
             callback: format!(
                 "{}://{}/lnurlp/{}/invoice",
-                state.scheme, &user.domain, user.name
+                state.scheme, domain, public_recipient.callback_identifier
             ),
             max_sendable: state.max_sendable,
             min_sendable: state.min_sendable,
             tag: Tag::Pay,
-            metadata: get_metadata(&user.domain, &user),
+            metadata: get_metadata_for_recipient(
+                &public_recipient.recipient,
+                &public_recipient.callback_identifier,
+            ),
             #[allow(clippy::cast_possible_truncation)]
             comment_allowed: Some(MAX_COMMENT_LENGTH as u32),
             allows_nostr,
@@ -694,19 +732,26 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let username = sanitize_username(&identifier);
-        let domain = sanitize_domain(&state, &host).await?;
-        let user = state
-            .db
-            .get_user_by_name(&domain, &username)
-            .await
+        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
             .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                lnurl_error("internal server error")
-            })?;
-        let Some(user) = user else {
+                trace!("invalid public identifier '{identifier}': {e:?}");
+                lnurl_error("invalid identifier")
+            })?
+        else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
+        let domain = sanitize_domain(&state, &host).await?;
+        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let Some(public_recipient) = public_recipient else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+        let account_id = public_recipient.recipient.account_id.clone();
+        let legacy_user_pubkey = public_recipient
+            .recipient
+            .spark_pubkey
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
 
         let Some(amount_msat) = params.amount else {
             trace!("missing amount");
@@ -716,6 +761,17 @@ where
         if amount_msat % 1000 != 0 {
             trace!("not a full sat amount");
             return Err(lnurl_error("amount must be a whole sat amount"));
+        }
+
+        if amount_msat < state.min_sendable || amount_msat > state.max_sendable {
+            trace!("amount outside advertised minSendable/maxSendable range");
+            return Err(lnurl_error("amount out of range"));
+        }
+
+        if let Some(comment) = params.comment.as_deref()
+            && comment.trim().len() > MAX_COMMENT_LENGTH
+        {
+            return Err(lnurl_error("comment too long"));
         }
 
         let nostr_pubkey = state
@@ -732,51 +788,76 @@ where
             })
             .transpose()?;
 
-        let desc_hash = if let Some(event) = &params.nostr {
-            if nostr_pubkey.is_none() {
+        let desc_hash = if let Some(raw_event) = &params.nostr {
+            let Some(expected_nostr_pubkey) = nostr_pubkey else {
                 trace!("nostr zap not supported");
                 return Err(lnurl_error("nostr zap not supported"));
-            }
+            };
 
-            if event.len() > MAX_NOSTR_EVENT_SIZE {
+            if raw_event.len() > MAX_NOSTR_EVENT_SIZE {
                 return Err(lnurl_error("nostr event too large"));
             }
 
-            let event = Event::from_json(event).map_err(|e| {
+            let event = Event::from_json(raw_event).map_err(|e| {
                 trace!("invalid nostr event, could not parse: {}", e);
                 lnurl_error("invalid nostr event")
             })?;
-            validate_nostr_zap_request(amount_msat, &event)?;
-            sha256::Hash::hash(event.as_json().as_bytes())
+            validate_nostr_zap_request(amount_msat, &event, expected_nostr_pubkey)?;
+            sha256::Hash::hash(raw_event.as_bytes())
         } else {
-            let metadata = get_metadata(&user.domain, &user);
+            let metadata = get_metadata_for_recipient(
+                &public_recipient.recipient,
+                &public_recipient.callback_identifier,
+            );
             sha256::Hash::hash(metadata.as_bytes())
         };
 
-        let pubkey = parse_pubkey(&user.pubkey)?;
+        let expiry = callback_expiry_for_provider(
+            public_recipient.recipient.provider,
+            public_recipient.wallet,
+            public_recipient.recipient.default_wallet,
+            params.expiry,
+        )?;
+
         let res = state
-            .wallet
-            .create_lightning_invoice(
-                amount_msat / 1000,
-                Some(spark_wallet::InvoiceDescription::DescriptionHash(
-                    desc_hash.to_byte_array(),
-                )),
-                Some(pubkey),
-                params.expiry,
-                state.include_spark_address,
-            )
+            .providers
+            .provider_for(public_recipient.recipient.provider)
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &public_recipient.recipient,
+                wallet: public_recipient.wallet,
+                amount_sat: amount_msat / 1000,
+                description_hash: desc_hash.to_byte_array(),
+                expiry,
+                include_spark_address: state.include_spark_address,
+            })
             .await
-            .map_err(|e| {
-                error!("failed to create lightning invoice: {}", e);
-                lnurl_error("failed to create invoice")
-            })?;
+            .map_err(map_provider_invoice_error)?;
 
         debug!("Created lightning invoice: {:?}", res);
 
-        let invoice = Bolt11Invoice::from_str(&res.invoice).map_err(|e| {
+        let invoice = Bolt11Invoice::from_str(&res.bolt11).map_err(|e| {
             error!("failed to parse invoice: {}", e);
             lnurl_error("internal server error")
         })?;
+
+        if !matches!(invoice.description(), Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0.to_string() == desc_hash.to_string())
+        {
+            error!("provider returned invoice with unexpected description hash");
+            return Err(lnurl_error("internal server error"));
+        }
+
+        let Some(invoice_amount_msat) = invoice.amount_milli_satoshis() else {
+            error!("provider returned invoice without an amount");
+            return Err(lnurl_error("internal server error"));
+        };
+
+        if invoice_amount_msat != amount_msat {
+            error!(
+                "provider returned invoice amount {} msat, expected {} msat",
+                invoice_amount_msat, amount_msat
+            );
+            return Err(lnurl_error("internal server error"));
+        }
 
         // Calculate expiry timestamp: current time + expiry duration from invoice
         let expiry_timestamp = invoice.expires_at().ok_or_else(|| {
@@ -802,10 +883,11 @@ where
         // save to zap event to db
         if let Some(zap_request) = params.nostr {
             let zap = Zap {
+                account_id: Some(account_id.clone()),
                 payment_hash: payment_hash.clone(),
                 zap_request,
                 zap_event: None,
-                user_pubkey: user.pubkey.clone(),
+                user_pubkey: legacy_user_pubkey.clone(),
                 invoice_expiry,
                 updated_at,
                 is_user_nostr_key: false,
@@ -818,16 +900,14 @@ where
 
         if let Some(comment) = params.comment {
             let comment = comment.trim();
-            if comment.len() > MAX_COMMENT_LENGTH {
-                return Err(lnurl_error("comment too long"));
-            }
             if !comment.is_empty()
                 && let Err(e) = state
                     .db
                     .insert_lnurl_sender_comment(&LnurlSenderComment {
+                        account_id: Some(account_id.clone()),
                         comment: comment.to_string(),
                         payment_hash: payment_hash.clone(),
-                        user_pubkey: user.pubkey.clone(),
+                        user_pubkey: legacy_user_pubkey.clone(),
                         updated_at,
                     })
                     .await
@@ -838,11 +918,16 @@ where
         }
 
         // Store invoice for LUD-21 verify support and webhook delivery
-        if let Err(e) = create_invoice(
+        if let Err(e) = create_provider_invoice_for_account(
             &state.db,
             &payment_hash,
-            &user.pubkey,
-            &res.invoice,
+            Some(&account_id),
+            Some(public_recipient.recipient.provider),
+            Some(res.wallet_kind),
+            res.wallet_id.as_deref(),
+            res.provider_payment_hash.as_deref(),
+            &legacy_user_pubkey,
+            &res.bolt11,
             invoice_expiry,
             &domain,
         )
@@ -855,7 +940,7 @@ where
         let verify_url = format!("{}://{}/verify/{}", state.scheme, domain, payment_hash);
 
         Ok(Json(json!({
-            "pr": res.invoice,
+            "pr": res.bolt11,
             "routes": Vec::<String>::new(),
             "verify": verify_url,
         })))
@@ -866,7 +951,7 @@ where
         Path(payment_hash): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> impl IntoResponse {
-        let invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
+        let mut invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
             Ok(Some(invoice)) => invoice,
             Ok(None) => {
                 return Json(json!({
@@ -883,6 +968,25 @@ where
             }
         };
 
+        if invoice.preimage.is_none() && invoice.provider == Some(AccountProvider::Blink) {
+            match settle_blink_invoice_by_payment_hash(&state, &payment_hash, None).await {
+                Ok(Some(preimage)) => {
+                    invoice.preimage = Some(preimage);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                        "Failed to settle Blink invoice during public verify for {}: {}",
+                        payment_hash, e
+                    );
+                    return Json(json!({
+                        "status": "ERROR",
+                        "reason": "Internal server error"
+                    }));
+                }
+            }
+        }
+
         let settled = invoice.preimage.is_some();
         Json(json!({
             "status": "OK",
@@ -894,7 +998,7 @@ where
 
     /// Invoice-paid notification endpoint (single invoice).
     /// Deprecated: use `invoices_paid` instead, which supports batch notifications.
-    /// TODO: Remove this endpoint after all clients have migrated to `invoices_paid`.
+    /// TODO(DEF-legacy-invoice-paid): Remove after all clients have migrated to `invoices_paid`.
     pub async fn invoice_paid(
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
@@ -1053,6 +1157,420 @@ where
         )
         .await
     }
+
+    pub async fn blink_invoice_paid(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<Value>,
+    ) -> Result<(), (StatusCode, Json<InternalErrorResponse>)> {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+        )?;
+
+        let parsed = parse_blink_settlement_notification(&payload).map_err(|e| {
+            trace!("invalid Blink settlement payload: {e}");
+            internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
+        })?;
+
+        if !parsed.should_settle() {
+            return Ok(());
+        }
+
+        let Some(payment_hash) = parsed.payment_hash() else {
+            trace!("missing paymentHash in Blink settlement payload");
+            return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
+        };
+
+        settle_blink_invoice_by_payment_hash(&state, payment_hash, parsed.preimage())
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    BlinkSettlementError::InvoicePaid(
+                        HandleInvoicePaidError::InvalidInvoice(_)
+                            | HandleInvoicePaidError::InvalidPreimage(_)
+                    )
+                ) {
+                    trace!(
+                        "invalid Blink invoice notification for {}: {}",
+                        payment_hash, e
+                    );
+                    return internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST);
+                }
+                error!(
+                    "failed to settle Blink invoice notification for {}: {}",
+                    payment_hash, e
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(InternalErrorResponse::new(
+                        INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                    )),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn transfer_identifier_to_spark(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Extension(state): Extension<State<DB>>,
+        body: Bytes,
+    ) -> Result<Json<InternalTransferToSparkResponse>, (StatusCode, Json<InternalErrorResponse>)>
+    {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )?;
+
+        let payload: InternalTransferToSparkRequest =
+            serde_json::from_slice(&body).map_err(|e| {
+                trace!("invalid internal transfer request JSON: {e}");
+                internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
+            })?;
+
+        let domain = validate_internal_domain(&payload.domain)?;
+        let parsed = parse_public_identifier(&payload.identifier).map_err(|e| {
+            trace!(
+                "invalid internal transfer identifier '{}': {e:?}",
+                payload.identifier
+            );
+            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
+        })?;
+        if parsed.wallet.is_some() {
+            return Err(internal_bad_request(
+                INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
+            ));
+        }
+        let identifier = parsed.canonical;
+        let destination_spark_pubkey =
+            validate_internal_required_string(&payload.destination_spark_pubkey)?;
+        let destination_spark_pubkey = parse_pubkey(&destination_spark_pubkey)
+            .map_err(|_| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))?
+            .to_string();
+        let description = validate_internal_description(&payload.description)?;
+
+        let source_recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &identifier)
+            .await
+            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
+        let Some(source_recipient) = source_recipient else {
+            return Err(internal_transfer_to_spark_error(
+                LnurlRepositoryError::SourceNotOwner,
+                &domain,
+                &identifier,
+            ));
+        };
+        if source_recipient.provider != AccountProvider::Blink {
+            return Err(internal_transfer_to_spark_error(
+                LnurlRepositoryError::InvalidOwnership,
+                &domain,
+                &identifier,
+            ));
+        }
+
+        state
+            .db
+            .transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+                domain: domain.clone(),
+                identifier: identifier.clone(),
+                source_account_id: source_recipient.account_id,
+                destination_spark_pubkey: destination_spark_pubkey.clone(),
+                description,
+            })
+            .await
+            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
+
+        Ok(Json(InternalTransferToSparkResponse {
+            domain: domain.clone(),
+            identifier: identifier.clone(),
+            provider: AccountProvider::Spark.as_str().to_string(),
+            spark_pubkey: destination_spark_pubkey,
+            lightning_address: format!("{identifier}@{domain}"),
+            lnurl: format!("lnurlp://{domain}/lnurlp/{identifier}"),
+        }))
+    }
+
+    pub async fn create_internal_blink_account(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<CreateBlinkAccountRequest>,
+    ) -> Result<Json<CreateBlinkAccountResponse>, (StatusCode, Json<InternalErrorResponse>)> {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_BLINK_ACCOUNTS_CREATE,
+        )?;
+
+        let domain = validate_internal_domain(&payload.domain)?;
+        let blink_account_id = validate_internal_required_string(&payload.blink_account_id)?;
+        let btc_wallet_id = validate_internal_required_string(&payload.btc_wallet_id)?;
+        let usd_wallet_id = validate_internal_required_string(&payload.usd_wallet_id)?;
+        let description = validate_internal_description(&payload.description)?;
+        if payload.identifiers.is_empty() {
+            return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
+        }
+
+        let default_wallet = parse_internal_default_wallet(&payload.default_wallet)?;
+        let mut identifiers = Vec::with_capacity(payload.identifiers.len());
+        let mut response_identifiers = Vec::with_capacity(payload.identifiers.len());
+        let mut seen_identifiers = HashSet::with_capacity(payload.identifiers.len());
+        for raw_identifier in &payload.identifiers {
+            let parsed = parse_public_identifier(raw_identifier).map_err(|e| {
+                trace!("invalid internal account identifier '{raw_identifier}': {e:?}");
+                internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
+            })?;
+            if parsed.wallet.is_some() {
+                return Err(internal_bad_request(
+                    INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
+                ));
+            }
+            if !seen_identifiers.insert((domain.clone(), parsed.canonical.clone())) {
+                return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
+            }
+            let identifier_kind = match parsed.kind {
+                IdentifierKind::Username => AccountIdentifierKind::Username,
+                IdentifierKind::Phone => AccountIdentifierKind::Phone,
+            };
+            let kind = identifier_kind.as_str().to_string();
+            identifiers.push(NewAccountIdentifier {
+                domain: domain.clone(),
+                identifier: parsed.canonical.clone(),
+                identifier_kind,
+                description: description.clone(),
+            });
+            response_identifiers.push(InternalAccountIdentifierResponse {
+                identifier: parsed.canonical,
+                kind,
+                description: description.clone(),
+            });
+        }
+
+        let account_id = generate_account_id(AccountProvider::Blink);
+        let account = NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: blink_account_id.clone(),
+            btc_wallet_id: btc_wallet_id.clone(),
+            usd_wallet_id: usd_wallet_id.clone(),
+            default_wallet,
+            identifiers,
+        };
+
+        state
+            .db
+            .create_blink_account(&account)
+            .await
+            .map_err(internal_account_creation_error)?;
+
+        Ok(Json(CreateBlinkAccountResponse {
+            account_id,
+            provider: AccountProvider::Blink.as_str().to_string(),
+            blink_account_id,
+            btc_wallet_id,
+            usd_wallet_id,
+            default_wallet: default_wallet.as_str().to_string(),
+            domain,
+            identifiers: response_identifiers,
+        }))
+    }
+
+    pub async fn get_internal_identifier(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Path((domain, identifier)): Path<(String, String)>,
+        Extension(state): Extension<State<DB>>,
+    ) -> Result<Json<InternalIdentifierLookupResponse>, (StatusCode, Json<InternalErrorResponse>)>
+    {
+        crate::internal_auth::require_scope(&principal, crate::internal_auth::SCOPE_ACCOUNTS_READ)?;
+
+        let domain = validate_internal_lookup_domain(&domain)?;
+        let parsed = parse_public_identifier(&identifier).map_err(|e| {
+            trace!("invalid internal lookup identifier '{identifier}': {e:?}");
+            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
+        })?;
+
+        let recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &parsed.canonical)
+            .await
+            .map_err(|e| internal_lookup_storage_error(&e))?;
+        let Some(recipient) = recipient else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
+            ));
+        };
+
+        Ok(Json(internal_identifier_lookup_response(
+            recipient,
+            parsed.wallet,
+        )))
+    }
+}
+
+fn internal_identifier_lookup_response(
+    recipient: ResolvedRecipient,
+    requested_wallet: Option<WalletModifier>,
+) -> InternalIdentifierLookupResponse {
+    InternalIdentifierLookupResponse {
+        provider: recipient.provider.as_str().to_string(),
+        account_id: recipient.account_id,
+        domain: recipient.domain,
+        identifier: recipient.identifier,
+        identifier_kind: recipient.identifier_kind.as_str().to_string(),
+        description: recipient.description,
+        requested_wallet: requested_wallet
+            .map(|wallet| wallet_modifier_response_value(wallet).to_string()),
+        provider_details: InternalProviderDetailsResponse {
+            spark_pubkey: recipient.spark_pubkey,
+            blink_account_id: recipient.blink_account_id,
+            btc_wallet_id: recipient.btc_wallet_id,
+            usd_wallet_id: recipient.usd_wallet_id,
+            default_wallet: recipient
+                .default_wallet
+                .map(|wallet| wallet.as_str().to_string()),
+        },
+    }
+}
+
+const fn wallet_modifier_response_value(modifier: WalletModifier) -> &'static str {
+    match modifier {
+        WalletModifier::Btc => "btc",
+        WalletModifier::Usd => "usd",
+    }
+}
+
+fn validate_internal_domain(
+    domain: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let domain = domain.trim().to_lowercase();
+    if domain.is_empty() {
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
+    } else {
+        Ok(domain)
+    }
+}
+
+fn validate_internal_lookup_domain(
+    domain: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let domain = domain.trim().to_lowercase();
+    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_DOMAIN))
+    } else {
+        Ok(domain)
+    }
+}
+
+fn validate_internal_required_string(
+    value: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn validate_internal_description(
+    description: &str,
+) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
+    let description = validate_internal_required_string(description)?;
+    validate_description(&description)
+        .map(|()| description)
+        .map_err(|(_status, _body)| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
+}
+
+fn parse_internal_default_wallet(
+    wallet: &str,
+) -> Result<WalletKind, (StatusCode, Json<InternalErrorResponse>)> {
+    match wallet.trim().to_lowercase().as_str() {
+        "btc" => Ok(WalletKind::Btc),
+        "usd" => Ok(WalletKind::Usd),
+        _ => Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)),
+    }
+}
+
+fn internal_account_creation_error(
+    error: LnurlRepositoryError,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    match error {
+        LnurlRepositoryError::BlinkAccountExists => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS,
+            )),
+        ),
+        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
+            )),
+        ),
+        error => {
+            error!("failed to create internal Blink account: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(InternalErrorResponse::new(
+                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                )),
+            )
+        }
+    }
+}
+
+fn internal_transfer_to_spark_error(
+    error: LnurlRepositoryError,
+    domain: &str,
+    identifier: &str,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner | LnurlRepositoryError::AccountNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
+        ),
+        LnurlRepositoryError::InvalidOwnership | LnurlRepositoryError::InvalidProvider => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(INTERNAL_ERROR_INVALID_REQUEST)),
+        ),
+        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
+            )),
+        ),
+        error => {
+            error!(
+                "failed to transfer internal identifier {identifier}@{domain} to Spark: {error}"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(InternalErrorResponse::new(
+                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                )),
+            )
+        }
+    }
+}
+
+fn internal_lookup_storage_error(
+    error: &LnurlRepositoryError,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    error!("failed to resolve internal identifier lookup: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(InternalErrorResponse::new(
+            INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+        )),
+    )
+}
+
+fn internal_bad_request(message: &'static str) -> (StatusCode, Json<InternalErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(InternalErrorResponse::new(message)),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1216,9 +1734,75 @@ where
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+enum BlinkSettlementError {
+    #[error(transparent)]
+    Repository(#[from] LnurlRepositoryError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    InvoicePaid(#[from] HandleInvoicePaidError),
+}
+
+async fn settle_blink_invoice_by_payment_hash<DB>(
+    state: &State<DB>,
+    payment_hash: &str,
+    supplied_preimage: Option<&str>,
+) -> Result<Option<String>, BlinkSettlementError>
+where
+    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
+{
+    let Some(invoice) = state.db.get_invoice_by_payment_hash(payment_hash).await? else {
+        return Ok(None);
+    };
+    if invoice.provider != Some(AccountProvider::Blink) {
+        return Ok(None);
+    }
+
+    if let Some(preimage) = supplied_preimage {
+        handle_invoice_paid(
+            &state.db,
+            &state.webhook_service,
+            payment_hash,
+            preimage,
+            None,
+            &state.invoice_paid_trigger,
+        )
+        .await?;
+        return Ok(Some(preimage.to_string()));
+    }
+
+    let status = state
+        .providers
+        .provider_for(AccountProvider::Blink)
+        .payment_status(PaymentStatusRequest { payment_hash })
+        .await?;
+
+    if !status.settled {
+        return Ok(None);
+    }
+
+    let Some(preimage) = status.preimage else {
+        return Ok(None);
+    };
+
+    handle_invoice_paid(
+        &state.db,
+        &state.webhook_service,
+        payment_hash,
+        &preimage,
+        status.amount_received_sat,
+        &state.invoice_paid_trigger,
+    )
+    .await?;
+
+    Ok(Some(preimage))
+}
+
 fn validate_nostr_zap_request(
     amount_msat: u64,
     event: &Event,
+    expected_nostr_pubkey: XOnlyPublicKey,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     if event.kind != Kind::ZapRequest {
         trace!("nostr event is incorrect kind");
@@ -1237,16 +1821,25 @@ fn validate_nostr_zap_request(
         return Err(lnurl_error("invalid nostr event"));
     }
 
-    // 3. It MUST have only one p tag
-    if event
+    // 3. It MUST have only one p tag for the advertised recipient pubkey.
+    let mut p_tags = event
         .tags
         .iter()
-        .filter_map(nostr::Tag::single_letter_tag)
-        .filter(|t| t.is_lowercase() && t.character == Alphabet::P)
-        .count()
-        != 1
-    {
+        .filter(|tag| {
+            tag.single_letter_tag()
+                .is_some_and(|t| t.is_lowercase() && t.character == Alphabet::P)
+        })
+        .filter_map(nostr::Tag::content);
+    let Some(p_tag) = p_tags.next() else {
+        trace!("invalid nostr event, missing 'p' tag");
+        return Err(lnurl_error("invalid nostr event"));
+    };
+    if p_tags.next().is_some() {
         trace!("invalid nostr event, missing or multiple 'p' tags");
+        return Err(lnurl_error("invalid nostr event"));
+    }
+    if p_tag != expected_nostr_pubkey.to_string() {
+        trace!("invalid nostr event, 'p' tag does not match recipient pubkey");
         return Err(lnurl_error("invalid nostr event"));
     }
 
@@ -1290,35 +1883,120 @@ fn validate_nostr_zap_request(
     // NOTE: Assuming the tag is well-formed and contains the necessary fields, because it's standard.
 
     // 8. There MUST be 0 or 1 P tags. If there is one, it MUST be equal to the zap receipt's pubkey.
-    // TODO: Implement this check.
+    // TODO(Phase 7): Enforce optional NIP-57 P-tag recipient checks when provider-neutral zap receipt keys are migrated.
     Ok(())
 }
 
-fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    if username.chars().take(65).count() > 64 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("username too long".into())),
-        ));
-    }
-
-    let regex = Regex::new(USERNAME_VALIDATION_REGEX).map_err(|e| {
-        error!("failed to compile regex: {}", e);
+fn canonical_spark_username_for_route(username: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    canonical_spark_username(username).map_err(|e| {
+        trace!("invalid Spark username: {e:?}");
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Value::String("internal server error".into())),
-        )
-    })?;
-
-    if !regex.is_match(username) {
-        trace!("invalid username doesn't match regex");
-        return Err((
             StatusCode::BAD_REQUEST,
             Json(Value::String("invalid username".into())),
-        ));
+        )
+    })
+}
+
+#[cfg(test)]
+fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    canonical_spark_username_for_route(username).map(|_| ())
+}
+
+#[cfg(test)]
+fn public_lookup_username(identifier: &str) -> Result<Option<String>, IdentifierError> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return Err(IdentifierError::EmptyIdentifier);
     }
 
-    Ok(())
+    match parse_public_identifier(trimmed) {
+        Ok(parsed) => Ok(Some(parsed.canonical)),
+        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
+            Ok(Some(sanitize_username(trimmed)))
+        }
+        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_public_identifier_for_public_route(
+    identifier: &str,
+) -> Result<Option<PublicIdentifierIntent>, IdentifierError> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return Err(IdentifierError::EmptyIdentifier);
+    }
+
+    match parse_public_identifier(trimmed) {
+        Ok(parsed) => {
+            let wallet = parsed.wallet.map(wallet_modifier_to_kind);
+            let callback_identifier = match parsed.wallet {
+                Some(WalletModifier::Btc) => format!("{}+btc", parsed.canonical),
+                Some(WalletModifier::Usd) => format!("{}+usd", parsed.canonical),
+                None => parsed.canonical.clone(),
+            };
+            Ok(Some(PublicIdentifierIntent {
+                canonical: parsed.canonical,
+                wallet,
+                callback_identifier,
+            }))
+        }
+        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
+            Ok(Some(PublicIdentifierIntent {
+                canonical: sanitize_username(trimmed),
+                wallet: None,
+                callback_identifier: sanitize_username(trimmed),
+            }))
+        }
+        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+const fn wallet_modifier_to_kind(modifier: WalletModifier) -> WalletKind {
+    match modifier {
+        WalletModifier::Btc => WalletKind::Btc,
+        WalletModifier::Usd => WalletKind::Usd,
+    }
+}
+
+async fn resolve_public_recipient<DB>(
+    state: &State<DB>,
+    domain: &str,
+    intent: PublicIdentifierIntent,
+) -> Result<Option<PublicRecipient>, (StatusCode, Json<Value>)>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    let recipient = state
+        .db
+        .resolve_recipient_by_identifier(domain, &intent.canonical)
+        .await
+        .map_err(|e| {
+            error!("failed to execute query: {}", e);
+            lnurl_error("internal server error")
+        })?;
+
+    Ok(recipient.map(|recipient| PublicRecipient {
+        recipient,
+        wallet: intent.wallet,
+        callback_identifier: intent.callback_identifier,
+    }))
+}
+
+fn is_legacy_spark_lookup_candidate(identifier: &str) -> bool {
+    !is_phone_like_public_identifier(identifier)
+        && !identifier.char_indices().skip(1).any(|(_, ch)| ch == '+')
+}
+
+fn is_phone_like_public_identifier(identifier: &str) -> bool {
+    identifier.starts_with('+')
+        || identifier.starts_with("00")
+        || identifier.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn validate_description(description: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -1446,12 +2124,182 @@ fn parse_pubkey(pubkey: &str) -> Result<PublicKey, (StatusCode, Json<Value>)> {
     Ok(pubkey)
 }
 
+#[cfg(test)]
 fn get_metadata(domain: &str, user: &User) -> String {
     json!(vec![
         vec!["text/plain", &user.description],
         vec!["text/identifier", &format!("{}@{}", user.name, domain)],
     ])
     .to_string()
+}
+
+fn get_metadata_for_recipient(recipient: &ResolvedRecipient, requested_identifier: &str) -> String {
+    json!(vec![
+        vec!["text/plain", &recipient.description],
+        vec![
+            "text/identifier",
+            &format!("{}@{}", requested_identifier, recipient.domain),
+        ],
+    ])
+    .to_string()
+}
+
+fn callback_expiry_for_provider(
+    provider: AccountProvider,
+    requested_wallet: Option<WalletKind>,
+    default_wallet: Option<WalletKind>,
+    expiry_secs: Option<u32>,
+) -> Result<Option<u32>, (StatusCode, Json<Value>)> {
+    if provider != AccountProvider::Blink {
+        return Ok(expiry_secs);
+    }
+
+    let Some(seconds) = expiry_secs else {
+        return Ok(None);
+    };
+    let Some(wallet) = requested_wallet.or(default_wallet) else {
+        error!("Blink callback has no selected or default wallet for expiry policy");
+        return Err(lnurl_error("internal server error"));
+    };
+
+    let limit = match wallet {
+        WalletKind::Btc => BLINK_BTC_EXPIRY_LIMIT_SECS,
+        WalletKind::Usd => BLINK_USD_EXPIRY_LIMIT_SECS,
+    };
+    if seconds > limit {
+        trace!("Blink {wallet:?} callback expiry {seconds}s exceeds limit {limit}s");
+        return Err(lnurl_error("expiry too long"));
+    }
+
+    Ok(Some(seconds.div_ceil(60)))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
+    error!("failed to execute query: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(Value::String("internal server error".into())),
+    )
+}
+
+fn spark_transfer_error(error: LnurlRepositoryError, username: &str) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner => {
+            trace!("transfer source pubkey does not own username '{username}'");
+            (
+                StatusCode::NOT_FOUND,
+                Json(Value::String(
+                    "source pubkey does not own this username".into(),
+                )),
+            )
+        }
+        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
+            trace!("name already taken during transfer: {username}");
+            (
+                StatusCode::CONFLICT,
+                Json(Value::String("name already taken".into())),
+            )
+        }
+        LnurlRepositoryError::General(err) => {
+            error!("failed to execute transfer query: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Value::String("internal server error".into())),
+            )
+        }
+        LnurlRepositoryError::BlinkAccountExists
+        | LnurlRepositoryError::AccountNotFound
+        | LnurlRepositoryError::InvalidOwnership
+        | LnurlRepositoryError::InvalidProvider
+        | LnurlRepositoryError::InvalidIdentifierKind => {
+            error!("unexpected provider-neutral transfer error: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Value::String("internal server error".into())),
+            )
+        }
+    }
+}
+
+fn spark_unregister_error(
+    error: LnurlRepositoryError,
+    username: &str,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner => {
+            trace!("unregister pubkey does not own username '{username}'");
+            (StatusCode::NOT_FOUND, Json(Value::String(String::new())))
+        }
+        error => storage_error(error),
+    }
+}
+
+fn spark_registration_error(
+    error: LnurlRepositoryError,
+    username: &str,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
+            trace!("name already taken: {username}");
+            (
+                StatusCode::CONFLICT,
+                Json(Value::String("name already taken".into())),
+            )
+        }
+        error => storage_error(error),
+    }
+}
+
+fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>) {
+    match error {
+        ProviderError::UnsupportedWallet { provider, wallet } => {
+            trace!("unsupported wallet {wallet:?} for provider {provider:?}");
+            lnurl_error("unsupported wallet")
+        }
+        ProviderError::InvoiceCreationFailed(err) => {
+            error!("failed to create lightning invoice: {err}");
+            lnurl_error("invoice creation failed")
+        }
+        ProviderError::BlinkInvoiceCreationFailed(err) => {
+            error!("failed to create Blink lightning invoice: {err}");
+            lnurl_error("invoice creation failed")
+        }
+        ProviderError::UnsupportedProvider(provider) => {
+            error!("unsupported provider for public LNURL invoice: {provider:?}");
+            lnurl_error("internal server error")
+        }
+        ProviderError::MissingSparkPubkey
+        | ProviderError::InvalidSparkPubkey
+        | ProviderError::MissingBlinkDefaultWallet
+        | ProviderError::MissingBlinkBtcWalletId
+        | ProviderError::MissingBlinkUsdWalletId
+        | ProviderError::BlinkPaymentStatusUnavailable(_)
+        | ProviderError::PaymentStatusUnavailable(_) => {
+            error!("invalid provider invoice state: {error}");
+            lnurl_error("internal server error")
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn spark_user_from_recipient(recipient: ResolvedRecipient) -> Result<User, LnurlRepositoryError> {
+    if recipient.provider != AccountProvider::Spark
+        || recipient.identifier_kind != AccountIdentifierKind::Username
+    {
+        return Err(LnurlRepositoryError::InvalidProvider);
+    }
+
+    let Some(pubkey) = recipient.spark_pubkey else {
+        return Err(LnurlRepositoryError::InvalidOwnership);
+    };
+
+    Ok(User {
+        domain: recipient.domain,
+        pubkey,
+        name: recipient.identifier,
+        description: recipient.description,
+    })
 }
 
 fn lnurl_error(message: &str) -> (StatusCode, Json<Value>) {
@@ -1503,14 +2351,21 @@ mod tests {
     use crate::models::ListMetadataMetadata;
     use crate::repository::{Invoice, LnurlRepositoryError, LnurlSenderComment, PendingZapReceipt};
     use crate::user::User;
+    use crate::webhooks::NewWebhookDelivery;
     use crate::webhooks::repository::WebhookRepositoryError;
     use crate::zap::Zap;
+    use axum::Router;
     use axum::body::Bytes;
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::middleware;
+    use axum::routing::{get, post};
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
+    use tower::util::ServiceExt;
 
     // -- Mock repository -------------------------------------------------------
 
@@ -1518,6 +2373,46 @@ mod tests {
     struct MockRepository {
         invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
         pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
+        webhook_deliveries: std::sync::Arc<Mutex<Vec<NewWebhookDelivery>>>,
+        created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
+        create_blink_account_error: std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
+        resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
+        resolve_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockCreateBlinkAccountError {
+        BlinkAccountExists,
+        IdentifierConflict,
+        NameTaken,
+    }
+
+    impl MockRepository {
+        fn fail_next_blink_account_creation(&self, error: MockCreateBlinkAccountError) {
+            *self.create_blink_account_error.lock().unwrap() = Some(error);
+        }
+
+        fn created_blink_account_count(&self) -> usize {
+            self.created_blink_accounts.lock().unwrap().len()
+        }
+
+        fn with_resolved_recipient(self, recipient: ResolvedRecipient) -> Self {
+            *self.resolved_recipient.lock().unwrap() = Some(recipient);
+            self
+        }
+
+        fn resolve_calls(&self) -> Vec<(String, String)> {
+            self.resolve_calls.lock().unwrap().clone()
+        }
+
+        fn blink_to_spark_transfer_count(&self) -> usize {
+            self.blink_to_spark_transfers.lock().unwrap().len()
+        }
+
+        fn blink_to_spark_transfers(&self) -> Vec<BlinkToSparkIdentifierTransfer> {
+            self.blink_to_spark_transfers.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1540,6 +2435,60 @@ mod tests {
             Ok(None)
         }
         async fn upsert_user(&self, _: &User) -> Result<(), LnurlRepositoryError> {
+            Ok(())
+        }
+        async fn resolve_recipient_by_identifier(
+            &self,
+            domain: &str,
+            identifier: &str,
+        ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+            self.resolve_calls
+                .lock()
+                .unwrap()
+                .push((domain.to_string(), identifier.to_string()));
+            Ok(self.resolved_recipient.lock().unwrap().clone())
+        }
+        async fn get_account_by_spark_pubkey(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::repository::Account>, LnurlRepositoryError> {
+            Ok(None)
+        }
+        async fn create_blink_account(
+            &self,
+            account: &NewBlinkAccount,
+        ) -> Result<(), LnurlRepositoryError> {
+            self.created_blink_accounts
+                .lock()
+                .unwrap()
+                .push(account.clone());
+            if let Some(error) = self.create_blink_account_error.lock().unwrap().take() {
+                return match error {
+                    MockCreateBlinkAccountError::BlinkAccountExists => {
+                        Err(LnurlRepositoryError::BlinkAccountExists)
+                    }
+                    MockCreateBlinkAccountError::IdentifierConflict => {
+                        Err(LnurlRepositoryError::IdentifierConflict)
+                    }
+                    MockCreateBlinkAccountError::NameTaken => Err(LnurlRepositoryError::NameTaken),
+                };
+            }
+            Ok(())
+        }
+        async fn transfer_identifier(
+            &self,
+            _: &IdentifierTransfer,
+        ) -> Result<(), LnurlRepositoryError> {
+            Ok(())
+        }
+        async fn transfer_blink_identifier_to_spark(
+            &self,
+            transfer: &BlinkToSparkIdentifierTransfer,
+        ) -> Result<(), LnurlRepositoryError> {
+            self.blink_to_spark_transfers
+                .lock()
+                .unwrap()
+                .push(transfer.clone());
             Ok(())
         }
         async fn transfer_username(
@@ -1681,9 +2630,29 @@ mod tests {
         }
         async fn get_webhook_payloads(
             &self,
-            _: &[String],
+            payment_hashes: &[String],
         ) -> Result<Vec<crate::repository::WebhookPayloadData>, LnurlRepositoryError> {
-            Ok(vec![])
+            let invoices = self.invoices.lock().unwrap();
+            Ok(payment_hashes
+                .iter()
+                .filter_map(|payment_hash| {
+                    let invoice = invoices.get(payment_hash)?;
+                    Some(crate::repository::WebhookPayloadData {
+                        account_id: invoice.account_id.clone(),
+                        payment_hash: invoice.payment_hash.clone(),
+                        user_pubkey: invoice.user_pubkey.clone(),
+                        invoice: invoice.invoice.clone(),
+                        preimage: invoice.preimage.clone()?,
+                        amount_received_sat: invoice.amount_received_sat,
+                        lightning_address: invoice
+                            .domain
+                            .as_ref()
+                            .map(|domain| format!("alice@{domain}")),
+                        sender_comment: Some("verify fallback zap".to_string()),
+                        domain: invoice.domain.clone()?,
+                    })
+                })
+                .collect())
         }
     }
 
@@ -1691,8 +2660,12 @@ mod tests {
     impl crate::webhooks::WebhookRepository for MockRepository {
         async fn insert_webhook_deliveries(
             &self,
-            _: &[crate::webhooks::NewWebhookDelivery],
+            deliveries: &[crate::webhooks::NewWebhookDelivery],
         ) -> Result<(), WebhookRepositoryError> {
+            self.webhook_deliveries
+                .lock()
+                .unwrap()
+                .extend_from_slice(deliveries);
             Ok(())
         }
         async fn take_pending_webhook_deliveries(
@@ -1799,12 +2772,96 @@ mod tests {
         (headers, Bytes::from(body))
     }
 
+    async fn internal_route_test_state(
+        repo: MockRepository,
+        internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+    ) -> State<MockRepository> {
+        internal_route_test_state_with_blink_endpoint(
+            repo,
+            internal_auth,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
+        )
+        .await
+    }
+
+    async fn internal_route_test_state_with_blink_endpoint(
+        repo: MockRepository,
+        internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+        blink_endpoint: &str,
+    ) -> State<MockRepository> {
+        let network = spark_wallet::Network::Regtest;
+        let auth_seed = [7_u8; 32];
+        let spark_config = spark_wallet::SparkWalletConfig::default_config(network);
+        let signer = Arc::new(spark_wallet::DefaultSigner::new(&auth_seed, network).unwrap());
+        let session_store = Arc::new(spark::session_store::InMemorySessionStore::default());
+        let connection_manager: Arc<dyn spark::operator::rpc::ConnectionManager> =
+            Arc::new(spark::operator::rpc::DefaultConnectionManager::new());
+        let service_provider = Arc::new(spark::ssp::ServiceProvider::new(
+            spark_config.service_provider_config.clone(),
+            signer.clone(),
+            session_store.clone(),
+            None,
+        ));
+        let wallet = Arc::new(
+            spark_wallet::SparkWallet::new(
+                spark_config.clone(),
+                signer.clone(),
+                session_store.clone(),
+                Arc::new(spark::tree::InMemoryTreeStore::default()),
+                Arc::new(spark::token::InMemoryTokenOutputStore::default()),
+                Arc::clone(&connection_manager),
+                None,
+                None,
+                None,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let providers = Arc::new(crate::providers::ProviderRegistry::new(
+            Arc::clone(&wallet),
+            blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
+        ));
+        let (invoice_paid_trigger, _rx) = watch::channel(());
+        State {
+            db: repo.clone(),
+            webhook_service: crate::webhooks::WebhookService::new(repo),
+            wallet,
+            providers,
+            internal_auth,
+            scheme: "http".to_string(),
+            min_sendable: 1_000,
+            max_sendable: 4_000_000_000,
+            include_spark_address: false,
+            domains: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            nostr_keys: None,
+            ca_cert: None,
+            crl_url: None,
+            crl: std::collections::HashSet::new(),
+            connection_manager,
+            coordinator: spark_config.operator_pool.get_coordinator().clone(),
+            signer,
+            session_store,
+            service_provider,
+            subscribed_keys: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            invoice_paid_trigger,
+            webhook_secret: TEST_WEBHOOK_SECRET.to_string(),
+        }
+    }
+
     fn setup_repo_with_invoice(preimage_hex: &str, receiver_pubkey: &str) -> MockRepository {
         let repo = MockRepository::default();
         let payment_hash = compute_payment_hash(preimage_hex);
         repo.invoices.lock().unwrap().insert(
             payment_hash.clone(),
             Invoice {
+                account_id: None,
+                provider: None,
+                wallet_kind: None,
+                wallet_id: None,
+                provider_payment_hash: None,
                 payment_hash,
                 user_pubkey: receiver_pubkey.to_string(),
                 invoice: "lnbc1...".to_string(),
@@ -1819,7 +2876,2692 @@ mod tests {
         repo
     }
 
+    fn generate_route_test_invoice(preimage_byte: u8) -> (String, String) {
+        generate_route_test_invoice_with_description_hash(
+            preimage_byte,
+            sha256::Hash::hash("route test invoice".as_bytes()),
+        )
+    }
+
+    fn generate_route_test_invoice_with_description_hash(
+        preimage_byte: u8,
+        description_hash: sha256::Hash,
+    ) -> (String, String) {
+        let preimage = [preimage_byte; 32];
+        let payment_hash = sha256::Hash::hash(&preimage);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&[42_u8; 32]).unwrap();
+        let invoice = lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Regtest)
+            .description_hash(description_hash)
+            .payment_hash(payment_hash)
+            .payment_secret(lightning_invoice::PaymentSecret([0_u8; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(1_000)
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key))
+            .expect("test invoice should build");
+
+        (payment_hash.to_string(), invoice.to_string())
+    }
+
+    async fn start_blink_invoice_mock_server(
+        _bolt11: String,
+        fail: bool,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_route = Arc::clone(&calls);
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/graphql",
+            post(move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls_for_route);
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body.clone());
+                    if fail {
+                        return Json(json!({
+                            "data": {
+                                "lnInvoiceCreateOnBehalfOfRecipient": { "invoice": null, "errors": [{"message": "upstream hidden"}] },
+                                "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": { "invoice": null, "errors": [{"message": "upstream hidden"}] }
+                            }
+                        }));
+                    }
+                    let request_description_hash = body["variables"]["input"]["descriptionHash"]
+                        .as_str()
+                        .and_then(|hash| sha256::Hash::from_str(hash).ok())
+                        .expect("Blink invoice mock requires a description hash");
+                    let call_index = u8::try_from(calls.load(Ordering::SeqCst)).unwrap_or(u8::MAX);
+                    let (_, bolt11) = generate_route_test_invoice_with_description_hash(
+                        100_u8.saturating_add(call_index),
+                        request_description_hash,
+                    );
+                    Json(json!({
+                        "data": {
+                            "lnInvoiceCreateOnBehalfOfRecipient": {
+                                "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_btc_hash" },
+                                "errors": []
+                            },
+                            "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": {
+                                "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_usd_hash" },
+                                "errors": []
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Blink server should serve");
+        });
+        (format!("http://{addr}/graphql"), calls, bodies)
+    }
+
+    async fn start_blink_status_mock_server(
+        status: &'static str,
+        preimage: Option<String>,
+        fail: bool,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_route = Arc::clone(&calls);
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/graphql",
+            post(move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls_for_route);
+                let bodies = Arc::clone(&bodies_for_route);
+                let preimage = preimage.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body.clone());
+                    if fail {
+                        return Json(json!({
+                            "errors": [{"message": "upstream status hidden"}]
+                        }));
+                    }
+                    let payment_hash = body["variables"]["input"]["paymentHash"]
+                        .as_str()
+                        .expect("Blink status mock requires paymentHash")
+                        .to_string();
+                    Json(json!({
+                        "data": {
+                            "lnInvoicePaymentStatusByHash": {
+                                "status": status,
+                                "paymentHash": payment_hash,
+                                "paymentRequest": "lnbc1status",
+                                "paymentPreimage": preimage
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Blink status server should serve");
+        });
+        (format!("http://{addr}/graphql"), calls, bodies)
+    }
+
+    fn route_test_invoice(
+        provider: Option<AccountProvider>,
+        payment_hash: String,
+        invoice: &str,
+        preimage: Option<String>,
+    ) -> Invoice {
+        Invoice {
+            account_id: Some("acct_verify_blink".to_string()),
+            provider,
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("btc_wallet_verify".to_string()),
+            provider_payment_hash: Some(payment_hash.clone()),
+            payment_hash,
+            user_pubkey: String::new(),
+            invoice: invoice.to_string(),
+            preimage,
+            invoice_expiry: i64::MAX,
+            created_at: 0,
+            updated_at: 0,
+            domain: Some("verify.example.com".to_string()),
+            amount_received_sat: None,
+        }
+    }
+
+    async fn call_verify(state: State<MockRepository>, payment_hash: &str) -> Value {
+        let response =
+            LnurlServer::<MockRepository>::verify(Path(payment_hash.to_string()), Extension(state))
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        serde_json::from_slice(&body.expect("verify response body reads"))
+            .expect("verify response body is JSON")
+    }
+
+    async fn get_public_invoice(
+        state: State<MockRepository>,
+        identifier: &str,
+        params: LnurlPayCallbackParams,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        LnurlServer::<MockRepository>::handle_invoice(
+            Host("example.com".to_string()),
+            Path(identifier.to_string()),
+            Query(params),
+            Extension(state),
+        )
+        .await
+    }
+
+    fn assert_lnurl_error(result: Result<Json<Value>, (StatusCode, Json<Value>)>, reason: &str) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected LNURL error {reason}");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], reason);
+    }
+
+    fn internal_test_token() -> String {
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": "blink:accounts:create accounts:read"
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign")
+    }
+
+    fn internal_auth_state() -> Arc<crate::internal_auth::InternalAuthState> {
+        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
+        Arc::new(
+            crate::internal_auth::InternalAuthState::from_jwks_json(
+                jwks,
+                "https://issuer.internal.test".to_string(),
+                "lnurl-server.internal.test".to_string(),
+            )
+            .expect("test JWKS fixture must load"),
+        )
+    }
+
+    async fn internal_account_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_account_app_with_state(state)
+    }
+
+    fn internal_account_app_with_state(state: State<MockRepository>) -> Router {
+        Router::new()
+            .route(
+                "/internal/blink/accounts",
+                post(LnurlServer::<MockRepository>::create_internal_blink_account),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    async fn internal_lookup_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_lookup_app_with_state(state)
+    }
+
+    fn internal_lookup_app_with_state(state: State<MockRepository>) -> Router {
+        Router::new()
+            .route(
+                "/internal/domains/{domain}/identifiers/{identifier}",
+                get(LnurlServer::<MockRepository>::get_internal_identifier),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    fn internal_blink_invoice_paid_app_with_state(state: State<MockRepository>) -> Router {
+        Router::new()
+            .route(
+                "/internal/blink/invoice-paid",
+                post(LnurlServer::<MockRepository>::blink_invoice_paid),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    fn internal_transfer_to_spark_app_with_state(state: State<MockRepository>) -> Router {
+        Router::new()
+            .route(
+                "/internal/identifiers/transfer-to-spark",
+                post(LnurlServer::<MockRepository>::transfer_identifier_to_spark),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state))
+    }
+
+    async fn internal_transfer_to_spark_app(repo: MockRepository) -> Router {
+        let state = internal_route_test_state(repo, Some(internal_auth_state())).await;
+        internal_transfer_to_spark_app_with_state(state)
+    }
+
+    async fn post_internal_transfer_to_spark(
+        app: Router,
+        payload: InternalTransferToSparkRequest,
+        scope: &str,
+    ) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(&payload).expect("request serializes");
+        post_internal_transfer_to_spark_raw(app, body, scope).await
+    }
+
+    async fn post_internal_transfer_to_spark_raw(
+        app: Router,
+        body: impl Into<axum::body::Body>,
+        scope: &str,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/identifiers/transfer-to-spark")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope(scope)),
+            )
+            .header("content-type", "application/json")
+            .body(body.into())
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
+    async fn post_internal_blink_invoice_paid(
+        app: Router,
+        payload: Value,
+        scope: &str,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/invoice-paid")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope(scope)),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
+    fn blink_settlement_payload(event_type: &str, status: &str, payment_hash: &str) -> Value {
+        json!({
+            "eventType": event_type,
+            "transaction": {
+                "status": status,
+                "initiationVia": {
+                    "type": "lightning",
+                    "paymentHash": payment_hash
+                },
+                "settlementVia": {
+                    "type": "SettlementViaLn",
+                    "preImage": TEST_PREIMAGE_HEX
+                }
+            }
+        })
+    }
+
+    fn valid_create_blink_account_payload() -> CreateBlinkAccountRequest {
+        CreateBlinkAccountRequest {
+            domain: "Example.COM".to_string(),
+            blink_account_id: "blink_account_123".to_string(),
+            btc_wallet_id: "btc_wallet_123".to_string(),
+            usd_wallet_id: "usd_wallet_123".to_string(),
+            default_wallet: "usd".to_string(),
+            description: "Blink account".to_string(),
+            identifiers: vec![" Alice_123 ".to_string(), "+573005871212".to_string()],
+        }
+    }
+
+    async fn post_internal_blink_account(
+        app: Router,
+        payload: CreateBlinkAccountRequest,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header("authorization", format!("Bearer {}", internal_test_token()))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
+    async fn get_internal_identifier(
+        app: Router,
+        path: &str,
+        token: String,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("response body is JSON")
+        };
+        (status, body)
+    }
+
+    fn internal_test_token_with_scope(scope: &str) -> String {
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": scope
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign")
+    }
+
+    fn blink_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_blink_lookup".to_string(),
+            provider: AccountProvider::Blink,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Alice Blink account".to_string(),
+            spark_pubkey: None,
+            blink_account_id: Some("blink_account_123".to_string()),
+            btc_wallet_id: Some("btc_wallet_123".to_string()),
+            usd_wallet_id: Some("usd_wallet_123".to_string()),
+            default_wallet: Some(WalletKind::Usd),
+        }
+    }
+
+    fn spark_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_spark_lookup".to_string(),
+            provider: AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "bob".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Bob Spark account".to_string(),
+            spark_pubkey: Some("spark_pubkey_123".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        }
+    }
+
+    fn post_transfer_spark_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_spark_after_transfer".to_string(),
+            provider: AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Alice moved to Spark".to_string(),
+            spark_pubkey: Some("spark_after_transfer_pubkey".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        }
+    }
+
+    fn valid_internal_transfer_to_spark_payload() -> InternalTransferToSparkRequest {
+        InternalTransferToSparkRequest {
+            domain: "Example.COM".to_string(),
+            identifier: " Alice ".to_string(),
+            destination_spark_pubkey:
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
+            description: "Moved to Spark".to_string(),
+        }
+    }
+
     // -- Tests -----------------------------------------------------------------
+
+    fn assert_bad_username(result: Result<(), (StatusCode, Json<Value>)>) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected invalid username error");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String("invalid username".to_string()));
+    }
+
+    #[test]
+    fn create_update_username_validation_uses_blink_rules_after_trim() {
+        assert!(validate_username(&sanitize_username(" Alice_123 ")).is_ok());
+
+        for invalid in ["", "   ", " alice+foo ", " 12345 ", " bc1alice "] {
+            assert_bad_username(validate_username(&sanitize_username(invalid)));
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_keeps_legacy_names_but_blocks_phone_like_fallback() {
+        assert_eq!(
+            public_lookup_username("legacy.name"),
+            Ok(Some("legacy.name".to_string()))
+        );
+
+        for phone_like in ["12345", "3005871212"] {
+            assert_eq!(public_lookup_username(phone_like), Ok(None));
+        }
+        for phone_like in ["573005871212", "+573005871212", "00573005871212"] {
+            assert_eq!(
+                public_lookup_username(phone_like),
+                Ok(Some("+573005871212".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_strips_recognized_modifiers_and_rejects_others() {
+        assert_eq!(
+            public_lookup_username("alice+BTC"),
+            Ok(Some("alice".to_string()))
+        );
+
+        for invalid in ["alice+eur", "alice+btc+usd"] {
+            assert_eq!(
+                public_lookup_username(invalid),
+                Err(crate::identifier::IdentifierError::InvalidModifier)
+            );
+        }
+    }
+
+    #[test]
+    fn public_identifier_rejects_invalid_wallet_modifier_test_01() {
+        let btc = parse_public_identifier_for_public_route("Alice+BTC")
+            .expect("BTC modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(btc.canonical, "alice");
+        assert_eq!(btc.wallet, Some(WalletKind::Btc));
+        assert_eq!(btc.callback_identifier, "alice+btc");
+
+        let usd = parse_public_identifier_for_public_route("alice+Usd")
+            .expect("USD modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(usd.canonical, "alice");
+        assert_eq!(usd.wallet, Some(WalletKind::Usd));
+        assert_eq!(usd.callback_identifier, "alice+usd");
+
+        for invalid in ["alice+eur", "alice+btc+usd", "alice+usd+btc"] {
+            assert!(
+                matches!(
+                    parse_public_identifier_for_public_route(invalid),
+                    Err(IdentifierError::InvalidModifier)
+                ),
+                "invalid wallet modifier must fail before route lookup: {invalid}"
+            );
+        }
+    }
+
+    // -- Spark management account-backed compatibility ------------------------
+
+    fn handler_source(name: &str) -> &'static str {
+        let source = include_str!("routes.rs");
+        let marker = format!("    pub async fn {name}(");
+        let start = source.find(&marker).expect("handler must exist");
+        let rest = &source[start..];
+        let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+        &rest[..next]
+    }
+
+    #[test]
+    fn spark_management_routes_use_provider_neutral_repository_calls() {
+        let register = handler_source("register");
+        assert!(
+            register.contains("upsert_spark_registration"),
+            "register must write through the account-backed Spark registration API"
+        );
+        assert!(
+            !register.contains("upsert_user"),
+            "register must not write exclusively through the legacy user API"
+        );
+
+        let available = handler_source("available");
+        assert!(
+            available.contains("resolve_recipient_by_identifier"),
+            "availability must resolve account-backed identifiers"
+        );
+        assert!(
+            !available.contains("get_user_by_name"),
+            "availability must not rely exclusively on legacy user lookup"
+        );
+
+        let recover = handler_source("recover");
+        assert!(
+            recover.contains("get_account_by_spark_pubkey"),
+            "recover must prove Spark account ownership through provider-neutral lookup"
+        );
+
+        let unregister = handler_source("unregister");
+        assert!(
+            unregister.contains("delete_spark_registration"),
+            "unregister must delete only the active Spark registration"
+        );
+        assert!(
+            unregister.contains("&username"),
+            "unregister must pass the signed canonical username into repository deletion"
+        );
+        assert!(
+            unregister.contains("spark_unregister_error"),
+            "unregister must map not-owned targeted deletion to the public not-found convention"
+        );
+        assert!(
+            !unregister.contains("delete_user"),
+            "unregister must not delete the legacy user row directly from the route"
+        );
+    }
+
+    #[test]
+    fn transfer_route_uses_provider_neutral_identifier_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "transfer must build the provider-neutral IdentifierTransfer DTO"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "transfer must move ownership through the provider-neutral repository API"
+        );
+        assert!(
+            transfer.contains("destination_spark_pubkey"),
+            "transfer must pass the verified destination Spark pubkey to the repository"
+        );
+        assert!(
+            !transfer.contains("get_account_by_spark_pubkey(&to_pubkey)"),
+            "transfer must not require a pre-existing destination Spark account"
+        );
+        assert!(
+            !transfer.contains("transfer_username"),
+            "transfer must not rely exclusively on legacy username transfer"
+        );
+        assert!(
+            transfer.contains("verify_transfer_signature"),
+            "transfer must preserve both Spark signature checks"
+        );
+    }
+
+    #[test]
+    fn spark_transfer_route_contract_still_uses_provider_neutral_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.matches("verify_transfer_signature").count() >= 2,
+            "public Spark transfer must keep both Spark signature verifications"
+        );
+        assert!(
+            transfer.contains("from_pk == to_pk"),
+            "public Spark transfer must keep same source/target pubkey rejection"
+        );
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "public Spark transfer must still construct IdentifierTransfer"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "public Spark transfer must still call transfer_identifier"
+        );
+        assert!(
+            transfer.contains("TransferLnurlPayResponse"),
+            "public Spark transfer response type must stay unchanged"
+        );
+        assert!(
+            !transfer.contains("SCOPE_TRANSFER_WRITE") && !transfer.contains("require_scope"),
+            "public Spark transfer route must not require internal JWT scopes"
+        );
+
+        let internal_transfer = handler_source("transfer_identifier_to_spark");
+        assert!(
+            internal_transfer.contains("SCOPE_TRANSFER_WRITE"),
+            "only the internal Blink-to-Spark transfer route should require transfer:write"
+        );
+        assert!(
+            internal_transfer.contains("AccountProvider::Blink"),
+            "internal transfer must reject non-Blink current owners"
+        );
+    }
+
+    #[test]
+    fn transfer_provider_neutral_conflicts_keep_legacy_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_transfer_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+
+        let (status, Json(body)) =
+            spark_transfer_error(LnurlRepositoryError::SourceNotOwner, "alice");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            Value::String("source pubkey does not own this username".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_response_preserves_account_id_field() {
+        let field_names: Vec<_> = serde_json::to_value(ListMetadataMetadata {
+            payment_hash: "metadata_hash".to_string(),
+            account_id: Some("acct_spark_metadata".to_string()),
+            sender_comment: None,
+            nostr_zap_request: None,
+            nostr_zap_receipt: None,
+            updated_at: 42,
+            preimage: None,
+        })
+        .expect("metadata should serialize")
+        .as_object()
+        .expect("metadata should serialize as object")
+        .keys()
+        .cloned()
+        .collect();
+
+        assert_eq!(
+            field_names,
+            vec![
+                "account_id",
+                "nostr_zap_receipt",
+                "nostr_zap_request",
+                "payment_hash",
+                "preimage",
+                "sender_comment",
+                "updated_at",
+            ]
+        );
+    }
+
+    #[test]
+    fn spark_registration_conflicts_keep_duplicate_name_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_registration_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+    }
+
+    // -- Public LNURL provider-dispatch compatibility -------------------------
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn public_lnurl_discovery_shape_remains_spark_compatible() {
+        let user = User {
+            domain: "localhost:8080".to_string(),
+            pubkey: "02abc123".to_string(),
+            name: "alice".to_string(),
+            description: "Alice wallet".to_string(),
+        };
+        let response = PayResponse {
+            callback: "http://localhost:8080/lnurlp/alice/invoice".to_string(),
+            max_sendable: 1_000_000,
+            min_sendable: 1_000,
+            tag: Tag::Pay,
+            metadata: get_metadata(&user.domain, &user),
+            comment_allowed: Some(MAX_COMMENT_LENGTH as u32),
+            allows_nostr: None,
+            nostr_pubkey: None,
+        };
+
+        let body = serde_json::to_value(response).expect("PayResponse serializes");
+        assert_eq!(body["tag"], "payRequest");
+        assert_eq!(
+            body["callback"],
+            "http://localhost:8080/lnurlp/alice/invoice"
+        );
+        assert_eq!(body["minSendable"], 1_000);
+        assert_eq!(body["maxSendable"], 1_000_000);
+        assert_eq!(body["commentAllowed"], MAX_COMMENT_LENGTH);
+        assert!(body.get("metadata").is_some());
+        assert!(body.get("provider").is_none());
+        assert!(body.get("account_id").is_none());
+    }
+
+    #[test]
+    fn public_invoice_and_verify_shapes_remain_spark_compatible() {
+        let invoice_body = json!({
+            "pr": "lnbc1testinvoice",
+            "routes": Vec::<String>::new(),
+            "verify": "http://localhost:8080/verify/payment_hash",
+        });
+        assert_eq!(invoice_body["pr"], "lnbc1testinvoice");
+        assert_eq!(invoice_body["routes"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            invoice_body["verify"],
+            "http://localhost:8080/verify/payment_hash"
+        );
+        assert!(invoice_body.get("provider").is_none());
+        assert!(invoice_body.get("account_id").is_none());
+
+        let verify_body = json!({
+            "status": "OK",
+            "settled": false,
+            "preimage": Value::Null,
+            "pr": "lnbc1testinvoice",
+        });
+        assert_eq!(verify_body["status"], "OK");
+        assert_eq!(verify_body["settled"], false);
+        assert!(verify_body.get("provider").is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_spark_and_unowned_invoices_remain_local_state_only_setl_01_d_07() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Spark),
+            "spark_verify_hash".to_string(),
+            "lnbc1sparkverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        repo.upsert_invoice(&route_test_invoice(
+            None,
+            "legacy_verify_hash".to_string(),
+            "lnbc1legacyverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let spark_body = call_verify(state.clone(), "spark_verify_hash").await;
+        assert_eq!(spark_body["status"], "OK");
+        assert_eq!(spark_body["settled"], false);
+        assert_eq!(spark_body["preimage"], Value::Null);
+        assert_eq!(spark_body["pr"], "lnbc1sparkverify");
+
+        let legacy_body = call_verify(state, "legacy_verify_hash").await;
+        assert_eq!(legacy_body["status"], "OK");
+        assert_eq!(legacy_body["settled"], true);
+        assert_eq!(legacy_body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(legacy_body["pr"], "lnbc1legacyverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_blink_local_preimage_returns_settled_without_status_setl_02() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            compute_payment_hash(TEST_PREIMAGE_HEX),
+            "lnbc1blinklocalverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &compute_payment_hash(TEST_PREIMAGE_HEX)).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1blinklocalverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn blink_verify_uses_local_preimage_state_test_01() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1test01localverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .expect("local Blink invoice fixture stores");
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1test01localverify");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "local LUD-21 state must avoid Blink status calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_blink_status_preimage_uses_central_side_effects_setl_03_07_08_d_09_d_22() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkfallbackverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1blinkfallbackverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash),
+            "verify fallback must enqueue zap receipts through handle_invoice_paid"
+        );
+        assert_eq!(
+            repo.webhook_deliveries.lock().unwrap().len(),
+            1,
+            "verify fallback must enqueue webhook deliveries through handle_invoice_paid"
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1test01fallbackverify",
+            None,
+        ))
+        .await
+        .expect("unsettled Blink invoice fixture stores");
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1test01fallbackverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .expect("invoice lookup succeeds")
+            .expect("invoice stays stored");
+        assert_eq!(stored.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
+        assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_blink_paid_status_without_preimage_remains_unsettled_setl_03_d_10() {
+        let payment_hash = "blink_paid_without_preimage_hash".to_string();
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinknopreimageverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], false);
+        assert_eq!(body["preimage"], Value::Null);
+        assert_eq!(body["pr"], "lnbc1blinknopreimageverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert!(invoice.preimage.is_none());
+        assert!(
+            !repo
+                .pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_blink_status_error_returns_generic_lnurl_error_d_11() {
+        let payment_hash = "blink_status_error_hash".to_string();
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, true).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkerrorverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], "Internal server error");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn metadata_entries(metadata: &str) -> Vec<(String, String)> {
+        serde_json::from_str::<Vec<(String, String)>>(metadata)
+            .expect("metadata must be a JSON array of string tuples")
+    }
+
+    fn phone_blink_resolved_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            identifier: "+573005871212".to_string(),
+            identifier_kind: AccountIdentifierKind::Phone,
+            description: "Phone Blink account".to_string(),
+            ..blink_resolved_recipient()
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_username_metadata_uses_description_and_requested_identity_lnurl_01_lnurl_02_d_01_d_02_d_19()
+     {
+        // LNURL-01/LNURL-02/D-01/D-02/D-19: public discovery must resolve a
+        // Blink recipient by canonical identifier, expose the requested
+        // Lightning Address identity, and not require Spark-only metadata.
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("Example.COM".to_string()),
+            Path("alice".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(response.callback, "http://example.com/lnurlp/alice/invoice");
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Alice Blink account".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "alice@example.com".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_wallet_alias_preserves_public_identity_but_looks_up_canonical_lnurl_01_lnurl_02_d_03_comp_04()
+     {
+        // LNURL-01/LNURL-02/D-03/COMP-04: virtual +usd aliases influence only
+        // public metadata/callback identity and wallet intent; repository lookup
+        // remains canonical and never persists identifier+usd.
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink alias discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(
+            response.callback,
+            "http://example.com/lnurlp/alice+usd/invoice"
+        );
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Alice Blink account".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "alice+usd@example.com".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_phone_identifier_keeps_requested_phone_identity_lnurl_01_lnurl_02_d_04()
+     {
+        // LNURL-01/LNURL-02/D-04: payer-supplied public phone identifiers are
+        // allowed in metadata identity and must not be masked by description.
+        let repo =
+            MockRepository::default().with_resolved_recipient(phone_blink_resolved_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("573005871212".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink phone discovery should return PayResponse metadata");
+
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "+573005871212".to_string())]
+        );
+        assert_eq!(
+            response.callback,
+            "http://example.com/lnurlp/+573005871212/invoice"
+        );
+        assert_eq!(
+            metadata_entries(&response.metadata),
+            vec![
+                ("text/plain".to_string(), "Phone Blink account".to_string()),
+                (
+                    "text/identifier".to_string(),
+                    "+573005871212@example.com".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_missing_and_invalid_phone_like_identifiers_keep_spark_not_found_shape_d_19()
+     {
+        // D-19: missing/invalid Blink-looking public discovery must not leak
+        // Blink-specific provider, account, phone, or existence details.
+        let missing_repo = MockRepository::default();
+        let missing_state = internal_route_test_state(missing_repo, None).await;
+        let missing = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice".to_string()),
+            Extension(missing_state),
+        )
+        .await;
+
+        let Err((missing_status, Json(missing_body))) = missing else {
+            panic!("missing recipient should keep Spark-compatible not-found shape");
+        };
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_body, Value::String(String::new()));
+
+        let invalid_repo = MockRepository::default();
+        let invalid_state = internal_route_test_state(invalid_repo.clone(), None).await;
+        let invalid = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("12345".to_string()),
+            Extension(invalid_state),
+        )
+        .await;
+
+        let Err((invalid_status, Json(invalid_body))) = invalid else {
+            panic!("invalid phone-like recipient should keep Spark-compatible not-found shape");
+        };
+        assert_eq!(invalid_status, StatusCode::NOT_FOUND);
+        assert_eq!(invalid_body, Value::String(String::new()));
+        assert!(invalid_repo.resolve_calls().is_empty());
+    }
+
+    #[test]
+    fn provider_invoice_metadata_contract_prov_04_lnurl_05_lnurl_06_d_11_d_13_d_15() {
+        // PROV-04/LNURL-05/D-11/D-13/D-15: provider-neutral invoice rows must
+        // carry typed provider/wallet metadata without any raw provider payload.
+        let invoice = Invoice {
+            account_id: Some("acct_spark_provider_metadata".to_string()),
+            provider: Some(AccountProvider::Spark),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: None,
+            provider_payment_hash: None,
+            payment_hash: "provider_invoice_metadata_hash".to_string(),
+            user_pubkey: "spark_provider_metadata_pubkey".to_string(),
+            invoice: "lnbc1providerinvoice".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: 1,
+            updated_at: 2,
+            domain: Some("provider-metadata.example.com".to_string()),
+            amount_received_sat: None,
+        };
+        assert_eq!(invoice.provider, Some(AccountProvider::Spark));
+        assert_eq!(invoice.wallet_kind, Some(WalletKind::Btc));
+        assert!(invoice.wallet_id.is_none());
+        assert!(invoice.provider_payment_hash.is_none());
+        assert_eq!(
+            invoice.account_id.as_deref(),
+            Some("acct_spark_provider_metadata")
+        );
+        assert_eq!(
+            invoice.domain.as_deref(),
+            Some("provider-metadata.example.com")
+        );
+
+        let provider_invoice = crate::providers::ProviderInvoice {
+            bolt11: invoice.invoice.clone(),
+            wallet_kind: WalletKind::Btc,
+            wallet_id: None,
+            provider_payment_hash: None,
+        };
+        assert_eq!(provider_invoice.wallet_kind, WalletKind::Btc);
+
+        // LNURL-06: the public callback success body stays exactly pr/routes/verify.
+        let callback_body = json!({
+            "pr": provider_invoice.bolt11,
+            "routes": Vec::<String>::new(),
+            "verify": "http://provider-metadata.example.com/verify/provider_invoice_metadata_hash",
+        });
+        let keys = callback_body
+            .as_object()
+            .expect("callback body must be an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["pr", "routes", "verify"]);
+    }
+
+    #[test]
+    fn unsupported_spark_usd_maps_to_existing_lnurl_error_shape() {
+        let routes_source = include_str!("routes.rs");
+        assert!(
+            routes_source.contains("fn map_provider_invoice_error"),
+            "routes must own provider error to LNURL JSON mapping"
+        );
+        assert!(
+            routes_source.contains("ProviderError::UnsupportedWallet"),
+            "unsupported wallet errors must be mapped at the route boundary"
+        );
+
+        let (status, Json(body)) = lnurl_error("unsupported wallet");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], "unsupported wallet");
+    }
+
+    #[test]
+    fn public_invoice_handler_source_uses_provider_dispatch_boundary() {
+        let invoice = handler_source("handle_invoice");
+        assert!(
+            invoice.contains("parse_public_identifier"),
+            "callback must parse wallet modifiers before provider dispatch"
+        );
+        assert!(
+            invoice.contains("resolve_public_recipient"),
+            "callback must resolve account-backed recipients through the public lookup helper"
+        );
+        assert!(
+            invoice.contains("provider_for"),
+            "callback must select the provider by resolved recipient provider"
+        );
+        assert!(
+            invoice.contains("create_invoice"),
+            "callback must create invoices through the selected provider"
+        );
+        let direct_wallet_call = ["state", "wallet", "create_lightning_invoice"].join(".");
+        assert!(
+            !invoice.contains(&direct_wallet_call),
+            "callback must not call the Spark wallet directly"
+        );
+
+        let providers_source = include_str!("providers.rs");
+        let provider_runtime_source = providers_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("providers source should have runtime section");
+        assert!(!provider_runtime_source.contains("use axum"));
+        assert!(!provider_runtime_source.contains("serde_json"));
+    }
+
+    #[test]
+    fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
+        // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
+        // alice+usd are public route identities only. Storage and dispatch must
+        // use the resolved canonical recipient/account metadata instead.
+        let invoice = handler_source("handle_invoice");
+        assert!(
+            invoice.contains("public_recipient.callback_identifier"),
+            "callback metadata hashing should preserve requested public identity"
+        );
+        assert!(
+            invoice.contains("Some(&account_id)")
+                && invoice.contains("public_recipient.recipient.provider")
+                && invoice.contains("res.wallet_id.as_deref()"),
+            "invoice persistence must use resolved account/provider/wallet metadata"
+        );
+        assert!(
+            !invoice.contains("identifier+btc")
+                && !invoice.contains("identifier+usd")
+                && !invoice.contains("callback_identifier.clone()"),
+            "virtual aliases must not be persisted as account identifiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_transfer_public_invoice_uses_spark_provider() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+        assert_eq!(
+            public_recipient.recipient.spark_pubkey.as_deref(),
+            Some("spark_after_transfer_pubkey")
+        );
+
+        let (_payment_hash, bolt11) = generate_route_test_invoice(31);
+        let invoice = Bolt11Invoice::from_str(&bolt11).expect("test invoice parses");
+        let payment_hash = invoice.payment_hash().to_string();
+        create_provider_invoice_for_account(
+            &repo,
+            &payment_hash,
+            Some(&public_recipient.recipient.account_id),
+            Some(public_recipient.recipient.provider),
+            Some(WalletKind::Btc),
+            None,
+            None,
+            public_recipient
+                .recipient
+                .spark_pubkey
+                .as_deref()
+                .expect("Spark recipient has pubkey"),
+            &bolt11,
+            i64::MAX,
+            &public_recipient.recipient.domain,
+        )
+        .await
+        .expect("post-transfer Spark invoice should persist");
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("new invoice should be persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Spark));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Btc));
+        assert_eq!(stored.wallet_id, None);
+        assert_eq!(stored.provider_payment_hash, None);
+        assert_eq!(
+            stored.account_id.as_deref(),
+            Some("acct_spark_after_transfer")
+        );
+        assert_eq!(stored.user_pubkey, "spark_after_transfer_pubkey");
+        assert_eq!(stored.domain.as_deref(), Some("example.com"));
+    }
+
+    #[tokio::test]
+    async fn post_transfer_historical_blink_invoice_owner_is_unchanged() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let historical_payment_hash = "historical_blink_before_transfer".to_string();
+        repo.upsert_invoice(&Invoice {
+            account_id: Some("acct_original_blink".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Usd),
+            wallet_id: Some("original_blink_usd_wallet".to_string()),
+            provider_payment_hash: Some("original_blink_provider_hash".to_string()),
+            payment_hash: historical_payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: "lnbc1historicalblink".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: 1,
+            updated_at: 1,
+            domain: Some("example.com".to_string()),
+            amount_received_sat: Some(42),
+        })
+        .await
+        .unwrap();
+
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&historical_payment_hash)
+            .await
+            .unwrap()
+            .expect("historical Blink invoice should remain persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.account_id.as_deref(), Some("acct_original_blink"));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(
+            stored.wallet_id.as_deref(),
+            Some("original_blink_usd_wallet")
+        );
+        assert_eq!(stored.payment_hash, historical_payment_hash);
+        assert_eq!(stored.amount_received_sat, Some(42));
+    }
+
+    #[test]
+    fn blink_provider_source_boundaries_remain_route_and_registry_owned() {
+        let routes_source = include_str!("routes.rs");
+        let route_runtime_source = routes_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("routes source should have runtime section");
+        assert!(
+            !route_runtime_source.contains("blink_client"),
+            "routes must not call Blink GraphQL client directly"
+        );
+        assert!(
+            routes_source.contains("ProviderError::MissingBlinkDefaultWallet")
+                && routes_source.contains("ProviderError::MissingBlinkBtcWalletId")
+                && routes_source.contains("ProviderError::MissingBlinkUsdWalletId")
+                && routes_source.contains("ProviderError::BlinkInvoiceCreationFailed")
+                && routes_source.contains("ProviderError::BlinkPaymentStatusUnavailable"),
+            "route provider-error mapping must cover Blink provider failures"
+        );
+
+        let providers_source = include_str!("providers.rs");
+        assert!(
+            providers_source.contains("AccountProvider::Blink => self.blink.as_ref()"),
+            "registry must dispatch Blink centrally through ProviderRegistry"
+        );
+    }
+
+    #[test]
+    fn phase_6_public_lnurl_error_reason_contract_is_explicit_and_plain() {
+        // D-16/D-17/D-18/D-19: public LNURL error categories must stay stable,
+        // plain, and provider-neutral so Blink internals never leak through
+        // user-correctable or upstream provider failures.
+        assert_eq!(
+            public_lnurl_phase_6_error_reasons(),
+            [
+                "unsupported wallet",
+                "expiry too long",
+                "missing amount",
+                "amount out of range",
+                "comment too long",
+                "invoice creation failed",
+            ]
+        );
+
+        for reason in public_lnurl_phase_6_error_reasons() {
+            let (status, Json(body)) = lnurl_error(reason);
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "ERROR");
+            assert_eq!(body["reason"], reason);
+            assert!(body.get("provider").is_none());
+            assert!(body.get("account_id").is_none());
+        }
+    }
+
+    #[test]
+    fn spark_recipient_adapts_to_legacy_recover_fields() {
+        let recipient = crate::repository::ResolvedRecipient {
+            account_id: "acct_spark_test".to_string(),
+            provider: crate::repository::AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: crate::repository::AccountIdentifierKind::Username,
+            description: "Alice wallet".to_string(),
+            spark_pubkey: Some("spark_pubkey".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        };
+
+        let user = spark_user_from_recipient(recipient).expect("Spark recipient should adapt");
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.domain, "example.com");
+        assert_eq!(user.pubkey, "spark_pubkey");
+        assert_eq!(user.description, "Alice wallet");
+    }
+
+    #[test]
+    fn invoice_callback_writes_account_owned_side_effects() {
+        let invoice_callback = handler_source("handle_invoice");
+        assert!(
+            invoice_callback.contains("account_id"),
+            "invoice callback must carry resolved account ownership into side effects"
+        );
+        assert!(
+            invoice_callback.contains("create_provider_invoice_for_account"),
+            "invoice callback must use provider-aware account invoice construction"
+        );
+        assert!(
+            !invoice_callback.contains("crate::invoice_paid::create_invoice(")
+                && !invoice_callback.contains("invoice_paid::create_invoice("),
+            "migrated invoice callback must not use the legacy account-less helper"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_blink_default_persists_provider_metadata_prov_04_lnurl_05_lnurl_06_d_12_d_15_d_16()
+     {
+        // PROV-04/LNURL-05/LNURL-06/D-12/D-15/D-16: Blink public callbacks must
+        // create invoices through the provider registry, return exactly
+        // pr/routes/verify, and persist provider-neutral metadata without a fake
+        // Spark pubkey.
+        let (_payment_hash, bolt11) = generate_route_test_invoice(11);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server(bolt11.clone(), false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let Json(body) = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("Blink default invoice callback should succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            body.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["pr", "routes", "verify"]
+        );
+        let returned_invoice = Bolt11Invoice::from_str(body["pr"].as_str().unwrap())
+            .expect("mock should return a valid invoice");
+        let payment_hash = returned_invoice.payment_hash().to_string();
+        assert_eq!(
+            body["verify"],
+            format!("http://example.com/verify/{payment_hash}")
+        );
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should be persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(stored.wallet_id.as_deref(), Some("usd_wallet_123"));
+        assert_eq!(
+            stored.provider_payment_hash.as_deref(),
+            Some("provider_usd_hash")
+        );
+        assert_eq!(stored.account_id.as_deref(), Some("acct_blink_lookup"));
+        assert_eq!(stored.domain.as_deref(), Some("example.com"));
+        assert_eq!(stored.payment_hash, payment_hash);
+        assert_ne!(
+            stored.user_pubkey, "spark_pubkey_123",
+            "Blink must not invent a fake Spark pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_blink_wallet_alias_and_expiry_policy_lnurl_04_d_03_d_05_d_06_d_07_d_08_d_09_d_10()
+     {
+        // LNURL-04/D-03/D-05-D-10: +btc/+usd aliases select Blink wallets and
+        // route-owned expiry policy converts public seconds to provider-ready
+        // minutes before dispatch.
+        let (_payment_hash, bolt11) = generate_route_test_invoice(12);
+        let (endpoint, calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+
+        for (identifier, expiry, expected_wallet, expected_expiry) in [
+            ("alice+btc", None, "btc_wallet_123", None),
+            ("alice+btc", Some(60), "btc_wallet_123", Some(1)),
+            ("alice+btc", Some(61), "btc_wallet_123", Some(2)),
+            ("alice+btc", Some(86_400), "btc_wallet_123", Some(1440)),
+            ("alice+usd", Some(300), "usd_wallet_123", Some(5)),
+        ] {
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            let _ = get_public_invoice(
+                state,
+                identifier,
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    expiry,
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await
+            .expect("accepted Blink expiry should create invoice");
+            let body = bodies
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("provider body captured");
+            assert_eq!(
+                body["variables"]["input"]["recipientWalletId"],
+                expected_wallet
+            );
+            match expected_expiry {
+                Some(minutes) => assert_eq!(body["variables"]["input"]["expiresIn"], minutes),
+                None => assert!(body["variables"]["input"].get("expiresIn").is_none()),
+            }
+        }
+
+        for (identifier, expiry) in [("alice+btc", 86_401), ("alice+usd", 301)] {
+            let before = calls.load(Ordering::SeqCst);
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            assert_lnurl_error(
+                get_public_invoice(
+                    state,
+                    identifier,
+                    LnurlPayCallbackParams {
+                        amount: Some(1_000),
+                        expiry: Some(expiry),
+                        ..LnurlPayCallbackParams::default()
+                    },
+                )
+                .await,
+                "expiry too long",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "over-limit expiry must not dispatch provider calls"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_validation_before_dispatch_lnurl_03_comp_04_d_17_d_18() {
+        // LNURL-03/COMP-04/D-17/D-18: route-owned validation must happen before
+        // provider dispatch and public errors must use stable plain phrases.
+        let (_payment_hash, bolt11) = generate_route_test_invoice(13);
+        let (endpoint, calls, _bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+
+        for (params, expected) in [
+            (LnurlPayCallbackParams::default(), "missing amount"),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(0),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "amount out of range",
+            ),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    comment: Some("x".repeat(MAX_COMMENT_LENGTH + 1)),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "comment too long",
+            ),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    nostr: Some("not-json".to_string()),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "nostr zap not supported",
+            ),
+        ] {
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+            let before = calls.load(Ordering::SeqCst);
+            assert_lnurl_error(get_public_invoice(state, "alice", params).await, expected);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "{expected} must happen before provider dispatch"
+            );
+        }
+
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        let before = calls.load(Ordering::SeqCst);
+        assert_lnurl_error(
+            get_public_invoice(
+                state,
+                "alice",
+                LnurlPayCallbackParams {
+                    amount: Some(2_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "internal server error",
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before + 1,
+            "provider amount mismatch is rejected after provider dispatch"
+        );
+
+        let spark_repo =
+            MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let spark_state =
+            internal_route_test_state_with_blink_endpoint(spark_repo, None, &endpoint).await;
+        assert_lnurl_error(
+            get_public_invoice(
+                spark_state,
+                "bob+usd",
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "unsupported wallet",
+        );
+
+        let (failing_endpoint, _failing_calls, _failing_bodies) =
+            start_blink_invoice_mock_server("lnbc1unused".to_string(), true).await;
+        let failing_repo =
+            MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let failing_state =
+            internal_route_test_state_with_blink_endpoint(failing_repo, None, &failing_endpoint)
+                .await;
+        assert_lnurl_error(
+            get_public_invoice(
+                failing_state,
+                "alice",
+                LnurlPayCallbackParams {
+                    amount: Some(1_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            "invoice creation failed",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_internal_blink_account_happy_path_requires_valid_internal_token() {
+        // D-01/D-04/D-08/D-09/D-13/D-14/D-16/D-17/D-19: the internal account
+        // creation happy path is locked to /internal/blink/accounts, a scoped
+        // RS256 JWT, local deterministic JWKS/key fixtures, route-boundary
+        // normalization, and exactly one provider-neutral repository write.
+        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
+        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let auth_state = Arc::new(
+            crate::internal_auth::InternalAuthState::from_jwks_json(
+                jwks,
+                "https://issuer.internal.test".to_string(),
+                "lnurl-server.internal.test".to_string(),
+            )
+            .expect("test JWKS fixture must load"),
+        );
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": "blink:accounts:create accounts:read"
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign");
+
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), Some(auth_state)).await;
+        let app = Router::new()
+            .route(
+                "/internal/blink/accounts",
+                post(LnurlServer::<MockRepository>::create_internal_blink_account),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&CreateBlinkAccountRequest {
+                    domain: "Example.COM".to_string(),
+                    blink_account_id: "blink_account_123".to_string(),
+                    btc_wallet_id: "btc_wallet_123".to_string(),
+                    usd_wallet_id: "usd_wallet_123".to_string(),
+                    default_wallet: "usd".to_string(),
+                    description: "Blink account".to_string(),
+                    identifiers: vec![" Alice_123 ".to_string(), "+573005871212".to_string()],
+                })
+                .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let response: CreateBlinkAccountResponse =
+            serde_json::from_slice(&body).expect("response deserializes");
+        assert_eq!(response.provider, "blink");
+        assert_eq!(response.domain, "example.com");
+        assert_eq!(response.identifiers[0].identifier, "alice_123");
+
+        let created = repo.created_blink_accounts.lock().unwrap();
+        assert_eq!(
+            created.len(),
+            1,
+            "create_blink_account is called exactly once"
+        );
+        let account = &created[0];
+        assert!(
+            account
+                .account_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("acct_blink_"))
+        );
+        assert_eq!(account.blink_account_id, "blink_account_123");
+        assert_eq!(account.default_wallet, WalletKind::Usd);
+        assert_eq!(account.identifiers.len(), 2);
+        assert_eq!(account.identifiers[0].domain, "example.com");
+        assert_eq!(account.identifiers[0].identifier, "alice_123");
+        assert_eq!(
+            account.identifiers[0].identifier_kind,
+            AccountIdentifierKind::Username
+        );
+        assert_eq!(account.identifiers[0].description, "Blink account");
+        assert_eq!(account.identifiers[1].identifier, "+573005871212");
+        assert_eq!(
+            account.identifiers[1].identifier_kind,
+            AccountIdentifierKind::Phone
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_missing_identifiers_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers.clear();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_default_wallet_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.default_wallet = "eur".to_string();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_identifier_without_repository_write()
+    {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["not valid".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_identifier"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_wallet_modifier_without_repository_write() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["alice+btc".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "wallet_modifier_not_allowed"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_duplicate_normalized_identifier_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["Alice_123".to_string(), " alice_123 ".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_duplicate_blink_account_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::BlinkAccountExists);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "blink_account_exists"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_identifier_conflict_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::IdentifierConflict);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_name_taken_fallback_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::NameTaken);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_fails_closed_when_internal_auth_config_is_absent() {
+        // D-03/D-07/D-27: absent configured internal auth state returns 401 before handler writes.
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let app = internal_account_app_with_state(state);
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, Value::Null);
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_requires_create_scope_before_repository_write() {
+        // D-09/D-10: valid internal JWTs without the route scope receive 403.
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope("accounts:read")),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&valid_create_blink_account_payload())
+                    .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body: Value = serde_json::from_slice(&body).expect("response body is JSON");
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_supplied_preimage_uses_internal_auth_and_central_side_effects() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinknativewebhook",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(
+            repo.clone(),
+            Some(internal_auth_state()),
+            &endpoint,
+        )
+        .await;
+        let app = internal_blink_invoice_paid_app_with_state(state);
+
+        let (status, body) = post_internal_blink_invoice_paid(
+            app,
+            blink_settlement_payload("receive.lightning", "success", &payment_hash),
+            crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+        )
+        .await;
+
+        assert!(status.is_success());
+        assert_eq!(body, Value::Null);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
+        assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_ignored_events_return_success_without_side_effects() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        for payload in [
+            blink_settlement_payload("send.lightning", "success", &payment_hash),
+            blink_settlement_payload("receive.lightning", "pending", &payment_hash),
+        ] {
+            let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+            let repo = MockRepository::default();
+            repo.upsert_invoice(&route_test_invoice(
+                Some(AccountProvider::Blink),
+                payment_hash.clone(),
+                "lnbc1ignoredblinknativewebhook",
+                None,
+            ))
+            .await
+            .unwrap();
+            let state = internal_route_test_state_with_blink_endpoint(
+                repo.clone(),
+                Some(internal_auth_state()),
+                &endpoint,
+            )
+            .await;
+            let app = internal_blink_invoice_paid_app_with_state(state);
+
+            let (status, body) = post_internal_blink_invoice_paid(
+                app,
+                payload,
+                crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+            )
+            .await;
+
+            assert!(status.is_success());
+            assert_eq!(body, Value::Null);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let invoice = repo
+                .get_invoice_by_payment_hash(&payment_hash)
+                .await
+                .unwrap()
+                .expect("invoice exists");
+            assert!(invoice.preimage.is_none());
+            assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+            assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_without_preimage_uses_blink_status_fallback() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinknativefallback",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(
+            repo.clone(),
+            Some(internal_auth_state()),
+            &endpoint,
+        )
+        .await;
+        let app = internal_blink_invoice_paid_app_with_state(state);
+        let mut payload = blink_settlement_payload("receive.lightning", "success", &payment_hash);
+        payload["transaction"]["settlementVia"] = json!({ "type": "SettlementViaIntraLedger" });
+
+        let (status, body) = post_internal_blink_invoice_paid(
+            app,
+            payload,
+            crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+        )
+        .await;
+
+        assert!(status.is_success());
+        assert_eq!(body, Value::Null);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
+        assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_does_not_settle_non_blink_invoices() {
+        for provider in [Some(AccountProvider::Spark), None] {
+            let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+            let (endpoint, calls, _) =
+                start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                    .await;
+            let repo = MockRepository::default();
+            repo.upsert_invoice(&route_test_invoice(
+                provider,
+                payment_hash.clone(),
+                "lnbc1notblink",
+                None,
+            ))
+            .await
+            .unwrap();
+            let state = internal_route_test_state_with_blink_endpoint(
+                repo.clone(),
+                Some(internal_auth_state()),
+                &endpoint,
+            )
+            .await;
+            let app = internal_blink_invoice_paid_app_with_state(state);
+
+            let (status, body) = post_internal_blink_invoice_paid(
+                app,
+                blink_settlement_payload("receive.lightning", "success", &payment_hash),
+                crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+            )
+            .await;
+
+            assert!(status.is_success());
+            assert_eq!(body, Value::Null);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let invoice = repo
+                .get_invoice_by_payment_hash(&payment_hash)
+                .await
+                .unwrap()
+                .expect("invoice exists");
+            assert!(invoice.preimage.is_none());
+            assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+            assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_rejects_invalid_supplied_preimages_without_retry_status() {
+        for invalid_preimage in ["not-hex", &"00".repeat(32)] {
+            let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+            let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+            let repo = MockRepository::default();
+            repo.upsert_invoice(&route_test_invoice(
+                Some(AccountProvider::Blink),
+                payment_hash.clone(),
+                "lnbc1invalidpreimage",
+                None,
+            ))
+            .await
+            .unwrap();
+            let state = internal_route_test_state_with_blink_endpoint(
+                repo.clone(),
+                Some(internal_auth_state()),
+                &endpoint,
+            )
+            .await;
+            let app = internal_blink_invoice_paid_app_with_state(state);
+            let mut payload =
+                blink_settlement_payload("receive.lightning", "success", &payment_hash);
+            payload["transaction"]["settlementVia"]["preImage"] = json!(invalid_preimage);
+
+            let (status, body) = post_internal_blink_invoice_paid(
+                app,
+                payload,
+                crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let invoice = repo
+                .get_invoice_by_payment_hash(&payment_hash)
+                .await
+                .unwrap()
+                .expect("invoice exists");
+            assert!(invoice.preimage.is_none());
+            assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+            assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_requires_settlement_write_scope() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, _calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkforbidden",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(
+            repo.clone(),
+            Some(internal_auth_state()),
+            &endpoint,
+        )
+        .await;
+        let app = internal_blink_invoice_paid_app_with_state(state);
+
+        let (status, body) = post_internal_blink_invoice_paid(
+            app,
+            blink_settlement_payload("receive.lightning", "success", &payment_hash),
+            "accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert!(invoice.preimage.is_none());
+        assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+        assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_requires_transfer_scope() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "blink:accounts:create accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_route_rejects_invalid_scope_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(
+            repo.resolve_calls().is_empty(),
+            "scope failures must happen before repository lookups"
+        );
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_invalid_destination_pubkey_without_transfer() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+        let mut payload = valid_internal_transfer_to_spark_payload();
+        payload.destination_spark_pubkey = "not-a-pubkey".to_string();
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            payload,
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_missing_scope_rejects_malformed_json_before_parsing() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_transfer_to_spark_raw(app, "{", "blink:accounts:create accounts:read")
+                .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_spark_owned_source() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_route_rejects_invalid_ownership_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(
+            repo.blink_to_spark_transfer_count(),
+            0,
+            "non-Blink owners must not reach transfer side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_moves_blink_identifier_to_spark() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(
+            body["spark_pubkey"],
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        assert_eq!(body["lightning_address"], "alice@example.com");
+        assert_eq!(body["lnurl"], "lnurlp://example.com/lnurlp/alice");
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(repo.blink_to_spark_transfers().len(), 1);
+        let transfer = repo.blink_to_spark_transfers().remove(0);
+        assert_eq!(transfer.domain, "example.com");
+        assert_eq!(transfer.identifier, "alice");
+        assert_eq!(transfer.source_account_id, "acct_blink_lookup");
+        assert_eq!(
+            transfer.destination_spark_pubkey,
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        assert_eq!(transfer.description, "Moved to Spark");
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_blink_parses_btc_modifier_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+btc",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(body["provider"], "blink");
+        assert_eq!(body["account_id"], "acct_blink_lookup");
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["identifier_kind"], "username");
+        assert_eq!(body["description"], "Alice Blink account");
+        assert_eq!(body["requested_wallet"], "btc");
+        assert_eq!(
+            body["provider_details"]["blink_account_id"],
+            "blink_account_123"
+        );
+        assert_eq!(body["provider_details"]["btc_wallet_id"], "btc_wallet_123");
+        assert_eq!(body["provider_details"]["usd_wallet_id"], "usd_wallet_123");
+        assert_eq!(body["provider_details"]["default_wallet"], "usd");
+        assert!(
+            body["provider_details"]
+                .get("spark_pubkey")
+                .is_none_or(Value::is_null)
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_spark_returns_spark_details_and_usd_wallet_intent() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/Example.COM/identifiers/bob+usd",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "bob".to_string())]
+        );
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(body["account_id"], "acct_spark_lookup");
+        assert_eq!(body["requested_wallet"], "usd");
+        assert_eq!(body["provider_details"]["spark_pubkey"], "spark_pubkey_123");
+        assert!(
+            body["provider_details"]
+                .get("blink_account_id")
+                .is_none_or(Value::is_null)
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_requires_accounts_read_scope_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("blink:accounts:create"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_returns_not_found_for_missing_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({"error": "not_found"}));
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_rejects_invalid_domain_and_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (domain_status, domain_body) = get_internal_identifier(
+            app.clone(),
+            "/internal/domains/%20%20/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+        let (identifier_status, identifier_body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+eur",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(domain_status, StatusCode::BAD_REQUEST);
+        assert_eq!(domain_body, json!({"error": "invalid_domain"}));
+        assert_eq!(identifier_status, StatusCode::BAD_REQUEST);
+        assert_eq!(identifier_body, json!({"error": "invalid_identifier"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_rpc_style_identifier_lookup_route_is_not_mounted() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, _body) = get_internal_identifier(
+            app,
+            "/internal/accounts/by-identifier/alice?domain=example.com",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[test]
+    fn internal_identifier_lookup_route_shape_is_locked_to_restful_path() {
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
+        assert!(!main_source.contains("accounts/by-identifier"));
+    }
+
+    #[test]
+    fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
+        // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
+        // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
+        let main_source = include_str!("main.rs");
+        let internal_mount = main_source
+            .find(".nest(\"/internal\", internal_router)")
+            .expect("internal router must be nested separately");
+        let spark_auth = main_source
+            .find("auth::auth::<DB>")
+            .expect("Spark compatibility routes must keep certificate auth");
+        let public_lnurl = main_source
+            .find("/.well-known/lnurlp/{identifier}")
+            .expect("public LNURL route must remain mounted");
+        let internal_auth = main_source
+            .find("internal_auth::internal_auth::<DB>")
+            .expect("internal router must use internal JWT middleware");
+
+        assert!(internal_auth < internal_mount);
+        assert!(internal_mount < spark_auth);
+        assert!(spark_auth < public_lnurl);
+        assert!(main_source.contains("/blink/accounts"));
+        assert!(main_source.contains("/lnurlpay/{pubkey}"));
+        assert!(main_source.contains("/lnurlp/{identifier}"));
+    }
 
     #[tokio::test]
     async fn webhook_valid_payment_marks_invoice_paid() {
@@ -2167,6 +5909,11 @@ mod tests {
         repo.invoices.lock().unwrap().insert(
             payment_hash.clone(),
             Invoice {
+                account_id: None,
+                provider: None,
+                wallet_kind: None,
+                wallet_id: None,
+                provider_payment_hash: None,
                 payment_hash: payment_hash.clone(),
                 user_pubkey: TEST_RECEIVER_PUBKEY.to_string(),
                 invoice: "lnbc1...".to_string(),

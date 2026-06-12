@@ -1,4 +1,4 @@
 services:
   postgres:
     ports:
-      - "5432:5432"
+      - "${LNURL_POSTGRES_PORT:-5432}:5432"

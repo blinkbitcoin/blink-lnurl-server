@@ -1,4 +1,6 @@
-use crate::{repository::LnurlRepository, routes::LnurlServer, state::State};
+use crate::{
+    providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
+};
 use anyhow::anyhow;
 use axum::{
     Extension, Router,
@@ -33,9 +35,12 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 mod auth;
 mod domains;
 mod error;
+mod identifier;
+mod internal_auth;
 mod invoice_paid;
 mod models;
 mod postgresql;
+mod providers;
 mod repository;
 mod routes;
 mod sqlite;
@@ -124,6 +129,26 @@ struct Args {
     /// for audit/debugging before they are cleaned up periodically.
     #[arg(long, default_value = "90")]
     pub webhook_delivery_ttl_days: u32,
+
+    /// Blink public GraphQL endpoint used for Blink provider invoice/status calls.
+    #[arg(long, default_value = "https://api.blink.sv/graphql")]
+    pub blink_graphql_endpoint: String,
+
+    /// URL to fetch Blink Core internal-auth JWKS from at startup.
+    #[arg(long)]
+    pub internal_jwks_url: Option<String>,
+
+    /// Local path to read Blink Core internal-auth JWKS from at startup.
+    #[arg(long)]
+    pub internal_jwks_path: Option<String>,
+
+    /// Expected issuer for Blink Core internal-auth JWTs.
+    #[arg(long)]
+    pub internal_jwt_issuer: Option<String>,
+
+    /// Expected audience for Blink Core internal-auth JWTs.
+    #[arg(long)]
+    pub internal_jwt_audience: Option<String>,
 }
 
 #[tokio::main]
@@ -264,6 +289,8 @@ where
 
     let domains = domains::start(repository.clone()).await?;
 
+    let internal_auth = load_internal_auth_state(&args).await;
+
     let ca_cert = args
         .ca_cert
         .map(|ca_cert_str| {
@@ -346,10 +373,17 @@ where
         );
     }
 
+    let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
+        args.blink_graphql_endpoint.clone(),
+    ));
+    let providers = Arc::new(ProviderRegistry::new(Arc::clone(&wallet), blink_client));
+
     let state = State {
         db: repository,
         webhook_service,
         wallet,
+        providers,
+        internal_auth,
         scheme: args.scheme,
         min_sendable: args.min_sendable,
         max_sendable: args.max_sendable,
@@ -378,7 +412,31 @@ where
         webhook_secret,
     };
 
+    // Mounted below as POST /internal/blink/accounts for Blink Core.
+    let internal_router = Router::new()
+        .route(
+            "/blink/accounts",
+            post(LnurlServer::<DB>::create_internal_blink_account),
+        )
+        .route(
+            "/domains/{domain}/identifiers/{identifier}",
+            get(LnurlServer::<DB>::get_internal_identifier),
+        )
+        .route(
+            "/blink/invoice-paid",
+            post(LnurlServer::<DB>::blink_invoice_paid),
+        )
+        .route(
+            "/identifiers/transfer-to-spark",
+            post(LnurlServer::<DB>::transfer_identifier_to_spark),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            internal_auth::internal_auth::<DB>,
+        ));
+
     let server_router = Router::new()
+        .nest("/internal", internal_router)
         .route(
             "/lnurlpay/available/{identifier}",
             get(LnurlServer::<DB>::available),
@@ -455,6 +513,51 @@ where
     Ok(())
 }
 
+async fn load_internal_auth_state(args: &Args) -> Option<Arc<internal_auth::InternalAuthState>> {
+    let (Some(issuer), Some(audience)) = (
+        args.internal_jwt_issuer.clone(),
+        args.internal_jwt_audience.clone(),
+    ) else {
+        debug!("internal auth issuer/audience not fully configured; /internal fails closed");
+        return None;
+    };
+
+    let jwks_json = if let Some(path) = &args.internal_jwks_path {
+        match std::fs::read_to_string(path) {
+            Ok(jwks) => Some(jwks),
+            Err(e) => {
+                error!("failed to read internal JWKS from {path}: {e}");
+                None
+            }
+        }
+    } else if let Some(url) = &args.internal_jwks_url {
+        match reqwest::Client::new().get(url).send().await {
+            Ok(response) => match response.text().await {
+                Ok(jwks) => Some(jwks),
+                Err(e) => {
+                    error!("failed to read internal JWKS response body from {url}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                error!("failed to fetch internal JWKS from {url}: {e}");
+                None
+            }
+        }
+    } else {
+        debug!("internal auth JWKS source not configured; /internal fails closed");
+        None
+    }?;
+
+    match internal_auth::InternalAuthState::from_jwks_json(&jwks_json, issuer, audience) {
+        Ok(state) => Some(Arc::new(state)),
+        Err(e) => {
+            error!("failed to parse internal JWKS; /internal fails closed: {e}");
+            None
+        }
+    }
+}
+
 fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String, secret: String) {
     tokio::spawn(async move {
         let mut delay = std::time::Duration::from_secs(1);
@@ -484,4 +587,19 @@ fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String,
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blink_graphql_endpoint_default_is_production() {
+        let args = Args::parse_from(["lnurl-server"]);
+
+        assert_eq!(
+            args.blink_graphql_endpoint,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+        );
+    }
 }

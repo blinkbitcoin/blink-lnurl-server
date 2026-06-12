@@ -11,9 +11,8 @@ use crate::webhooks::{NewWebhookDelivery, WebhookRepository, WebhookService};
 #[derive(Debug, Serialize)]
 #[serde(tag = "template", content = "data", rename_all = "snake_case")]
 pub enum WebhookPayload {
-    SparkPaymentReceived {
+    PaymentReceived {
         payment_hash: String,
-        user_pubkey: String,
         invoice: String,
         preimage: String,
         amount_sat: Option<i64>,
@@ -41,9 +40,8 @@ where
     let now = now_millis();
     let mut deliveries = Vec::with_capacity(data.len());
     for item in data {
-        let payload = WebhookPayload::SparkPaymentReceived {
+        let payload = WebhookPayload::PaymentReceived {
             payment_hash: item.payment_hash.clone(),
-            user_pubkey: item.user_pubkey,
             invoice: item.invoice,
             preimage: item.preimage,
             amount_sat: item.amount_received_sat,
@@ -106,7 +104,10 @@ mod test_helpers {
 
 #[cfg(test)]
 mod shared_tests {
-    use crate::repository::{Invoice, LnurlRepository};
+    use crate::repository::{
+        AccountIdentifierKind, AccountProvider, Invoice, LnurlRepository, NewAccountIdentifier,
+        NewBlinkAccount, WalletKind,
+    };
     use crate::time::now_millis;
     use crate::webhooks::{WebhookRepository, WebhookService};
 
@@ -133,6 +134,11 @@ mod shared_tests {
 
         let now = now_millis();
         let invoice = Invoice {
+            account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "enqueue_pubkey".to_string(),
             invoice: invoice_str,
@@ -159,13 +165,181 @@ mod shared_tests {
         assert_eq!(deliveries[0].domain, domain);
 
         let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
-        assert_eq!(payload["template"], "spark_payment_received");
+        assert_eq!(payload["template"], "payment_received");
         let data = &payload["data"];
         assert_eq!(data["payment_hash"], payment_hash);
-        assert_eq!(data["user_pubkey"], "enqueue_pubkey");
         assert_eq!(data["preimage"], preimage_hex);
         assert_eq!(data["lightning_address"], "alice@enqueue-test.example.com");
         assert_eq!(data["amount_sat"], 1000);
+
+        let data_object = data.as_object().expect("payload data must be an object");
+        assert!(!data_object.contains_key("provider"));
+        assert!(!data_object.contains_key("account_id"));
+        assert!(!data_object.contains_key("user_pubkey"));
+    }
+
+    pub async fn provider_neutral_invoice_uses_account_identifier_lightning_address<DB>(db: &DB)
+    where
+        DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let webhook_service = WebhookService::new(db.clone());
+        let preimage_bytes = [13u8; 32];
+        let (preimage_hex, payment_hash, invoice_str) =
+            super::test_helpers::generate_test_invoice(&preimage_bytes);
+
+        let domain = "blink-webhook.example.com";
+        db.add_domain(domain).await.unwrap();
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some("acct_webhook_blink".to_string()),
+            blink_account_id: "blink_webhook_account".to_string(),
+            btc_wallet_id: "blink_webhook_btc".to_string(),
+            usd_wallet_id: "blink_webhook_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: domain.to_string(),
+                identifier: "alice".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "blink alice".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let now = now_millis();
+        db.upsert_invoice(&Invoice {
+            account_id: Some("acct_webhook_blink".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("blink_webhook_btc".to_string()),
+            provider_payment_hash: Some(payment_hash.clone()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: invoice_str,
+            preimage: Some(preimage_hex),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some(domain.to_string()),
+            amount_received_sat: Some(2100),
+        })
+        .await
+        .unwrap();
+
+        let payloads = db
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].lightning_address.as_deref(),
+            Some("alice@blink-webhook.example.com")
+        );
+        assert_eq!(payloads[0].user_pubkey, "");
+
+        crate::webhook_notify::notify_webhooks(
+            db,
+            &webhook_service,
+            std::slice::from_ref(&payment_hash),
+        )
+        .await
+        .unwrap();
+
+        let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
+        assert_eq!(payload["template"], "payment_received");
+        assert_eq!(
+            payload["data"]["lightning_address"],
+            "alice@blink-webhook.example.com"
+        );
+        let data_object = payload["data"]
+            .as_object()
+            .expect("payload data must be an object");
+        assert!(!data_object.contains_key("provider"));
+        assert!(!data_object.contains_key("account_id"));
+        assert!(!data_object.contains_key("user_pubkey"));
+    }
+
+    pub async fn webhook_payload_chooses_one_deterministic_identifier<DB>(db: &DB)
+    where
+        DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let webhook_service = WebhookService::new(db.clone());
+        let preimage_bytes = [14u8; 32];
+        let (preimage_hex, payment_hash, invoice_str) =
+            super::test_helpers::generate_test_invoice(&preimage_bytes);
+
+        let domain = "multi-identifier-webhook.example.com";
+        db.add_domain(domain).await.unwrap();
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some("acct_webhook_multi_identifier".to_string()),
+            blink_account_id: "blink_webhook_multi_identifier".to_string(),
+            btc_wallet_id: "blink_webhook_multi_identifier_btc".to_string(),
+            usd_wallet_id: "blink_webhook_multi_identifier_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: domain.to_string(),
+                    identifier: "+15551234567".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "blink alice phone".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: domain.to_string(),
+                    identifier: "alice".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "blink alice username".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        let now = now_millis();
+        db.upsert_invoice(&Invoice {
+            account_id: Some("acct_webhook_multi_identifier".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("blink_webhook_multi_identifier_btc".to_string()),
+            provider_payment_hash: Some(payment_hash.clone()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: invoice_str,
+            preimage: Some(preimage_hex),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some(domain.to_string()),
+            amount_received_sat: Some(2100),
+        })
+        .await
+        .unwrap();
+
+        let payloads = db
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].lightning_address.as_deref(),
+            Some("alice@multi-identifier-webhook.example.com")
+        );
+
+        crate::webhook_notify::notify_webhooks(
+            db,
+            &webhook_service,
+            std::slice::from_ref(&payment_hash),
+        )
+        .await
+        .unwrap();
+
+        let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
+        assert_eq!(
+            payload["data"]["lightning_address"],
+            "alice@multi-identifier-webhook.example.com"
+        );
     }
 
     pub async fn enqueue_webhooks_skips_invoice_without_domain<DB>(db: &DB)
@@ -179,6 +353,11 @@ mod shared_tests {
 
         let now = now_millis();
         let invoice = Invoice {
+            account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "no_domain_pubkey".to_string(),
             invoice: invoice_str,
@@ -217,6 +396,11 @@ mod shared_tests {
 
         let now = now_millis();
         let invoice = Invoice {
+            account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash: payment_hash.clone(),
             user_pubkey: "idem_pubkey".to_string(),
             invoice: invoice_str,
@@ -268,7 +452,7 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
-    async fn enqueue_webhooks_creates_delivery() {
+    async fn webhook_payload_enqueue_webhooks_creates_delivery() {
         let db = setup_test_db().await;
         shared_tests::enqueue_webhooks_creates_delivery(&db).await;
     }
@@ -283,6 +467,18 @@ mod sqlite_tests {
     async fn enqueue_webhooks_is_idempotent() {
         let db = setup_test_db().await;
         shared_tests::enqueue_webhooks_is_idempotent(&db).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_provider_neutral_invoice_uses_account_identifier_lightning_address() {
+        let db = setup_test_db().await;
+        shared_tests::provider_neutral_invoice_uses_account_identifier_lightning_address(&db).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_chooses_one_deterministic_identifier() {
+        let db = setup_test_db().await;
+        shared_tests::webhook_payload_chooses_one_deterministic_identifier(&db).await;
     }
 }
 
@@ -318,7 +514,7 @@ mod postgres_tests {
     }
 
     #[tokio::test]
-    async fn enqueue_webhooks_creates_delivery() {
+    async fn webhook_payload_enqueue_webhooks_creates_delivery() {
         let Some(db) = setup_test_db().await else {
             return;
         };
@@ -339,5 +535,21 @@ mod postgres_tests {
             return;
         };
         shared_tests::enqueue_webhooks_is_idempotent(&db).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_provider_neutral_invoice_uses_account_identifier_lightning_address() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::provider_neutral_invoice_uses_account_identifier_lightning_address(&db).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_chooses_one_deterministic_identifier() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::webhook_payload_chooses_one_deterministic_identifier(&db).await;
     }
 }
