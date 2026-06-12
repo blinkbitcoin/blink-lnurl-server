@@ -91,7 +91,7 @@ teardown_file() {
 }
 
 @test "blink: settlement webhook with supplied preimage marks invoice paid" {
-  create_blink_account "blinksettlepreimage10" "Blink settlement preimage wallet" "btc" "btc-wallet-paid-fallback" >/dev/null
+  create_blink_account "blinksettlepreimage10" "Blink settlement preimage wallet" "btc" "btc-wallet-paid-fallback-preimage10" >/dev/null
   discovery="$(blink_lnurl_discovery "blinksettlepreimage10")"
   invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
   payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
