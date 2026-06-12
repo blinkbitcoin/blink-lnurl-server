@@ -96,7 +96,7 @@ teardown_file() {
   invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
   payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
 
-  run blink_settlement_notify "$payment_hash" "0909090909090909090909090909090909090909090909090909090909090909"
+  run blink_settlement_notify "$payment_hash" "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
   [ "$status" -eq 0 ]
   [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
 }
