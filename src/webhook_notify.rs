@@ -11,9 +11,8 @@ use crate::webhooks::{NewWebhookDelivery, WebhookRepository, WebhookService};
 #[derive(Debug, Serialize)]
 #[serde(tag = "template", content = "data", rename_all = "snake_case")]
 pub enum WebhookPayload {
-    SparkPaymentReceived {
+    PaymentReceived {
         payment_hash: String,
-        user_pubkey: String,
         invoice: String,
         preimage: String,
         amount_sat: Option<i64>,
@@ -41,9 +40,8 @@ where
     let now = now_millis();
     let mut deliveries = Vec::with_capacity(data.len());
     for item in data {
-        let payload = WebhookPayload::SparkPaymentReceived {
+        let payload = WebhookPayload::PaymentReceived {
             payment_hash: item.payment_hash.clone(),
-            user_pubkey: item.user_pubkey,
             invoice: item.invoice,
             preimage: item.preimage,
             amount_sat: item.amount_received_sat,

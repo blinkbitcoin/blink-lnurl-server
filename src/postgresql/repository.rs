@@ -1287,10 +1287,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let hashes: Vec<&str> = payment_hashes.iter().map(String::as_str).collect();
         let rows = sqlx::query(
             "SELECT i.account_id, i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
+                    ai.identifier, ai.domain,
                     u.name, u.domain,
                     sc.sender_comment,
                     i.domain
              FROM invoices i
+             LEFT JOIN account_identifiers ai ON ai.account_id = i.account_id AND ai.domain = i.domain
              LEFT JOIN users u ON u.pubkey = i.user_pubkey AND u.domain = i.domain
              LEFT JOIN sender_comments sc ON sc.payment_hash = i.payment_hash
              WHERE i.payment_hash = ANY($1)
@@ -1303,10 +1305,19 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let results = rows
             .into_iter()
             .map(|row| {
-                let name: Option<String> = row.try_get(6)?;
-                let user_domain: Option<String> = row.try_get(7)?;
-                let lightning_address = match (name, user_domain) {
-                    (Some(n), Some(d)) => Some(format!("{n}@{d}")),
+                let account_identifier: Option<String> = row.try_get(6)?;
+                let account_identifier_domain: Option<String> = row.try_get(7)?;
+                let user_name: Option<String> = row.try_get(8)?;
+                let user_domain: Option<String> = row.try_get(9)?;
+                let lightning_address = match (
+                    account_identifier,
+                    account_identifier_domain,
+                    user_name,
+                    user_domain,
+                ) {
+                    (Some(n), Some(d), _, _) | (None, None, Some(n), Some(d)) => {
+                        Some(format!("{n}@{d}"))
+                    }
                     _ => None,
                 };
                 Ok::<_, sqlx::Error>(WebhookPayloadData {
@@ -1317,8 +1328,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     preimage: row.try_get(4)?,
                     amount_received_sat: row.try_get(5)?,
                     lightning_address,
-                    sender_comment: row.try_get(8)?,
-                    domain: row.try_get(9)?,
+                    sender_comment: row.try_get(10)?,
+                    domain: row.try_get(11)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
