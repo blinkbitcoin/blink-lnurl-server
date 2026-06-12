@@ -737,6 +737,198 @@ pub mod shared_tests {
         assert_eq!(by_pubkey.account_id, account_id);
     }
 
+    pub async fn spark_compatibility_registration_resolves_provider_neutral_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-15: Spark compatibility registration must remain visible
+        // through provider-neutral recipient lookup and legacy recover lookup.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_compatibility_owner_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "test02-spark.example.com".to_string(),
+                identifier: "sparkcompat".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "Spark compatibility owner".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("test02-spark.example.com", "sparkcompat")
+            .await
+            .unwrap()
+            .expect("Spark registration should resolve provider-neutral owner");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Spark);
+        assert_eq!(recipient.identifier_kind, AccountIdentifierKind::Username);
+        assert_eq!(recipient.description, "Spark compatibility owner");
+        assert_eq!(
+            recipient.spark_pubkey.as_deref(),
+            Some("spark_compatibility_owner_pubkey")
+        );
+        assert!(recipient.blink_account_id.is_none());
+
+        let legacy_user = db
+            .get_user_by_pubkey(
+                "test02-spark.example.com",
+                "spark_compatibility_owner_pubkey",
+            )
+            .await
+            .unwrap()
+            .expect("Spark compatibility recover lookup should still work");
+        assert_eq!(legacy_user.name, "sparkcompat");
+        assert_eq!(legacy_user.description, "Spark compatibility owner");
+    }
+
+    pub async fn blink_account_creation_persists_wallet_fields<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-03: Blink account creation persists provider-neutral
+        // ownership plus BTC/USD/default-wallet fields for a username alias.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_test02_wallet_account".to_string(),
+            btc_wallet_id: "blink_test02_btc_wallet".to_string(),
+            usd_wallet_id: "blink_test02_usd_wallet".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "test02-blink.example.com".to_string(),
+                identifier: "blinkwallet".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "Blink wallet owner".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("test02-blink.example.com", "blinkwallet")
+            .await
+            .unwrap()
+            .expect("Blink username should resolve provider-neutral owner");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Blink);
+        assert_eq!(recipient.identifier_kind, AccountIdentifierKind::Username);
+        assert_eq!(
+            recipient.blink_account_id.as_deref(),
+            Some("blink_test02_wallet_account")
+        );
+        assert_eq!(
+            recipient.btc_wallet_id.as_deref(),
+            Some("blink_test02_btc_wallet")
+        );
+        assert_eq!(
+            recipient.usd_wallet_id.as_deref(),
+            Some("blink_test02_usd_wallet")
+        );
+        assert_eq!(recipient.default_wallet, Some(WalletKind::Usd));
+        assert!(recipient.spark_pubkey.is_none());
+    }
+
+    pub async fn global_identifier_conflict_rejects_cross_provider_duplicate<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/T-09-02-01: the global (domain, identifier) uniqueness
+        // invariant rejects cross-provider duplicate ownership.
+        let identifier = NewAccountIdentifier {
+            domain: "test02-conflict.example.com".to_string(),
+            identifier: "duplicate".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Spark first owner".to_string(),
+        };
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(generate_account_id(AccountProvider::Spark)),
+            pubkey: "spark_test02_conflict_pubkey".to_string(),
+            identifier: identifier.clone(),
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(generate_account_id(AccountProvider::Blink)),
+                blink_account_id: "blink_test02_conflict_account".to_string(),
+                btc_wallet_id: "blink_test02_conflict_btc".to_string(),
+                usd_wallet_id: "blink_test02_conflict_usd".to_string(),
+                default_wallet: WalletKind::Btc,
+                identifiers: vec![identifier],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::IdentifierConflict)
+        ));
+    }
+
+    pub async fn lookup_by_username_and_normalized_phone_matches<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-03: repository lookup accepts the already-normalized E.164
+        // phone identifier produced by the public/internal identifier parser and
+        // returns the same Blink recipient shape as a username alias.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_test02_phone_account".to_string(),
+            btc_wallet_id: "blink_test02_phone_btc".to_string(),
+            usd_wallet_id: "blink_test02_phone_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "test02-phone.example.com".to_string(),
+                    identifier: "phoneuser".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "Blink username alias".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "test02-phone.example.com".to_string(),
+                    identifier: "+573005871212".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "Blink normalized phone alias".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        let username = db
+            .resolve_recipient_by_identifier("test02-phone.example.com", "phoneuser")
+            .await
+            .unwrap()
+            .expect("username alias should resolve");
+        let phone = db
+            .resolve_recipient_by_identifier("test02-phone.example.com", "+573005871212")
+            .await
+            .unwrap()
+            .expect("normalized phone alias should resolve");
+
+        assert_eq!(username.account_id, account_id);
+        assert_eq!(phone.account_id, username.account_id);
+        assert_eq!(phone.provider, AccountProvider::Blink);
+        assert_eq!(phone.identifier_kind, AccountIdentifierKind::Phone);
+        assert_eq!(
+            phone.blink_account_id.as_deref(),
+            username.blink_account_id.as_deref()
+        );
+        assert_eq!(
+            phone.btc_wallet_id.as_deref(),
+            username.btc_wallet_id.as_deref()
+        );
+        assert_eq!(
+            phone.usd_wallet_id.as_deref(),
+            username.usd_wallet_id.as_deref()
+        );
+        assert_eq!(phone.default_wallet, username.default_wallet);
+    }
+
     pub async fn transfer_identifier_requires_source_owner<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -1487,6 +1679,15 @@ pub mod shared_tests {
         assert_eq!(stored_blink.invoice_expiry, blink_invoice.invoice_expiry);
     }
 
+    pub async fn invoice_ownership_fields_round_trip<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/LNURL-05: provide an explicit release-gate test name for the
+        // provider/account/domain/wallet invoice ownership parity assertions.
+        invoice_provider_metadata_round_trips(db).await;
+    }
+
     pub async fn metadata_account_id_round_trips_and_legacy_rows_remain_none<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -1589,6 +1790,119 @@ pub mod shared_tests {
             .find(|item| item.payment_hash == legacy_hash)
             .expect("legacy metadata row should be returned");
         assert!(legacy.account_id.is_none());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn metadata_webhook_join_uses_provider_neutral_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/T-09-02-02: metadata and webhook joins should derive
+        // ownership context from provider-neutral account identifiers while the
+        // external-facing address remains the public lightning address.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_test02_join_account".to_string(),
+            btc_wallet_id: "blink_test02_join_btc".to_string(),
+            usd_wallet_id: "blink_test02_join_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "test02-join.example.com".to_string(),
+                    identifier: "webhookjoin".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "Webhook join owner".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "test02-join.example.com".to_string(),
+                    identifier: "+573005871213".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "Webhook phone owner".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        let now = crate::time::now_millis();
+        let payment_hash = "test02_join_payment_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: Some(account_id.clone()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("blink_test02_join_btc".to_string()),
+            provider_payment_hash: Some("blink_test02_join_provider_hash".to_string()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "legacy_join_pubkey".to_string(),
+            invoice: "lnbc1test02join".to_string(),
+            preimage: Some("test02_join_preimage".to_string()),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some("test02-join.example.com".to_string()),
+            amount_received_sat: Some(42),
+        })
+        .await
+        .unwrap();
+        db.upsert_zap(&Zap {
+            account_id: Some(account_id.clone()),
+            payment_hash: payment_hash.clone(),
+            zap_request: r#"{"kind":9734}"#.to_string(),
+            zap_event: Some(r#"{"kind":9735}"#.to_string()),
+            user_pubkey: "legacy_join_pubkey".to_string(),
+            invoice_expiry: i64::MAX,
+            updated_at: now,
+            is_user_nostr_key: false,
+        })
+        .await
+        .unwrap();
+        db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: Some(account_id.clone()),
+            comment: "join sender comment".to_string(),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "legacy_join_pubkey".to_string(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        let metadata = db
+            .get_metadata_by_pubkey("legacy_join_pubkey", 0, 10, None)
+            .await
+            .unwrap();
+        let item = metadata
+            .iter()
+            .find(|item| item.payment_hash == payment_hash)
+            .expect("metadata join should include the provider-neutral invoice");
+        assert_eq!(item.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(item.sender_comment.as_deref(), Some("join sender comment"));
+
+        let payloads = db
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        let payload = payloads
+            .first()
+            .expect("paid provider-neutral invoice should build webhook payload data");
+        assert_eq!(payload.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(payload.domain, "test02-join.example.com");
+        assert_eq!(payload.payment_hash, payment_hash);
+        assert_eq!(payload.preimage, "test02_join_preimage");
+        assert_eq!(payload.amount_received_sat, Some(42));
+        assert_eq!(
+            payload.lightning_address.as_deref(),
+            Some("webhookjoin@test02-join.example.com")
+        );
+        assert_ne!(
+            payload.lightning_address.as_deref(),
+            payload.account_id.as_deref(),
+            "external lightning address must not be the internal account id"
+        );
+        assert_eq!(
+            payload.sender_comment.as_deref(),
+            Some("join sender comment")
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1780,6 +2094,15 @@ pub mod shared_tests {
         assert_eq!(stayed.account_id, source_account_id);
         assert_eq!(stayed.description, "stays with Blink");
         assert_eq!(stayed.default_wallet, Some(WalletKind::Usd));
+    }
+
+    pub async fn atomic_transfer_preserves_historical_invoice_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/T-09-02-03: expose the atomic transfer/history invariant with
+        // the release-gate artifact name while reusing the detailed shared test.
+        transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner(db).await;
     }
 
     pub async fn create_blink_account_rejects_existing_spark_account_id_with_invalid_provider<DB>(
