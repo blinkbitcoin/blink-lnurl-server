@@ -1216,13 +1216,19 @@ where
     pub async fn transfer_identifier_to_spark(
         Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
         Extension(state): Extension<State<DB>>,
-        Json(payload): Json<InternalTransferToSparkRequest>,
+        body: Bytes,
     ) -> Result<Json<InternalTransferToSparkResponse>, (StatusCode, Json<InternalErrorResponse>)>
     {
         crate::internal_auth::require_scope(
             &principal,
             crate::internal_auth::SCOPE_TRANSFER_WRITE,
         )?;
+
+        let payload: InternalTransferToSparkRequest =
+            serde_json::from_slice(&body).map_err(|e| {
+                trace!("invalid internal transfer request JSON: {e}");
+                internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
+            })?;
 
         let domain = validate_internal_domain(&payload.domain)?;
         let parsed = parse_public_identifier(&payload.identifier).map_err(|e| {
@@ -1240,6 +1246,9 @@ where
         let identifier = parsed.canonical;
         let destination_spark_pubkey =
             validate_internal_required_string(&payload.destination_spark_pubkey)?;
+        let destination_spark_pubkey = parse_pubkey(&destination_spark_pubkey)
+            .map_err(|_| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))?
+            .to_string();
         let description = validate_internal_description(&payload.description)?;
 
         let source_recipient = state
@@ -3388,8 +3397,7 @@ mod tests {
             domain: "Example.COM".to_string(),
             identifier: " Alice ".to_string(),
             destination_spark_pubkey:
-                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-                    .to_string(),
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
             description: "Moved to Spark".to_string(),
         }
     }
@@ -5176,12 +5184,9 @@ mod tests {
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
         let app = internal_transfer_to_spark_app(repo.clone()).await;
 
-        let (status, body) = post_internal_transfer_to_spark_raw(
-            app,
-            "{",
-            "blink:accounts:create accounts:read",
-        )
-        .await;
+        let (status, body) =
+            post_internal_transfer_to_spark_raw(app, "{", "blink:accounts:create accounts:read")
+                .await;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
