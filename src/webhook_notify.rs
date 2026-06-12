@@ -260,6 +260,88 @@ mod shared_tests {
         assert!(!data_object.contains_key("user_pubkey"));
     }
 
+    pub async fn webhook_payload_chooses_one_deterministic_identifier<DB>(db: &DB)
+    where
+        DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let webhook_service = WebhookService::new(db.clone());
+        let preimage_bytes = [14u8; 32];
+        let (preimage_hex, payment_hash, invoice_str) =
+            super::test_helpers::generate_test_invoice(&preimage_bytes);
+
+        let domain = "multi-identifier-webhook.example.com";
+        db.add_domain(domain).await.unwrap();
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some("acct_webhook_multi_identifier".to_string()),
+            blink_account_id: "blink_webhook_multi_identifier".to_string(),
+            btc_wallet_id: "blink_webhook_multi_identifier_btc".to_string(),
+            usd_wallet_id: "blink_webhook_multi_identifier_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: domain.to_string(),
+                    identifier: "+15551234567".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "blink alice phone".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: domain.to_string(),
+                    identifier: "alice".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "blink alice username".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        let now = now_millis();
+        db.upsert_invoice(&Invoice {
+            account_id: Some("acct_webhook_multi_identifier".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("blink_webhook_multi_identifier_btc".to_string()),
+            provider_payment_hash: Some(payment_hash.clone()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: invoice_str,
+            preimage: Some(preimage_hex),
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some(domain.to_string()),
+            amount_received_sat: Some(2100),
+        })
+        .await
+        .unwrap();
+
+        let payloads = db
+            .get_webhook_payloads(std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].lightning_address.as_deref(),
+            Some("alice@multi-identifier-webhook.example.com")
+        );
+
+        crate::webhook_notify::notify_webhooks(
+            db,
+            &webhook_service,
+            std::slice::from_ref(&payment_hash),
+        )
+        .await
+        .unwrap();
+
+        let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&deliveries[0].payload).unwrap();
+        assert_eq!(
+            payload["data"]["lightning_address"],
+            "alice@multi-identifier-webhook.example.com"
+        );
+    }
+
     pub async fn enqueue_webhooks_skips_invoice_without_domain<DB>(db: &DB)
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
@@ -392,6 +474,12 @@ mod sqlite_tests {
         let db = setup_test_db().await;
         shared_tests::provider_neutral_invoice_uses_account_identifier_lightning_address(&db).await;
     }
+
+    #[tokio::test]
+    async fn webhook_payload_chooses_one_deterministic_identifier() {
+        let db = setup_test_db().await;
+        shared_tests::webhook_payload_chooses_one_deterministic_identifier(&db).await;
+    }
 }
 
 // PostgreSQL tests - only run when LNURL_TEST_POSTGRES_URL is set.
@@ -455,5 +543,13 @@ mod postgres_tests {
             return;
         };
         shared_tests::provider_neutral_invoice_uses_account_identifier_lightning_address(&db).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_chooses_one_deterministic_identifier() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::webhook_payload_chooses_one_deterministic_identifier(&db).await;
     }
 }

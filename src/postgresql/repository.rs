@@ -1292,7 +1292,18 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     sc.sender_comment,
                     i.domain
              FROM invoices i
-             LEFT JOIN account_identifiers ai ON ai.account_id = i.account_id AND ai.domain = i.domain
+             LEFT JOIN account_identifiers ai
+               ON ai.account_id = i.account_id
+              AND ai.domain = i.domain
+              AND ai.identifier = (
+                  SELECT ai2.identifier
+                  FROM account_identifiers ai2
+                  WHERE ai2.account_id = i.account_id
+                    AND ai2.domain = i.domain
+                  ORDER BY CASE ai2.identifier_kind WHEN 'username' THEN 0 ELSE 1 END,
+                           ai2.identifier
+                  LIMIT 1
+              )
              LEFT JOIN users u ON u.pubkey = i.user_pubkey AND u.domain = i.domain
              LEFT JOIN sender_comments sc ON sc.payment_hash = i.payment_hash
              WHERE i.payment_hash = ANY($1)
