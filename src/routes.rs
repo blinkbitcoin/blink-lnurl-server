@@ -3454,6 +3454,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_identifier_rejects_invalid_wallet_modifier_test_01() {
+        let btc = parse_public_identifier_for_public_route("Alice+BTC")
+            .expect("BTC modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(btc.canonical, "alice");
+        assert_eq!(btc.wallet, Some(WalletKind::Btc));
+        assert_eq!(btc.callback_identifier, "alice+btc");
+
+        let usd = parse_public_identifier_for_public_route("alice+Usd")
+            .expect("USD modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(usd.canonical, "alice");
+        assert_eq!(usd.wallet, Some(WalletKind::Usd));
+        assert_eq!(usd.callback_identifier, "alice+usd");
+
+        for invalid in ["alice+eur", "alice+btc+usd", "alice+usd+btc"] {
+            assert!(
+                matches!(
+                    parse_public_identifier_for_public_route(invalid),
+                    Err(IdentifierError::InvalidModifier)
+                ),
+                "invalid wallet modifier must fail before route lookup: {invalid}"
+            );
+        }
+    }
+
     // -- Spark management account-backed compatibility ------------------------
 
     fn handler_source(name: &str) -> &'static str {
@@ -3766,6 +3793,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blink_verify_uses_local_preimage_state_test_01() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1test01localverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .expect("local Blink invoice fixture stores");
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1test01localverify");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "local LUD-21 state must avoid Blink status calls"
+        );
+    }
+
+    #[tokio::test]
     async fn verify_blink_status_preimage_uses_central_side_effects_setl_03_07_08_d_09_d_22() {
         let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
         let (endpoint, calls, _) =
@@ -3807,6 +3862,46 @@ mod tests {
             1,
             "verify fallback must enqueue webhook deliveries through handle_invoice_paid"
         );
+    }
+
+    #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1test01fallbackverify",
+            None,
+        ))
+        .await
+        .expect("unsettled Blink invoice fixture stores");
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1test01fallbackverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .expect("invoice lookup succeeds")
+            .expect("invoice stays stored");
+        assert_eq!(stored.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
+        assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5160,6 +5255,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_route_rejects_invalid_scope_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(
+            repo.resolve_calls().is_empty(),
+            "scope failures must happen before repository lookups"
+        );
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
     async fn internal_transfer_to_spark_rejects_invalid_destination_pubkey_without_transfer() {
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
         let app = internal_transfer_to_spark_app(repo.clone()).await;
@@ -5209,6 +5325,27 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
         assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_route_rejects_invalid_ownership_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(
+            repo.blink_to_spark_transfer_count(),
+            0,
+            "non-Blink owners must not reach transfer side effects"
+        );
     }
 
     #[tokio::test]
