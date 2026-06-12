@@ -1801,11 +1801,28 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn invoice_ownership_fields_round_trip() {
+        shared_tests::invoice_ownership_fields_round_trip(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
     async fn metadata_account_id_round_trips_and_legacy_rows_remain_none() {
         shared_tests::metadata_account_id_round_trips_and_legacy_rows_remain_none(
             &setup_test_db().await,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn metadata_webhook_join_uses_provider_neutral_owner() {
+        shared_tests::metadata_webhook_join_uses_provider_neutral_owner(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn atomic_transfer_preserves_historical_invoice_owner() {
+        shared_tests::atomic_transfer_preserves_historical_invoice_owner(&setup_test_db().await)
+            .await;
     }
 
     #[tokio::test]

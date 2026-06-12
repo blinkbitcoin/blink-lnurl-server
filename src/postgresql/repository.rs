@@ -1944,11 +1944,35 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn invoice_ownership_fields_round_trip() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::invoice_ownership_fields_round_trip(&db).await;
+    }
+
+    #[tokio::test]
     async fn metadata_account_id_round_trips_and_legacy_rows_remain_none() {
         let Some((_, db)) = setup_test_db().await else {
             return;
         };
         shared_tests::metadata_account_id_round_trips_and_legacy_rows_remain_none(&db).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_webhook_join_uses_provider_neutral_owner() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::metadata_webhook_join_uses_provider_neutral_owner(&db).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_transfer_preserves_historical_invoice_owner() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::atomic_transfer_preserves_historical_invoice_owner(&db).await;
     }
 
     #[tokio::test]
