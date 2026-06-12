@@ -426,6 +426,10 @@ where
             "/blink/invoice-paid",
             post(LnurlServer::<DB>::blink_invoice_paid),
         )
+        .route(
+            "/identifiers/transfer-to-spark",
+            post(LnurlServer::<DB>::transfer_identifier_to_spark),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             internal_auth::internal_auth::<DB>,

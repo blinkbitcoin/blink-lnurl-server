@@ -1215,8 +1215,8 @@ where
 
     pub async fn transfer_identifier_to_spark(
         Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
-        Extension(_state): Extension<State<DB>>,
-        Json(_payload): Json<InternalTransferToSparkRequest>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<InternalTransferToSparkRequest>,
     ) -> Result<Json<InternalTransferToSparkResponse>, (StatusCode, Json<InternalErrorResponse>)>
     {
         crate::internal_auth::require_scope(
@@ -1224,12 +1224,64 @@ where
             crate::internal_auth::SCOPE_TRANSFER_WRITE,
         )?;
 
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(InternalErrorResponse::new(
-                INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
-            )),
-        ))
+        let domain = validate_internal_domain(&payload.domain)?;
+        let parsed = parse_public_identifier(&payload.identifier).map_err(|e| {
+            trace!(
+                "invalid internal transfer identifier '{}': {e:?}",
+                payload.identifier
+            );
+            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
+        })?;
+        if parsed.wallet.is_some() {
+            return Err(internal_bad_request(
+                INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
+            ));
+        }
+        let identifier = parsed.canonical;
+        let destination_spark_pubkey =
+            validate_internal_required_string(&payload.destination_spark_pubkey)?;
+        let description = validate_internal_description(&payload.description)?;
+
+        let source_recipient = state
+            .db
+            .resolve_recipient_by_identifier(&domain, &identifier)
+            .await
+            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
+        let Some(source_recipient) = source_recipient else {
+            return Err(internal_transfer_to_spark_error(
+                LnurlRepositoryError::SourceNotOwner,
+                &domain,
+                &identifier,
+            ));
+        };
+        if source_recipient.provider != AccountProvider::Blink {
+            return Err(internal_transfer_to_spark_error(
+                LnurlRepositoryError::InvalidOwnership,
+                &domain,
+                &identifier,
+            ));
+        }
+
+        state
+            .db
+            .transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+                domain: domain.clone(),
+                identifier: identifier.clone(),
+                source_account_id: source_recipient.account_id,
+                destination_spark_pubkey: destination_spark_pubkey.clone(),
+                description,
+            })
+            .await
+            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
+
+        Ok(Json(InternalTransferToSparkResponse {
+            domain: domain.clone(),
+            identifier: identifier.clone(),
+            provider: AccountProvider::Spark.as_str().to_string(),
+            spark_pubkey: destination_spark_pubkey,
+            lightning_address: format!("{identifier}@{domain}"),
+            lnurl: format!("lnurlp://{domain}/lnurlp/{identifier}"),
+        }))
     }
 
     pub async fn create_internal_blink_account(
@@ -1449,6 +1501,40 @@ fn internal_account_creation_error(
         ),
         error => {
             error!("failed to create internal Blink account: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(InternalErrorResponse::new(
+                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                )),
+            )
+        }
+    }
+}
+
+fn internal_transfer_to_spark_error(
+    error: LnurlRepositoryError,
+    domain: &str,
+    identifier: &str,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    match error {
+        LnurlRepositoryError::SourceNotOwner | LnurlRepositoryError::AccountNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
+        ),
+        LnurlRepositoryError::InvalidOwnership | LnurlRepositoryError::InvalidProvider => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(INTERNAL_ERROR_INVALID_REQUEST)),
+        ),
+        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
+            StatusCode::CONFLICT,
+            Json(InternalErrorResponse::new(
+                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
+            )),
+        ),
+        error => {
+            error!(
+                "failed to transfer internal identifier {identifier}@{domain} to Spark: {error}"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(InternalErrorResponse::new(
