@@ -221,6 +221,7 @@ struct GraphqlPaymentStatus {
     status: Option<String>,
     payment_hash: Option<String>,
     payment_request: Option<String>,
+    payment_preimage: Option<String>,
 }
 
 impl GraphqlPaymentStatus {
@@ -247,7 +248,7 @@ impl GraphqlPaymentStatus {
             settled: state == PaymentStatusState::Paid,
             payment_hash,
             payment_request: self.payment_request,
-            preimage: None,
+            preimage: self.payment_preimage,
             amount_received_sat: None,
         })
     }

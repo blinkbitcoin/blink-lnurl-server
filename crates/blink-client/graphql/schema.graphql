@@ -44,6 +44,7 @@ type LnInvoicePaymentStatus {
   status: LnInvoicePaymentStatusType!
   paymentHash: PaymentHash!
   paymentRequest: String
+  paymentPreimage: String
 }
 
 type GraphQLError {
