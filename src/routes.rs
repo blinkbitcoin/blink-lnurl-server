@@ -45,7 +45,7 @@ use crate::{
     zap::Zap,
 };
 use crate::{
-    providers::{CreateInvoiceRequest, ProviderError},
+    providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError},
     repository::{
         AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
         LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
@@ -948,7 +948,7 @@ where
         Path(payment_hash): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> impl IntoResponse {
-        let invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
+        let mut invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
             Ok(Some(invoice)) => invoice,
             Ok(None) => {
                 return Json(json!({
@@ -964,6 +964,25 @@ where
                 }));
             }
         };
+
+        if invoice.preimage.is_none() && invoice.provider == Some(AccountProvider::Blink) {
+            match settle_blink_invoice_by_payment_hash(&state, &payment_hash, None).await {
+                Ok(Some(preimage)) => {
+                    invoice.preimage = Some(preimage);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                        "Failed to settle Blink invoice during public verify for {}: {}",
+                        payment_hash, e
+                    );
+                    return Json(json!({
+                        "status": "ERROR",
+                        "reason": "Internal server error"
+                    }));
+                }
+            }
+        }
 
         let settled = invoice.preimage.is_some();
         Json(json!({
@@ -1543,6 +1562,62 @@ where
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+enum BlinkSettlementError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    InvoicePaid(#[from] HandleInvoicePaidError),
+}
+
+async fn settle_blink_invoice_by_payment_hash<DB>(
+    state: &State<DB>,
+    payment_hash: &str,
+    supplied_preimage: Option<&str>,
+) -> Result<Option<String>, BlinkSettlementError>
+where
+    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
+{
+    if let Some(preimage) = supplied_preimage {
+        handle_invoice_paid(
+            &state.db,
+            &state.webhook_service,
+            payment_hash,
+            preimage,
+            None,
+            &state.invoice_paid_trigger,
+        )
+        .await?;
+        return Ok(Some(preimage.to_string()));
+    }
+
+    let status = state
+        .providers
+        .provider_for(AccountProvider::Blink)
+        .payment_status(PaymentStatusRequest { payment_hash })
+        .await?;
+
+    if !status.settled {
+        return Ok(None);
+    }
+
+    let Some(preimage) = status.preimage else {
+        return Ok(None);
+    };
+
+    handle_invoice_paid(
+        &state.db,
+        &state.webhook_service,
+        payment_hash,
+        &preimage,
+        status.amount_received_sat,
+        &state.invoice_paid_trigger,
+    )
+    .await?;
+
+    Ok(Some(preimage))
+}
+
 fn validate_nostr_zap_request(
     amount_msat: u64,
     event: &Event,
@@ -2094,8 +2169,8 @@ mod tests {
     use super::*;
     use crate::models::ListMetadataMetadata;
     use crate::repository::{Invoice, LnurlRepositoryError, LnurlSenderComment, PendingZapReceipt};
-    use crate::webhooks::NewWebhookDelivery;
     use crate::user::User;
+    use crate::webhooks::NewWebhookDelivery;
     use crate::webhooks::repository::WebhookRepositoryError;
     use crate::zap::Zap;
     use axum::Router;
@@ -2770,14 +2845,11 @@ mod tests {
     }
 
     async fn call_verify(state: State<MockRepository>, payment_hash: &str) -> Value {
-        let response = LnurlServer::<MockRepository>::verify(
-            Path(payment_hash.to_string()),
-            Extension(state),
-        )
-        .await
-        .into_response();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await;
+        let response =
+            LnurlServer::<MockRepository>::verify(Path(payment_hash.to_string()), Extension(state))
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
         serde_json::from_slice(&body.expect("verify response body reads"))
             .expect("verify response body is JSON")
     }
@@ -3326,7 +3398,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        let state = internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
 
         let body = call_verify(state, &payment_hash).await;
         assert_eq!(body["status"], "OK");
@@ -3367,7 +3440,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        let state = internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
 
         let body = call_verify(state, &payment_hash).await;
         assert_eq!(body["status"], "OK");
@@ -3381,7 +3455,13 @@ mod tests {
             .unwrap()
             .expect("invoice should remain stored");
         assert!(invoice.preimage.is_none());
-        assert!(!repo.pending_zap_receipts.lock().unwrap().contains_key(&payment_hash));
+        assert!(
+            !repo
+                .pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
     }
 
     #[tokio::test]
