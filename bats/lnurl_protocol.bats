@@ -4,6 +4,9 @@ load "helpers/common.bash"
 load "helpers/assertions.bash"
 
 setup_file() {
+  export LNURL_INTERNAL_JWKS_PATH="${ROOT_DIR}/tests/fixtures/internal_auth_jwks.json"
+  export LNURL_INTERNAL_JWT_ISSUER="https://issuer.internal.test"
+  export LNURL_INTERNAL_JWT_AUDIENCE="lnurl-server.internal.test"
   start_stack
 }
 
@@ -13,6 +16,60 @@ teardown_file() {
 
 setup() {
   register_user "alice" "localhost:8080" "Alice test wallet" >/dev/null
+}
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+internal_test_token() {
+  local scope="${1:?scope is required}"
+  local header
+  local claims
+  local signing_input
+  local signature
+
+  header="$(printf '%s' '{"alg":"RS256","kid":"blink-internal-test-key","typ":"JWT"}' | base64url)"
+  claims="$(jq -cn --arg scope "${scope}" '{sub:"blink-core-test-service",iss:"https://issuer.internal.test",aud:"lnurl-server.internal.test",exp:4102444800,nbf:1700000000,scope:$scope}' | base64url)"
+  signing_input="${header}.${claims}"
+  signature="$(printf '%s' "${signing_input}" | openssl dgst -sha256 -sign "${ROOT_DIR}/tests/fixtures/internal_auth_private.pem" -binary | base64url)"
+  printf '%s.%s\n' "${signing_input}" "${signature}"
+}
+
+seed_post_transfer_fixture() {
+  local account_id="${1:?account id is required}"
+  local identifier="${2:?identifier is required}"
+  local historical_hash="${3:?historical payment hash is required}"
+
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('${account_id}', 'blink', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO blink_accounts(account_id, blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet, created_at, updated_at) VALUES ('${account_id}', '${account_id}_blink', '${account_id}_btc_wallet', '${account_id}_usd_wallet', 'btc', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) VALUES ('${account_id}', 'localhost:8080', '${identifier}', 'username', 'Historical Blink wallet', 0, 0) ON CONFLICT (domain, identifier) DO NOTHING; INSERT INTO invoices(payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash) VALUES ('${historical_hash}', 'blink_historical_pubkey', 'lnbc1historical', NULL, 4102444800000, 1, 1, 'localhost:8080', NULL, '${account_id}', 'blink', 'btc', '${account_id}_btc_wallet', '${historical_hash}') ON CONFLICT (payment_hash) DO NOTHING" >/dev/null
+}
+
+internal_transfer_to_spark() {
+  local token="${1:?token is required}"
+  local identifier="${2:?identifier is required}"
+  local destination_pubkey="${3:?destination pubkey is required}"
+
+  curl -sS \
+    --request POST \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --header "Authorization: Bearer ${token}" \
+    --data "{\"domain\":\"localhost:8080\",\"identifier\":\"${identifier}\",\"destination_spark_pubkey\":\"${destination_pubkey}\",\"description\":\"Post-transfer Spark wallet\"}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/identifiers/transfer-to-spark"
+}
+
+invoice_provider_account() {
+  local payment_hash="${1:?payment hash is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT provider || ':' || account_id FROM invoices WHERE payment_hash = '${payment_hash}'"
+}
+
+latest_invoice_provider_account_for_spark_pubkey() {
+  local spark_pubkey="${1:?spark pubkey is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT i.provider || ':' || i.account_id FROM invoices i JOIN spark_accounts s ON s.account_id = i.account_id WHERE i.domain = 'localhost:8080' AND s.pubkey = '${spark_pubkey}' ORDER BY i.created_at DESC LIMIT 1"
 }
 
 @test "lnurl: discovery returns payRequest" {
@@ -39,6 +96,37 @@ setup() {
   assert_json_equals "$output" '.verify | startswith("http://localhost:8080/verify/")' 'true'
   assert_json_equals "$output" '.routes | length' '0'
   assert_json_absent_or_not_contains "$output" '.status' 'ERROR'
+}
+
+@test "lnurl: post-transfer identifier resolves to Spark while historical Blink invoice stays Blink-owned" {
+  historical_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  seed_post_transfer_fixture "acct_blink_lnurl_history" "posttransfer" "${historical_hash}"
+  destination_pubkey="$(json_get "$(auth_payload "posttransfer")" '.to_pubkey')"
+  token="$(internal_test_token "transfer:write")"
+
+  response="$(internal_transfer_to_spark "${token}" "posttransfer" "${destination_pubkey}")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "${code}" = "200" ]
+  assert_json_equals "${body}" '.provider' 'spark'
+
+  run lnurl_discovery "posttransfer" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.tag' 'payRequest'
+  assert_json_equals "$output" '.callback' 'http://localhost:8080/lnurlp/posttransfer/invoice'
+  callback_url="$(json_get "$output" '.callback')"
+
+  run lnurl_callback "$callback_url" "1000"
+  [ "$status" -eq 0 ]
+  assert_json_nonempty "$output" '.pr'
+  assert_json_nonempty "$output" '.verify'
+  assert_json_equals "$output" '.routes | length' '0'
+  assert_json_absent_or_not_contains "$output" '.status' 'ERROR'
+
+  [ "$(invoice_provider_account "${historical_hash}")" = "blink:acct_blink_lnurl_history" ]
+  new_owner="$(latest_invoice_provider_account_for_spark_pubkey "${destination_pubkey}")"
+  [[ "${new_owner}" == spark:* ]]
+  [ "${new_owner}" != "spark:acct_blink_lnurl_history" ]
 }
 
 @test "lnurl: btc wallet modifier preserves Spark discovery and callback happy path (D-13/D-15)" {
