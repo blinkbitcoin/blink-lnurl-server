@@ -777,4 +777,73 @@ mod tests {
         assert_eq!(status.preimage, None);
         assert_eq!(status.amount_received_sat, None);
     }
+
+    #[test]
+    fn blink_invoice_paid_parser_extracts_payment_hash_and_intra_ledger_preimage() {
+        let payload = serde_json::json!({
+            "eventType": "receive.lightning",
+            "transaction": {
+                "status": "success",
+                "initiationVia": {
+                    "type": "lightning",
+                    "paymentHash": "payment_hash_123"
+                },
+                "settlementVia": {
+                    "type": "SettlementViaIntraLedger",
+                    "preImage": "preimage_123"
+                }
+            }
+        });
+
+        let parsed = parse_blink_settlement_notification(&payload)
+            .expect("Blink settlement notification should parse");
+
+        assert!(parsed.should_settle());
+        assert_eq!(parsed.payment_hash(), Some("payment_hash_123"));
+        assert_eq!(parsed.preimage(), Some("preimage_123"));
+    }
+
+    #[test]
+    fn blink_invoice_paid_parser_extracts_lightning_preimage_and_ignores_irrelevant_events() {
+        let lightning_payload = serde_json::json!({
+            "eventType": "receive.lightning",
+            "transaction": {
+                "status": "success",
+                "initiationVia": { "paymentHash": "payment_hash_ln" },
+                "settlementVia": { "type": "SettlementViaLn", "preImage": "preimage_ln" }
+            }
+        });
+
+        let parsed = parse_blink_settlement_notification(&lightning_payload)
+            .expect("Blink LN settlement notification should parse");
+
+        assert!(parsed.should_settle());
+        assert_eq!(parsed.payment_hash(), Some("payment_hash_ln"));
+        assert_eq!(parsed.preimage(), Some("preimage_ln"));
+
+        for payload in [
+            serde_json::json!({
+                "eventType": "send.lightning",
+                "transaction": {
+                    "status": "success",
+                    "initiationVia": { "paymentHash": "ignored_event_hash" },
+                    "settlementVia": { "preImage": "ignored_event_preimage" }
+                }
+            }),
+            serde_json::json!({
+                "eventType": "receive.lightning",
+                "transaction": {
+                    "status": "pending",
+                    "initiationVia": { "paymentHash": "ignored_status_hash" },
+                    "settlementVia": { "preImage": "ignored_status_preimage" }
+                }
+            }),
+        ] {
+            let parsed = parse_blink_settlement_notification(&payload)
+                .expect("ignored Blink notification should parse");
+            assert!(!parsed.should_settle());
+            assert_eq!(parsed.payment_hash(), None);
+            assert_eq!(parsed.preimage(), None);
+        }
+    }
 }
