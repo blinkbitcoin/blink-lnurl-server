@@ -1185,6 +1185,19 @@ where
         settle_blink_invoice_by_payment_hash(&state, payment_hash, parsed.preimage())
             .await
             .map_err(|e| {
+                if matches!(
+                    e,
+                    BlinkSettlementError::InvoicePaid(
+                        HandleInvoicePaidError::InvalidInvoice(_)
+                            | HandleInvoicePaidError::InvalidPreimage(_)
+                    )
+                ) {
+                    trace!(
+                        "invalid Blink invoice notification for {}: {}",
+                        payment_hash, e
+                    );
+                    return internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST);
+                }
                 error!(
                     "failed to settle Blink invoice notification for {}: {}",
                     payment_hash, e
@@ -4667,6 +4680,52 @@ mod tests {
 
             assert!(status.is_success());
             assert_eq!(body, Value::Null);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let invoice = repo
+                .get_invoice_by_payment_hash(&payment_hash)
+                .await
+                .unwrap()
+                .expect("invoice exists");
+            assert!(invoice.preimage.is_none());
+            assert!(repo.pending_zap_receipts.lock().unwrap().is_empty());
+            assert!(repo.webhook_deliveries.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn blink_invoice_paid_rejects_invalid_supplied_preimages_without_retry_status() {
+        for invalid_preimage in ["not-hex", &"00".repeat(32)] {
+            let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+            let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+            let repo = MockRepository::default();
+            repo.upsert_invoice(&route_test_invoice(
+                Some(AccountProvider::Blink),
+                payment_hash.clone(),
+                "lnbc1invalidpreimage",
+                None,
+            ))
+            .await
+            .unwrap();
+            let state = internal_route_test_state_with_blink_endpoint(
+                repo.clone(),
+                Some(internal_auth_state()),
+                &endpoint,
+            )
+            .await;
+            let app = internal_blink_invoice_paid_app_with_state(state);
+            let mut payload =
+                blink_settlement_payload("receive.lightning", "success", &payment_hash);
+            payload["transaction"]["settlementVia"]["preImage"] = json!(invalid_preimage);
+
+            let (status, body) = post_internal_blink_invoice_paid(
+                app,
+                payload,
+                crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             let invoice = repo
                 .get_invoice_by_payment_hash(&payment_hash)
