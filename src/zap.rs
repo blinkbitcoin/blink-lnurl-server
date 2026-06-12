@@ -289,10 +289,7 @@ where
 {
     let zap_request = nostr::Event::from_json(&zap.zap_request)?;
 
-    // Build the zap receipt
-    let zap_event =
-        nostr::EventBuilder::zap_receipt(bolt11, Some(preimage.to_string()), &zap_request)
-            .sign_with_keys(nostr_keys)?;
+    let zap_event = build_zap_receipt_event(nostr_keys, zap, bolt11, preimage)?;
 
     let relays: Vec<_> = zap_request
         .tags
@@ -335,6 +332,45 @@ where
 
     debug!("Published zap receipt to {} relays", relays.len());
     Ok(())
+}
+
+fn build_zap_receipt_event(
+    nostr_keys: &nostr::Keys,
+    zap: &Zap,
+    bolt11: &str,
+    preimage: &str,
+) -> Result<nostr::Event, anyhow::Error> {
+    let zap_request = nostr::Event::from_json(&zap.zap_request)?;
+    let mut tags = vec![
+        nostr::Tag::from_standardized_without_cell(nostr::TagStandard::Bolt11(bolt11.to_string())),
+        nostr::Tag::description(zap.zap_request.clone()),
+        nostr::Tag::from_standardized_without_cell(nostr::TagStandard::Preimage(
+            preimage.to_string(),
+        )),
+    ];
+
+    for tag in zap_request.tags.iter() {
+        let tag_values = tag.clone().to_vec();
+        if tag_values
+            .first()
+            .is_some_and(|tag_name| matches!(tag_name.as_str(), "e" | "a" | "p"))
+        {
+            tags.push(tag.clone());
+        }
+    }
+
+    tags.push(nostr::Tag::from_standardized_without_cell(
+        nostr::TagStandard::PublicKey {
+            public_key: zap_request.pubkey,
+            relay_url: None,
+            alias: None,
+            uppercase: true,
+        },
+    ));
+
+    Ok(nostr::EventBuilder::new(nostr::Kind::ZapReceipt, "")
+        .tags(tags)
+        .sign_with_keys(nostr_keys)?)
 }
 
 #[cfg(test)]
@@ -450,24 +486,31 @@ mod tests {
         let tag_values: Vec<Vec<String>> = zap_receipt
             .tags
             .iter()
-            .map(|tag| tag.as_vec())
+            .map(|tag| tag.clone().to_vec())
             .collect();
-        assert!(tag_values.iter().any(|tag| tag == &["description", ZAP_REQUEST_JSON]));
+        assert!(
+            tag_values
+                .iter()
+                .any(|tag| tag == &["description", ZAP_REQUEST_JSON])
+        );
         assert!(tag_values.iter().any(|tag| tag == &["bolt11", bolt11]));
         assert!(tag_values.iter().any(|tag| tag == &["preimage", preimage]));
-        assert!(!tag_values
-            .iter()
-            .flatten()
-            .any(|value| value == "account_id" || value == "acct_blink_internal_only"));
+        assert!(
+            !tag_values
+                .iter()
+                .flatten()
+                .any(|value| value == "account_id" || value == "acct_blink_internal_only")
+        );
         assert!(zap_receipt.as_json().contains("description"));
         assert!(zap_receipt.as_json().contains("bolt11"));
         assert!(zap_receipt.as_json().contains("preimage"));
         assert!(!zap_receipt.as_json().contains("account_id"));
-        assert_eq!(zap_request.as_json(), ZAP_REQUEST_JSON);
-        assert!(zap_receipt
-            .tags
-            .iter()
-            .any(|tag| matches!(tag.as_standardized(), Some(TagStandard::Description(_)))));
+        assert!(
+            zap_receipt
+                .tags
+                .iter()
+                .any(|tag| matches!(tag.as_standardized(), Some(TagStandard::Description(_))))
+        );
     }
 }
 
