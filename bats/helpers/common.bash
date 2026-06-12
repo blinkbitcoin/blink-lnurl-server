@@ -5,6 +5,7 @@ STATE_DIR="${ROOT_DIR}/.tmp/e2e"
 PID_FILE="${STATE_DIR}/server.pid"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 E2E_AUTH_BIN="${E2E_AUTH_BIN:-${ROOT_DIR}/target/debug/e2e_auth}"
+E2E_ZAP_REQUEST_BIN="${E2E_ZAP_REQUEST_BIN:-${ROOT_DIR}/target/debug/e2e_zap_request}"
 BLINK_GRAPHQL_MOCK_BIN="${BLINK_GRAPHQL_MOCK_BIN:-${ROOT_DIR}/target/debug/blink_graphql_mock}"
 BLINK_GRAPHQL_MOCK_PID_FILE="${STATE_DIR}/blink-graphql-mock.pid"
 BLINK_GRAPHQL_MOCK_LOG_FILE="${STATE_DIR}/blink-graphql-mock.log"
@@ -105,6 +106,19 @@ auth_pubkey() {
   json_get "${auth}" '.pubkey'
 }
 
+zap_request_for_discovery() {
+  local discovery_json="${1:?discovery JSON is required}"
+  local amount_msats="${2:?amount msats is required}"
+  local nostr_pubkey
+  nostr_pubkey="$(json_get "${discovery_json}" '.nostrPubkey')"
+
+  if [ -x "${E2E_ZAP_REQUEST_BIN}" ] && [ "${E2E_ZAP_REQUEST_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_zap_request.rs" ]; then
+    "${E2E_ZAP_REQUEST_BIN}" "${nostr_pubkey}" "${amount_msats}"
+  else
+    cargo run --quiet --locked --bin e2e_zap_request -- "${nostr_pubkey}" "${amount_msats}"
+  fi
+}
+
 base64url() {
   openssl base64 -A | tr '+/' '-_' | tr -d '='
 }
@@ -200,25 +214,29 @@ transfer_blink_identifier_to_spark() {
 identifier_owner_provider() {
   local identifier="${1:?identifier is required}"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
-    -c "SELECT a.provider FROM account_identifiers ai JOIN accounts a ON a.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = '${identifier}'"
+    -v identifier="${identifier}" \
+    -c "SELECT a.provider FROM account_identifiers ai JOIN accounts a ON a.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = :'identifier'"
 }
 
 invoice_account_provider() {
   local payment_hash="${1:?payment hash is required}"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
-    -c "SELECT provider FROM invoices WHERE payment_hash = '${payment_hash}'"
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT provider FROM invoices WHERE payment_hash = :'payment_hash'"
 }
 
 invoice_wallet_kind() {
   local payment_hash="${1:?payment hash is required}"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
-    -c "SELECT wallet_kind FROM invoices WHERE payment_hash = '${payment_hash}'"
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT wallet_kind FROM invoices WHERE payment_hash = :'payment_hash'"
 }
 
 invoice_has_preimage() {
   local payment_hash="${1:?payment hash is required}"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
-    -c "SELECT CASE WHEN preimage IS NULL THEN 'false' ELSE 'true' END FROM invoices WHERE payment_hash = '${payment_hash}'"
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT CASE WHEN preimage IS NULL THEN 'false' ELSE 'true' END FROM invoices WHERE payment_hash = :'payment_hash'"
 }
 
 configure_domain_webhook() {
@@ -226,13 +244,42 @@ configure_domain_webhook() {
   local url="${2:?url is required}"
   local secret="${3:?secret is required}"
   docker compose exec -T postgres psql -U user -d lnurl \
-    -c "INSERT INTO domain_webhooks(domain, url, webhook_secret) VALUES ('${domain}', '${url}', '${secret}') ON CONFLICT (domain) DO UPDATE SET url = EXCLUDED.url, webhook_secret = EXCLUDED.webhook_secret" >/dev/null
+    -v domain="${domain}" \
+    -v url="${url}" \
+    -v secret="${secret}" \
+    -c "INSERT INTO domain_webhooks(domain, url, webhook_secret) VALUES (:'domain', :'url', :'secret') ON CONFLICT (domain) DO UPDATE SET url = EXCLUDED.url, webhook_secret = EXCLUDED.webhook_secret" >/dev/null
 }
 
 webhook_delivery_count() {
+  webhook_delivery_count_for_payment_hash "$@"
+}
+
+zap_side_effect_state() {
   local payment_hash="${1:?payment hash is required}"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
-    -c "SELECT COUNT(*) FROM webhook_deliveries WHERE payload::text LIKE '%${payment_hash}%'"
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT CONCAT(COUNT(*), ':', COALESCE(MAX(CASE WHEN zap_request IS NULL THEN 'missing' ELSE 'present' END), 'missing')) FROM zaps WHERE payment_hash = :'payment_hash'"
+}
+
+pending_zap_receipt_count() {
+  local payment_hash="${1:?payment hash is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT COUNT(*) FROM pending_zap_receipts WHERE payment_hash = :'payment_hash'"
+}
+
+webhook_delivery_count_for_payment_hash() {
+  local payment_hash="${1:?payment hash is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT COUNT(*) FROM webhook_deliveries WHERE identifier = :'payment_hash' OR payload::text LIKE CONCAT('%', :'payment_hash', '%')"
+}
+
+webhook_delivery_payload_for_payment_hash() {
+  local payment_hash="${1:?payment hash is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -v payment_hash="${payment_hash}" \
+    -c "SELECT payload FROM webhook_deliveries WHERE identifier = :'payment_hash' OR payload::text LIKE CONCAT('%', :'payment_hash', '%') ORDER BY id DESC LIMIT 1"
 }
 
 register_user() {
@@ -431,8 +478,11 @@ lnurl_discovery() {
 lnurl_callback() {
   local callback_url="${1:?callback URL is required}"
   local amount_msats="${2:-}"
+  local nostr="${3:-}"
 
-  if [ -n "${amount_msats}" ]; then
+  if [ -n "${amount_msats}" ] && [ -n "${nostr}" ]; then
+    curl -fsS --get --data-urlencode "amount=${amount_msats}" --data-urlencode "nostr=${nostr}" "${callback_url}" | jq -cer '.'
+  elif [ -n "${amount_msats}" ]; then
     curl -fsS --get --data-urlencode "amount=${amount_msats}" "${callback_url}" | jq -cer '.'
   else
     curl -fsS "${callback_url}" | jq -cer '.'
