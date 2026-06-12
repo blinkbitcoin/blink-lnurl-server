@@ -4,11 +4,70 @@ load "helpers/common.bash"
 load "helpers/assertions.bash"
 
 setup_file() {
+  export LNURL_INTERNAL_JWKS_PATH="${ROOT_DIR}/tests/fixtures/internal_auth_jwks.json"
+  export LNURL_INTERNAL_JWT_ISSUER="https://issuer.internal.test"
+  export LNURL_INTERNAL_JWT_AUDIENCE="lnurl-server.internal.test"
   start_stack
 }
 
 teardown_file() {
   stop_stack
+}
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+internal_test_token() {
+  local scope="${1:?scope is required}"
+  local header
+  local claims
+  local signing_input
+  local signature
+
+  header="$(printf '%s' '{"alg":"RS256","kid":"blink-internal-test-key","typ":"JWT"}' | base64url)"
+  claims="$(jq -cn --arg scope "${scope}" '{sub:"blink-core-test-service",iss:"https://issuer.internal.test",aud:"lnurl-server.internal.test",exp:4102444800,nbf:1700000000,scope:$scope}' | base64url)"
+  signing_input="${header}.${claims}"
+  signature="$(printf '%s' "${signing_input}" | openssl dgst -sha256 -sign "${ROOT_DIR}/tests/fixtures/internal_auth_private.pem" -binary | base64url)"
+  printf '%s.%s\n' "${signing_input}" "${signature}"
+}
+
+seed_blink_transfer_fixture() {
+  local account_id="${1:?account id is required}"
+  local moved_identifier="${2:?moved identifier is required}"
+  local untouched_identifier="${3:?untouched identifier is required}"
+  local description="${4:-Blink transfer source}"
+
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('${account_id}', 'blink', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO blink_accounts(account_id, blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet, created_at, updated_at) VALUES ('${account_id}', '${account_id}_blink', '${account_id}_btc_wallet', '${account_id}_usd_wallet', 'btc', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) VALUES ('${account_id}', 'localhost:8080', '${moved_identifier}', 'username', '${description}', 0, 0), ('${account_id}', 'localhost:8080', '${untouched_identifier}', 'username', 'Untouched Blink wallet', 0, 0) ON CONFLICT (domain, identifier) DO NOTHING" >/dev/null
+}
+
+internal_transfer_to_spark() {
+  local token="${1:?token is required}"
+  local identifier="${2:?identifier is required}"
+  local destination_pubkey="${3:?destination pubkey is required}"
+  local description="${4:?description is required}"
+
+  curl -sS \
+    --request POST \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --header "Authorization: Bearer ${token}" \
+    --data "{\"domain\":\"localhost:8080\",\"identifier\":\"${identifier}\",\"destination_spark_pubkey\":\"${destination_pubkey}\",\"description\":\"${description}\"}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/identifiers/transfer-to-spark"
+}
+
+identifier_owner_provider() {
+  local identifier="${1:?identifier is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT a.provider FROM account_identifiers ai JOIN accounts a ON a.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = '${identifier}'"
+}
+
+identifier_spark_pubkey() {
+  local identifier="${1:?identifier is required}"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT s.pubkey FROM account_identifiers ai JOIN spark_accounts s ON s.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = '${identifier}'"
 }
 
 @test "auth: register recover and unregister" {
@@ -60,7 +119,7 @@ teardown_file() {
   [ "$body" = '"name already taken"' ]
 }
 
-@test "auth: transfer moves Spark username with canonical signatures (D-13/D-15)" {
+@test "auth: Spark transfer remains compatible after cross-provider transfer support" {
   run register_user "transferuser" "localhost:8080" "Transfer source wallet"
   [ "$status" -eq 0 ]
 
@@ -88,6 +147,41 @@ teardown_file() {
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.username' 'transferuser'
   assert_json_equals "$output" '.description' 'Transfer target wallet'
+}
+
+@test "auth: internal transfer-to-spark requires transfer scope" {
+  seed_blink_transfer_fixture "acct_blink_bats_scope" "scopemove" "scopestay" "Scoped Blink wallet"
+  destination_pubkey="$(json_get "$(auth_payload "scopemove")" '.to_pubkey')"
+  token="$(internal_test_token "accounts:read")"
+
+  response="$(internal_transfer_to_spark "${token}" "scopemove" "${destination_pubkey}" "Should not move")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "${code}" = "403" ]
+  assert_json_equals "${body}" '.error' 'forbidden'
+  [ "$(identifier_owner_provider "scopemove")" = "blink" ]
+}
+
+@test "auth: internal transfer-to-spark moves one Blink identifier to Spark" {
+  seed_blink_transfer_fixture "acct_blink_bats_success" "internalmove" "internalstay" "Internal Blink wallet"
+  destination_pubkey="$(json_get "$(auth_payload "internalmove")" '.to_pubkey')"
+  token="$(internal_test_token "transfer:write")"
+
+  response="$(internal_transfer_to_spark "${token}" "internalmove" "${destination_pubkey}" "Internal Spark wallet")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "${code}" = "200" ]
+  assert_json_equals "${body}" '.domain' 'localhost:8080'
+  assert_json_equals "${body}" '.identifier' 'internalmove'
+  assert_json_equals "${body}" '.provider' 'spark'
+  assert_json_equals "${body}" '.spark_pubkey' "${destination_pubkey}"
+  assert_json_equals "${body}" '.lightning_address' 'internalmove@localhost:8080'
+  assert_json_equals "${body}" '.lnurl' 'lnurlp://localhost:8080/lnurlp/internalmove'
+  [ "$(identifier_owner_provider "internalmove")" = "spark" ]
+  [ "$(identifier_spark_pubkey "internalmove")" = "${destination_pubkey}" ]
+  [ "$(identifier_owner_provider "internalstay")" = "blink" ]
 }
 
 @test "auth: transfer replaces destination's previous Spark alias" {
