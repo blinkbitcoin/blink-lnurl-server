@@ -429,6 +429,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spark_provider_rejects_blink_wallet_modifier_test_01() {
+        let provider = spark_provider_for_unit_tests();
+        let recipient = recipient(AccountProvider::Spark, None);
+
+        let err = provider
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &recipient,
+                wallet: Some(WalletKind::Usd),
+                amount_sat: 1,
+                description_hash: [0; 32],
+                expiry: None,
+                include_spark_address: false,
+            })
+            .await
+            .expect_err("Spark provider must reject Blink-only USD wallet modifiers");
+
+        assert!(matches!(
+            err,
+            ProviderError::UnsupportedWallet {
+                provider: AccountProvider::Spark,
+                wallet: WalletKind::Usd,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn spark_provider_accepts_default_and_btc_wallet_intents() {
         let provider = spark_provider_for_unit_tests();
         let recipient = recipient(AccountProvider::Spark, None);
@@ -688,6 +714,31 @@ mod tests {
             hex::encode([7; 32])
         );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
+    }
+
+    #[test]
+    fn blink_provider_selects_explicit_wallets_test_01() {
+        let default_btc = blink_recipient(Some(WalletKind::Btc));
+        assert_eq!(
+            select_blink_wallet_id(&default_btc, None).expect("default BTC wallet selects"),
+            (WalletKind::Btc, "btc_wallet")
+        );
+        assert_eq!(
+            select_blink_wallet_id(&default_btc, Some(WalletKind::Usd))
+                .expect("explicit USD wallet overrides default BTC"),
+            (WalletKind::Usd, "usd_wallet")
+        );
+
+        let default_usd = blink_recipient(Some(WalletKind::Usd));
+        assert_eq!(
+            select_blink_wallet_id(&default_usd, None).expect("default USD wallet selects"),
+            (WalletKind::Usd, "usd_wallet")
+        );
+        assert_eq!(
+            select_blink_wallet_id(&default_usd, Some(WalletKind::Btc))
+                .expect("explicit BTC wallet overrides default USD"),
+            (WalletKind::Btc, "btc_wallet")
+        );
     }
 
     #[tokio::test]

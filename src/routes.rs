@@ -3454,6 +3454,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_identifier_rejects_invalid_wallet_modifier_test_01() {
+        let btc = parse_public_identifier_for_public_route("Alice+BTC")
+            .expect("BTC modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(btc.canonical, "alice");
+        assert_eq!(btc.wallet, Some(WalletKind::Btc));
+        assert_eq!(btc.callback_identifier, "alice+btc");
+
+        let usd = parse_public_identifier_for_public_route("alice+Usd")
+            .expect("USD modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(usd.canonical, "alice");
+        assert_eq!(usd.wallet, Some(WalletKind::Usd));
+        assert_eq!(usd.callback_identifier, "alice+usd");
+
+        for invalid in ["alice+eur", "alice+btc+usd", "alice+usd+btc"] {
+            assert!(
+                matches!(
+                    parse_public_identifier_for_public_route(invalid),
+                    Err(IdentifierError::InvalidModifier)
+                ),
+                "invalid wallet modifier must fail before route lookup: {invalid}"
+            );
+        }
+    }
+
     // -- Spark management account-backed compatibility ------------------------
 
     fn handler_source(name: &str) -> &'static str {
