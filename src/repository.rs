@@ -1720,6 +1720,68 @@ pub mod shared_tests {
         );
     }
 
+    pub async fn post_transfer_lookup_and_metadata_join_consistency<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(source_account_id.clone()),
+            blink_account_id: "blink_consistency_account".to_string(),
+            btc_wallet_id: "blink_consistency_btc".to_string(),
+            usd_wallet_id: "blink_consistency_usd".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "post-transfer-consistency.example.com".to_string(),
+                    identifier: "moving".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "moving before transfer".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "post-transfer-consistency.example.com".to_string(),
+                    identifier: "stays".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "stays with Blink".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: "post-transfer-consistency.example.com".to_string(),
+            identifier: "moving".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_consistency_destination".to_string(),
+            description: "moving after transfer".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let moved = db
+            .resolve_recipient_by_identifier("post-transfer-consistency.example.com", "moving")
+            .await
+            .unwrap()
+            .expect("moved identifier should resolve");
+        assert_eq!(moved.provider, AccountProvider::Spark);
+        assert_eq!(
+            moved.spark_pubkey.as_deref(),
+            Some("spark_consistency_destination")
+        );
+        assert_eq!(moved.description, "moving after transfer");
+
+        let stayed = db
+            .resolve_recipient_by_identifier("post-transfer-consistency.example.com", "stays")
+            .await
+            .unwrap()
+            .expect("untouched identifier should still resolve");
+        assert_eq!(stayed.provider, AccountProvider::Blink);
+        assert_eq!(stayed.account_id, source_account_id);
+        assert_eq!(stayed.description, "stays with Blink");
+        assert_eq!(stayed.default_wallet, Some(WalletKind::Usd));
+    }
+
     pub async fn create_blink_account_rejects_existing_spark_account_id_with_invalid_provider<DB>(
         db: &DB,
     ) where

@@ -3360,6 +3360,22 @@ mod tests {
         }
     }
 
+    fn post_transfer_spark_recipient() -> ResolvedRecipient {
+        ResolvedRecipient {
+            account_id: "acct_spark_after_transfer".to_string(),
+            provider: AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Alice moved to Spark".to_string(),
+            spark_pubkey: Some("spark_after_transfer_pubkey".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        }
+    }
+
     fn valid_internal_transfer_to_spark_payload() -> InternalTransferToSparkRequest {
         InternalTransferToSparkRequest {
             domain: "Example.COM".to_string(),
@@ -3505,6 +3521,45 @@ mod tests {
         assert!(
             transfer.contains("verify_transfer_signature"),
             "transfer must preserve both Spark signature checks"
+        );
+    }
+
+    #[test]
+    fn spark_transfer_route_contract_still_uses_provider_neutral_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.matches("verify_transfer_signature").count() >= 2,
+            "public Spark transfer must keep both Spark signature verifications"
+        );
+        assert!(
+            transfer.contains("from_pk == to_pk"),
+            "public Spark transfer must keep same source/target pubkey rejection"
+        );
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "public Spark transfer must still construct IdentifierTransfer"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "public Spark transfer must still call transfer_identifier"
+        );
+        assert!(
+            transfer.contains("TransferLnurlPayResponse"),
+            "public Spark transfer response type must stay unchanged"
+        );
+        assert!(
+            !transfer.contains("SCOPE_TRANSFER_WRITE") && !transfer.contains("require_scope"),
+            "public Spark transfer route must not require internal JWT scopes"
+        );
+
+        let internal_transfer = handler_source("transfer_identifier_to_spark");
+        assert!(
+            internal_transfer.contains("SCOPE_TRANSFER_WRITE"),
+            "only the internal Blink-to-Spark transfer route should require transfer:write"
+        );
+        assert!(
+            internal_transfer.contains("AccountProvider::Blink"),
+            "internal transfer must reject non-Blink current owners"
         );
     }
 
@@ -4084,6 +4139,115 @@ mod tests {
                 && !invoice.contains("callback_identifier.clone()"),
             "virtual aliases must not be persisted as account identifiers"
         );
+    }
+
+    #[tokio::test]
+    async fn post_transfer_public_invoice_uses_spark_provider() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+        assert_eq!(
+            public_recipient.recipient.spark_pubkey.as_deref(),
+            Some("spark_after_transfer_pubkey")
+        );
+
+        let (_payment_hash, bolt11) = generate_route_test_invoice(31);
+        let invoice = Bolt11Invoice::from_str(&bolt11).expect("test invoice parses");
+        let payment_hash = invoice.payment_hash().to_string();
+        create_provider_invoice_for_account(
+            &repo,
+            &payment_hash,
+            Some(&public_recipient.recipient.account_id),
+            Some(public_recipient.recipient.provider),
+            Some(WalletKind::Btc),
+            None,
+            None,
+            public_recipient
+                .recipient
+                .spark_pubkey
+                .as_deref()
+                .expect("Spark recipient has pubkey"),
+            &bolt11,
+            i64::MAX,
+            &public_recipient.recipient.domain,
+        )
+        .await
+        .expect("post-transfer Spark invoice should persist");
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("new invoice should be persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Spark));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Btc));
+        assert_eq!(stored.wallet_id, None);
+        assert_eq!(stored.provider_payment_hash, None);
+        assert_eq!(
+            stored.account_id.as_deref(),
+            Some("acct_spark_after_transfer")
+        );
+        assert_eq!(stored.user_pubkey, "spark_after_transfer_pubkey");
+        assert_eq!(stored.domain.as_deref(), Some("example.com"));
+    }
+
+    #[tokio::test]
+    async fn post_transfer_historical_blink_invoice_owner_is_unchanged() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let historical_payment_hash = "historical_blink_before_transfer".to_string();
+        repo.upsert_invoice(&Invoice {
+            account_id: Some("acct_original_blink".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Usd),
+            wallet_id: Some("original_blink_usd_wallet".to_string()),
+            provider_payment_hash: Some("original_blink_provider_hash".to_string()),
+            payment_hash: historical_payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: "lnbc1historicalblink".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: 1,
+            updated_at: 1,
+            domain: Some("example.com".to_string()),
+            amount_received_sat: Some(42),
+        })
+        .await
+        .unwrap();
+
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&historical_payment_hash)
+            .await
+            .unwrap()
+            .expect("historical Blink invoice should remain persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.account_id.as_deref(), Some("acct_original_blink"));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(
+            stored.wallet_id.as_deref(),
+            Some("original_blink_usd_wallet")
+        );
+        assert_eq!(stored.payment_hash, historical_payment_hash);
+        assert_eq!(stored.amount_received_sat, Some(42));
     }
 
     #[test]
