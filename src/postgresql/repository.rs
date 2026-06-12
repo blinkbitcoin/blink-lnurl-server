@@ -2,9 +2,9 @@ use crate::models::ListMetadataMetadata;
 use sqlx::{PgPool, Row};
 
 use crate::repository::{
-    Account, AccountIdentifierKind, AccountProvider, IdentifierTransfer, Invoice,
-    LnurlSenderComment, NewBlinkAccount, NewSparkRegistration, PendingZapReceipt,
-    ResolvedRecipient, WalletKind, WebhookPayloadData, generate_account_id,
+    Account, AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
+    IdentifierTransfer, Invoice, LnurlSenderComment, NewBlinkAccount, NewSparkRegistration,
+    PendingZapReceipt, ResolvedRecipient, WalletKind, WebhookPayloadData, generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -686,6 +686,15 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
         Ok(())
+    }
+
+    async fn transfer_blink_identifier_to_spark(
+        &self,
+        _transfer: &BlinkToSparkIdentifierTransfer,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(crate::repository::LnurlRepositoryError::General(anyhow::anyhow!(
+            "provider-neutral repository method not implemented"
+        )))
     }
 
     async fn transfer_username(
@@ -1710,6 +1719,45 @@ mod provider_neutral_tests {
             return;
         };
         shared_tests::transfer_identifier_replaces_destination_prior_alias(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_creates_fresh_destination_spark_account() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_blink_identifier_to_spark_creates_fresh_destination_spark_account(
+            &db,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_requires_blink_source_owner() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_blink_identifier_to_spark_requires_blink_source_owner(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_moves_only_requested_identifier() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_blink_identifier_to_spark_moves_only_requested_identifier(&db)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner(
+            &db,
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -208,6 +208,15 @@ pub struct IdentifierTransfer {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlinkToSparkIdentifierTransfer {
+    pub domain: String,
+    pub identifier: String,
+    pub source_account_id: String,
+    pub destination_spark_pubkey: String,
+    pub description: String,
+}
+
 fn provider_neutral_not_implemented() -> LnurlRepositoryError {
     LnurlRepositoryError::General(anyhow!(
         "provider-neutral repository method not implemented"
@@ -314,6 +323,13 @@ pub trait LnurlRepository {
     async fn transfer_identifier(
         &self,
         _transfer: &IdentifierTransfer,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn transfer_blink_identifier_to_spark(
+        &self,
+        _transfer: &BlinkToSparkIdentifierTransfer,
     ) -> Result<(), LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
@@ -450,9 +466,10 @@ pub struct WebhookPayloadData {
 #[cfg(test)]
 pub mod shared_tests {
     use super::{
-        AccountIdentifierKind, AccountProvider, IdentifierTransfer, Invoice, LnurlRepository,
-        LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier, NewBlinkAccount,
-        NewSparkRegistration, WalletKind, generate_account_id,
+        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
+        IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment,
+        NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration, WalletKind,
+        generate_account_id,
     };
     use crate::zap::Zap;
 
@@ -925,6 +942,241 @@ pub mod shared_tests {
             .expect("legacy recover should point to transferred identifier");
         assert_eq!(recovered.name, "newname");
         assert_eq!(recovered.description, "replacement transfer");
+    }
+
+    pub async fn transfer_blink_identifier_to_spark_creates_fresh_destination_spark_account<DB>(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(source_account_id.clone()),
+            blink_account_id: "blink_transfer_fresh_account".to_string(),
+            btc_wallet_id: "blink_transfer_fresh_btc".to_string(),
+            usd_wallet_id: "blink_transfer_fresh_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "blink-fresh-transfer.example.com".to_string(),
+                identifier: "freshblink".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "before blink transfer".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: "blink-fresh-transfer.example.com".to_string(),
+            identifier: "freshblink".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_from_blink_fresh_destination".to_string(),
+            description: "after blink transfer".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let destination_account = db
+            .get_account_by_spark_pubkey("spark_from_blink_fresh_destination")
+            .await
+            .unwrap()
+            .expect("Blink-to-Spark transfer should create destination Spark account");
+        assert_eq!(destination_account.provider, AccountProvider::Spark);
+
+        let moved = db
+            .resolve_recipient_by_identifier("blink-fresh-transfer.example.com", "freshblink")
+            .await
+            .unwrap()
+            .expect("transferred Blink identifier should resolve");
+        assert_eq!(moved.account_id, destination_account.account_id);
+        assert_eq!(moved.provider, AccountProvider::Spark);
+        assert_eq!(moved.description, "after blink transfer");
+        assert_eq!(
+            moved.spark_pubkey.as_deref(),
+            Some("spark_from_blink_fresh_destination")
+        );
+        assert!(moved.blink_account_id.is_none());
+    }
+
+    pub async fn transfer_blink_identifier_to_spark_requires_blink_source_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let missing_result = db
+            .transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+                domain: "blink-source-required.example.com".to_string(),
+                identifier: "missing".to_string(),
+                source_account_id: "not_the_owner".to_string(),
+                destination_spark_pubkey: "spark_from_missing_blink".to_string(),
+                description: "must fail".to_string(),
+            })
+            .await;
+        assert!(matches!(missing_result, Err(LnurlRepositoryError::SourceNotOwner)));
+
+        let spark_source_account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(spark_source_account_id.clone()),
+            pubkey: "spark_source_for_blink_transfer".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "blink-source-required.example.com".to_string(),
+                identifier: "sparkowned".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "spark owned".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let spark_result = db
+            .transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+                domain: "blink-source-required.example.com".to_string(),
+                identifier: "sparkowned".to_string(),
+                source_account_id: spark_source_account_id.clone(),
+                destination_spark_pubkey: "spark_from_blink_reject_destination".to_string(),
+                description: "must also fail".to_string(),
+            })
+            .await;
+        assert!(matches!(spark_result, Err(LnurlRepositoryError::InvalidOwnership)));
+
+        let still_spark = db
+            .resolve_recipient_by_identifier("blink-source-required.example.com", "sparkowned")
+            .await
+            .unwrap()
+            .expect("rejected Spark-owned transfer must leave ownership unchanged");
+        assert_eq!(still_spark.account_id, spark_source_account_id);
+        assert_eq!(still_spark.provider, AccountProvider::Spark);
+    }
+
+    pub async fn transfer_blink_identifier_to_spark_moves_only_requested_identifier<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(source_account_id.clone()),
+            blink_account_id: "blink_transfer_multi_account".to_string(),
+            btc_wallet_id: "blink_transfer_multi_btc".to_string(),
+            usd_wallet_id: "blink_transfer_multi_usd".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "blink-move-only.example.com".to_string(),
+                    identifier: "moving".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "moves".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "blink-move-only.example.com".to_string(),
+                    identifier: "stays".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "stays".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: "blink-move-only.example.com".to_string(),
+            identifier: "moving".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_from_blink_move_only_destination".to_string(),
+            description: "moved".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let moved = db
+            .resolve_recipient_by_identifier("blink-move-only.example.com", "moving")
+            .await
+            .unwrap()
+            .expect("requested identifier should move");
+        let stayed = db
+            .resolve_recipient_by_identifier("blink-move-only.example.com", "stays")
+            .await
+            .unwrap()
+            .expect("second Blink identifier should remain");
+
+        assert_eq!(moved.provider, AccountProvider::Spark);
+        assert_eq!(
+            moved.spark_pubkey.as_deref(),
+            Some("spark_from_blink_move_only_destination")
+        );
+        assert_eq!(stayed.account_id, source_account_id);
+        assert_eq!(stayed.provider, AccountProvider::Blink);
+        assert_eq!(stayed.description, "stays");
+    }
+
+    pub async fn transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner<DB>(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let source_account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(source_account_id.clone()),
+            blink_account_id: "blink_transfer_invoice_account".to_string(),
+            btc_wallet_id: "blink_transfer_invoice_btc".to_string(),
+            usd_wallet_id: "blink_transfer_invoice_usd".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "blink-invoice-transfer.example.com".to_string(),
+                identifier: "invoiceowner".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "invoice owner".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let now = crate::time::now_millis();
+        let payment_hash = "blink_transfer_invoice_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: Some(source_account_id.clone()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Usd),
+            wallet_id: Some("blink_transfer_invoice_usd".to_string()),
+            provider_payment_hash: Some("blink_provider_payment_hash".to_string()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: "blink_invoice_legacy_pubkey".to_string(),
+            invoice: "lnbc1blinktransferinvoice".to_string(),
+            preimage: None,
+            invoice_expiry: i64::MAX,
+            created_at: now,
+            updated_at: now,
+            domain: Some("blink-invoice-transfer.example.com".to_string()),
+            amount_received_sat: Some(21),
+        })
+        .await
+        .unwrap();
+
+        db.transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
+            domain: "blink-invoice-transfer.example.com".to_string(),
+            identifier: "invoiceowner".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_from_blink_invoice_destination".to_string(),
+            description: "invoice owner moved".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain persisted after transfer");
+        assert_eq!(stored.account_id.as_deref(), Some(source_account_id.as_str()));
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(stored.wallet_id.as_deref(), Some("blink_transfer_invoice_usd"));
+
+        let moved = db
+            .resolve_recipient_by_identifier("blink-invoice-transfer.example.com", "invoiceowner")
+            .await
+            .unwrap()
+            .expect("current identifier ownership should move to Spark");
+        assert_eq!(moved.provider, AccountProvider::Spark);
+        assert_ne!(moved.account_id, source_account_id);
     }
 
     #[allow(clippy::too_many_lines)]
