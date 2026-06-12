@@ -18,9 +18,7 @@ pub struct User {
 
 #[cfg(test)]
 mod tests {
-    use crate::identifier::{
-        IdentifierError, canonical_spark_username, checked_to_phone_number,
-    };
+    use crate::identifier::{IdentifierError, canonical_spark_username, checked_to_phone_number};
 
     #[test]
     fn username_validation_rejects_numeric_only_collisions_test_01() {

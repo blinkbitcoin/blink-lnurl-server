@@ -3895,7 +3895,12 @@ mod tests {
             .expect("invoice lookup succeeds")
             .expect("invoice stays stored");
         assert_eq!(stored.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
-        assert!(repo.pending_zap_receipts.lock().unwrap().contains_key(&payment_hash));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
         assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
     }
 
