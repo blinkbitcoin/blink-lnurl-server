@@ -436,6 +436,61 @@ mod shared_tests {
         );
     }
 
+    pub async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01<DB>(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let (trigger, _rx) = watch::channel(());
+        let webhook_service = WebhookService::new(db.clone());
+        let preimage_bytes = [9u8; 32];
+        let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
+
+        create_provider_invoice_for_account(
+            db,
+            &payment_hash,
+            None,
+            Some(AccountProvider::Blink),
+            Some(WalletKind::Btc),
+            Some("btc_wallet_test_01"),
+            Some("provider_payment_hash_test_01"),
+            "",
+            &invoice_str,
+            i64::MAX,
+            "settlement-test.example.com",
+        )
+        .await
+        .unwrap();
+
+        handle_invoice_paid(
+            db,
+            &webhook_service,
+            &payment_hash,
+            &preimage_hex,
+            Some(123),
+            &trigger,
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("Blink invoice should stay stored");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.preimage.as_deref(), Some(preimage_hex.as_str()));
+        assert_eq!(stored.amount_received_sat, Some(123));
+
+        let pending = db.take_pending_zap_receipts(10).await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|receipt| receipt.payment_hash == payment_hash),
+            "central handler should enqueue zap receipt side effects"
+        );
+    }
+
     pub async fn invoices_paid_creates_invoice_when_only_comment_exists<DB>(db: &DB)
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
@@ -689,6 +744,13 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let db = setup_test_db().await;
+        shared_tests::blink_settlement_fallback_persists_through_paid_invoice_handler_test_01(&db)
+            .await;
+    }
+
+    #[tokio::test]
     async fn invoices_paid_creates_invoice_when_only_comment_exists() {
         let db = setup_test_db().await;
         shared_tests::invoices_paid_creates_invoice_when_only_comment_exists(&db).await;
@@ -767,6 +829,15 @@ mod postgres_tests {
             return;
         };
         shared_tests::create_invoice_for_account_sets_provider_metadata(&db).await;
+    }
+
+    #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::blink_settlement_fallback_persists_through_paid_invoice_handler_test_01(&db)
+            .await;
     }
 
     #[tokio::test]
