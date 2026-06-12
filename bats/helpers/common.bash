@@ -155,6 +155,67 @@ create_blink_account() {
     "${BASE_URL}/internal/blink/accounts" | jq -cer '.'
 }
 
+create_blink_account_body() {
+  local blink_account_id="${1:?blink account id is required}"
+  local btc_wallet_id="${2:?BTC wallet id is required}"
+  local usd_wallet_id="${3:?USD wallet id is required}"
+  local default_wallet="${4:?default wallet is required}"
+  local description="${5:?description is required}"
+  shift 5
+  local identifiers
+  identifiers="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+
+  jq -cn \
+    --arg domain "localhost:8080" \
+    --arg blink_account_id "${blink_account_id}" \
+    --arg btc_wallet_id "${btc_wallet_id}" \
+    --arg usd_wallet_id "${usd_wallet_id}" \
+    --arg default_wallet "${default_wallet}" \
+    --arg description "${description}" \
+    --argjson identifiers "${identifiers}" \
+    '{domain:$domain,blink_account_id:$blink_account_id,btc_wallet_id:$btc_wallet_id,usd_wallet_id:$usd_wallet_id,default_wallet:$default_wallet,description:$description,identifiers:$identifiers}'
+}
+
+create_blink_account_multi() {
+  local blink_account_id="${1:?blink account id is required}"
+  local description="${2:?description is required}"
+  local default_wallet="${3:?default wallet is required}"
+  local btc_wallet_id="${4:?BTC wallet id is required}"
+  local usd_wallet_id="${5:?USD wallet id is required}"
+  shift 5
+  local token
+  local body
+  token="$(internal_test_token "blink:accounts:create")"
+  body="$(create_blink_account_body "${blink_account_id}" "${btc_wallet_id}" "${usd_wallet_id}" "${default_wallet}" "${description}" "$@")"
+
+  curl -fsS \
+    --request POST \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --header "Authorization: Bearer ${token}" \
+    --data "${body}" \
+    "${BASE_URL}/internal/blink/accounts" | jq -cer '.'
+}
+
+post_internal_blink_account_status_body() {
+  local body="${1:?body is required}"
+  local token="${2:-}"
+  local headers=(
+    --header "Host: localhost:8080"
+    --header "Content-Type: application/json"
+  )
+  if [ -n "${token}" ]; then
+    headers+=(--header "Authorization: Bearer ${token}")
+  fi
+
+  curl -sS \
+    --request POST \
+    "${headers[@]}" \
+    --data "${body}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/blink/accounts"
+}
+
 create_blink_account_status() {
   local identifier="${1:?identifier is required}"
   local description="${2:-Blink test wallet}"
@@ -193,6 +254,65 @@ blink_settlement_notify() {
     --header "Authorization: Bearer ${token}" \
     --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg preimage "${preimage}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{preImage:$preimage}}}')" \
     "${BASE_URL}/internal/blink/invoice-paid" | jq -cer '.'
+}
+
+internal_identifier_lookup() {
+  local identifier="${1:?identifier is required}"
+  local token
+  token="$(internal_test_token "accounts:read")"
+
+  curl -fsS \
+    --header "Host: localhost:8080" \
+    --header "Authorization: Bearer ${token}" \
+    "${BASE_URL}/internal/domains/localhost:8080/identifiers/${identifier}" | jq -cer '.'
+}
+
+internal_identifier_lookup_status_body() {
+  local identifier="${1:?identifier is required}"
+  local token="${2:-}"
+  local headers=(--header "Host: localhost:8080")
+  if [ -n "${token}" ]; then
+    headers+=(--header "Authorization: Bearer ${token}")
+  fi
+
+  curl -sS \
+    --request GET \
+    "${headers[@]}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/domains/localhost:8080/identifiers/${identifier}"
+}
+
+blink_settlement_notify_without_preimage() {
+  local payment_hash="${1:?payment hash is required}"
+  local token
+  token="$(internal_test_token "settlement:write")"
+
+  curl -fsS \
+    --request POST \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --header "Authorization: Bearer ${token}" \
+    --data "$(jq -cn --arg payment_hash "${payment_hash}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{type:"SettlementViaIntraLedger"}}}')" \
+    "${BASE_URL}/internal/blink/invoice-paid" | jq -cer '.'
+}
+
+blink_settlement_notify_status_body() {
+  local body="${1:?body is required}"
+  local token="${2:-}"
+  local headers=(
+    --header "Host: localhost:8080"
+    --header "Content-Type: application/json"
+  )
+  if [ -n "${token}" ]; then
+    headers+=(--header "Authorization: Bearer ${token}")
+  fi
+
+  curl -sS \
+    --request POST \
+    "${headers[@]}" \
+    --data "${body}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/blink/invoice-paid"
 }
 
 transfer_blink_identifier_to_spark() {
