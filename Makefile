@@ -25,7 +25,7 @@ start:
 	./scripts/start-local-stack.sh
 
 test-e2e:
-	cargo build --locked --bin lnurl-server --bin e2e_auth
+	cargo build --locked --bin lnurl-server --bin e2e_auth --bin blink_graphql_mock
 	bats -t bats
 
 e2e: test-e2e
