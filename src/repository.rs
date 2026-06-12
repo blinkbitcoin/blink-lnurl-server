@@ -466,10 +466,9 @@ pub struct WebhookPayloadData {
 #[cfg(test)]
 pub mod shared_tests {
     use super::{
-        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
-        IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment,
-        NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration, WalletKind,
-        generate_account_id,
+        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
+        Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier,
+        NewBlinkAccount, NewSparkRegistration, WalletKind, generate_account_id,
     };
     use crate::zap::Zap;
 
@@ -1011,7 +1010,10 @@ pub mod shared_tests {
                 description: "must fail".to_string(),
             })
             .await;
-        assert!(matches!(missing_result, Err(LnurlRepositoryError::SourceNotOwner)));
+        assert!(matches!(
+            missing_result,
+            Err(LnurlRepositoryError::SourceNotOwner)
+        ));
 
         let spark_source_account_id = generate_account_id(AccountProvider::Spark);
         db.upsert_spark_registration(&NewSparkRegistration {
@@ -1036,7 +1038,10 @@ pub mod shared_tests {
                 description: "must also fail".to_string(),
             })
             .await;
-        assert!(matches!(spark_result, Err(LnurlRepositoryError::InvalidOwnership)));
+        assert!(matches!(
+            spark_result,
+            Err(LnurlRepositoryError::InvalidOwnership)
+        ));
 
         let still_spark = db
             .resolve_recipient_by_identifier("blink-source-required.example.com", "sparkowned")
@@ -1165,10 +1170,16 @@ pub mod shared_tests {
             .await
             .unwrap()
             .expect("invoice should remain persisted after transfer");
-        assert_eq!(stored.account_id.as_deref(), Some(source_account_id.as_str()));
+        assert_eq!(
+            stored.account_id.as_deref(),
+            Some(source_account_id.as_str())
+        );
         assert_eq!(stored.provider, Some(AccountProvider::Blink));
         assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
-        assert_eq!(stored.wallet_id.as_deref(), Some("blink_transfer_invoice_usd"));
+        assert_eq!(
+            stored.wallet_id.as_deref(),
+            Some("blink_transfer_invoice_usd")
+        );
 
         let moved = db
             .resolve_recipient_by_identifier("blink-invoice-transfer.example.com", "invoiceowner")

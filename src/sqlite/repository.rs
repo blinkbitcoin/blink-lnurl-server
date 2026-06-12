@@ -671,11 +671,132 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn transfer_blink_identifier_to_spark(
         &self,
-        _transfer: &BlinkToSparkIdentifierTransfer,
+        transfer: &BlinkToSparkIdentifierTransfer,
     ) -> Result<(), LnurlRepositoryError> {
-        Err(crate::repository::LnurlRepositoryError::General(anyhow::anyhow!(
-            "provider-neutral repository method not implemented"
-        )))
+        let now = now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        let source_account_id: Option<String> = sqlx::query_scalar(
+            "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if source_account_id.as_deref() != Some(transfer.source_account_id.as_str()) {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        let source_is_blink: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM accounts a
+                 JOIN blink_accounts b ON b.account_id = a.account_id
+                 WHERE a.account_id = $1 AND a.provider = 'blink'
+             )",
+        )
+        .bind(&transfer.source_account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !source_is_blink {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
+
+        let destination_account = sqlx::query_as::<_, (String, String)>(
+            "SELECT s.account_id, a.provider
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
+        )
+        .bind(&transfer.destination_spark_pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let destination_account_id = if let Some((account_id, provider)) = destination_account {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Spark {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+            account_id
+        } else {
+            let account_id = generate_account_id(AccountProvider::Spark);
+            sqlx::query(
+                "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(AccountProvider::Spark.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(&transfer.destination_spark_pubkey)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            account_id
+        };
+
+        let update_result = sqlx::query(
+            "UPDATE account_identifiers
+             SET account_id = $3
+             ,   description = $4
+             ,   updated_at = $5
+             WHERE domain = $1 AND identifier = $2 AND account_id = $6",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .bind(&destination_account_id)
+        .bind(&transfer.description)
+        .bind(now)
+        .bind(&transfer.source_account_id)
+        .execute(&mut *tx)
+        .await?;
+        if update_result.rows_affected() != 1 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO users (domain, pubkey, name, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(domain, pubkey) DO UPDATE
+             SET name = excluded.name
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.destination_spark_pubkey)
+        .bind(&transfer.identifier)
+        .bind(&transfer.description)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
     }
 
     async fn transfer_username(
