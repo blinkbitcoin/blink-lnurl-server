@@ -112,10 +112,140 @@ teardown_file() {
   [ "$(invoice_account_provider "${historical_hash}")" = "blink" ]
 }
 
-@test "blink: phone identifier registration resolves through public discovery" {
-  create_blink_account "+573005871212" "Blink phone wallet" "btc" >/dev/null
+@test "blink: multi-identifier account registration resolves username and phone to same account" {
+  response="$(create_blink_account_multi "acct-blinkmulti10" "Multi identifier wallet" "btc" "btc-wallet-blinkmulti10" "usd-wallet-blinkmulti10" "blinkmulti10" "+573005871212")"
+  assert_json_equals "$response" '.provider' 'blink'
+  assert_json_equals "$response" '.blink_account_id' 'acct-blinkmulti10'
+  account_id="$(json_get "$response" '.account_id')"
 
-  run blink_lnurl_discovery "+573005871212"
-  [ "$status" -eq 0 ]
-  assert_json_equals "$output" '.tag' 'payRequest'
+  for local_part in "blinkmulti10" "+573005871212" "573005871212" "00573005871212"; do
+    discovery="$(blink_lnurl_discovery "${local_part}")"
+    assert_json_equals "$discovery" '.tag' 'payRequest'
+  done
+
+  username_lookup="$(internal_identifier_lookup "blinkmulti10")"
+  phone_lookup="$(internal_identifier_lookup "+573005871212")"
+  assert_json_equals "$username_lookup" '.provider' 'blink'
+  assert_json_equals "$phone_lookup" '.provider' 'blink'
+  assert_json_equals "$username_lookup" '.account_id' "$account_id"
+  assert_json_equals "$phone_lookup" '.account_id' "$account_id"
+  assert_json_equals "$username_lookup" '.provider_details.blink_account_id' 'acct-blinkmulti10'
+  assert_json_equals "$phone_lookup" '.provider_details.blink_account_id' 'acct-blinkmulti10'
+}
+
+@test "blink: internal lookup resolves canonical identifiers and wallet modifiers" {
+  create_blink_account_multi "acct-blinklookup10" "Lookup wallet" "btc" "btc-wallet-blinklookup10" "usd-wallet-blinklookup10" "blinklookup10" >/dev/null
+
+  base_lookup="$(internal_identifier_lookup "blinklookup10")"
+  usd_lookup="$(internal_identifier_lookup "blinklookup10+usd")"
+  btc_lookup="$(internal_identifier_lookup "blinklookup10+btc")"
+  account_id="$(json_get "$base_lookup" '.account_id')"
+
+  assert_json_equals "$base_lookup" '.provider' 'blink'
+  assert_json_equals "$base_lookup" '.requested_wallet' 'null'
+  assert_json_equals "$usd_lookup" '.account_id' "$account_id"
+  assert_json_equals "$usd_lookup" '.requested_wallet' 'usd'
+  assert_json_equals "$btc_lookup" '.account_id' "$account_id"
+  assert_json_equals "$btc_lookup" '.requested_wallet' 'btc'
+  assert_json_equals "$btc_lookup" '.provider_details.default_wallet' 'btc'
+}
+
+@test "blink: registration rejects same blink_account_id and Spark-owned identifiers" {
+  create_blink_account_multi "acct-reregister10" "Original Blink wallet" "btc" "btc-wallet-reregister10" "usd-wallet-reregister10" "reregister10a" >/dev/null
+  same_account_body="$(create_blink_account_body "acct-reregister10" "btc-wallet-reregister10b" "usd-wallet-reregister10b" "btc" "Second Blink wallet" "reregister10b")"
+
+  response="$(post_internal_blink_account_status_body "$same_account_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "409" ]
+  assert_json_equals "$body" '.error' 'blink_account_exists'
+
+  register_user "crossprovider10" "localhost:8080" "Spark-owned wallet" >/dev/null
+  conflict_body="$(create_blink_account_body "acct-crossprovider10" "btc-wallet-crossprovider10" "usd-wallet-crossprovider10" "btc" "Conflicting Blink wallet" "crossprovider10")"
+  response="$(post_internal_blink_account_status_body "$conflict_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "409" ]
+  assert_json_equals "$body" '.error' 'identifier_conflict'
+}
+
+@test "blink: internal registration validates default wallet and identifiers" {
+  missing_body="$(create_blink_account_body "acct-missingdefault10" "btc-wallet-missingdefault10" "usd-wallet-missingdefault10" "btc" "Missing default wallet" "missingdefault10" | jq -c 'del(.default_wallet)')"
+  response="$(post_internal_blink_account_status_body "$missing_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "422" ]
+  [[ "$body" == *"Failed to deserialize the JSON body into the target type"* ]]
+  [[ "$body" == *"missing field `default_wallet`"* ]]
+
+  invalid_wallet_body="$(create_blink_account_body "acct-invalidwallet10" "btc-wallet-invalidwallet10" "usd-wallet-invalidwallet10" "eur" "Invalid wallet" "invalidwallet10")"
+  response="$(post_internal_blink_account_status_body "$invalid_wallet_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'invalid_request'
+
+  invalid_identifier_body="$(create_blink_account_body "acct-invalididentifier10" "btc-wallet-invalididentifier10" "usd-wallet-invalididentifier10" "btc" "Invalid identifier" "not valid")"
+  response="$(post_internal_blink_account_status_body "$invalid_identifier_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'invalid_identifier'
+
+  invalid_phone_body="$(create_blink_account_body "acct-invalidphone10" "btc-wallet-invalidphone10" "usd-wallet-invalidphone10" "btc" "Invalid phone" "12345")"
+  response="$(post_internal_blink_account_status_body "$invalid_phone_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'invalid_identifier'
+
+  wallet_modifier_body="$(create_blink_account_body "acct-modifier10" "btc-wallet-modifier10" "usd-wallet-modifier10" "btc" "Wallet modifier" "alice+btc")"
+  response="$(post_internal_blink_account_status_body "$wallet_modifier_body" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'wallet_modifier_not_allowed'
+}
+
+@test "blink: internal auth rejects missing invalid and wrong-scope tokens on critical routes" {
+  account_body="$(create_blink_account_body "acct-authnegative10" "btc-wallet-authnegative10" "usd-wallet-authnegative10" "btc" "Auth negative wallet" "authnegative10")"
+  settlement_body="$(jq -cn --arg payment_hash "authnegativehash10" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{type:"SettlementViaIntraLedger"}}}')"
+
+  response="$(post_internal_blink_account_status_body "$account_body")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(post_internal_blink_account_status_body "$account_body" "not-a-jwt")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(post_internal_blink_account_status_body "$account_body" "$(internal_test_token "accounts:read")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "403" ]
+  assert_json_equals "$body" '.error' 'forbidden'
+
+  response="$(internal_identifier_lookup_status_body "blinkmulti10")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(internal_identifier_lookup_status_body "blinkmulti10" "not-a-jwt")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(internal_identifier_lookup_status_body "blinkmulti10" "$(internal_test_token "blink:accounts:create")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "403" ]
+  assert_json_equals "$body" '.error' 'forbidden'
+
+  response="$(blink_settlement_notify_status_body "$settlement_body")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(blink_settlement_notify_status_body "$settlement_body" "not-a-jwt")"
+  [ "${response##*$'\n'}" = "401" ]
+  response="$(blink_settlement_notify_status_body "$settlement_body" "$(internal_test_token "accounts:read")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "403" ]
+  assert_json_equals "$body" '.error' 'forbidden'
+}
+
+@test "blink: phone identifier registration resolves through public discovery" {
+  for local_part in "+573005871212" "573005871212" "00573005871212"; do
+    run blink_lnurl_discovery "${local_part}"
+    [ "$status" -eq 0 ]
+    assert_json_equals "$output" '.tag' 'payRequest'
+  done
 }
