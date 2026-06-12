@@ -2094,6 +2094,7 @@ mod tests {
     use super::*;
     use crate::models::ListMetadataMetadata;
     use crate::repository::{Invoice, LnurlRepositoryError, LnurlSenderComment, PendingZapReceipt};
+    use crate::webhooks::NewWebhookDelivery;
     use crate::user::User;
     use crate::webhooks::repository::WebhookRepositoryError;
     use crate::zap::Zap;
@@ -2116,6 +2117,7 @@ mod tests {
     struct MockRepository {
         invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
         pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
+        webhook_deliveries: std::sync::Arc<Mutex<Vec<NewWebhookDelivery>>>,
         created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
         create_blink_account_error: std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
         resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
@@ -2353,9 +2355,29 @@ mod tests {
         }
         async fn get_webhook_payloads(
             &self,
-            _: &[String],
+            payment_hashes: &[String],
         ) -> Result<Vec<crate::repository::WebhookPayloadData>, LnurlRepositoryError> {
-            Ok(vec![])
+            let invoices = self.invoices.lock().unwrap();
+            Ok(payment_hashes
+                .iter()
+                .filter_map(|payment_hash| {
+                    let invoice = invoices.get(payment_hash)?;
+                    Some(crate::repository::WebhookPayloadData {
+                        account_id: invoice.account_id.clone(),
+                        payment_hash: invoice.payment_hash.clone(),
+                        user_pubkey: invoice.user_pubkey.clone(),
+                        invoice: invoice.invoice.clone(),
+                        preimage: invoice.preimage.clone()?,
+                        amount_received_sat: invoice.amount_received_sat,
+                        lightning_address: invoice
+                            .domain
+                            .as_ref()
+                            .map(|domain| format!("alice@{domain}")),
+                        sender_comment: Some("verify fallback zap".to_string()),
+                        domain: invoice.domain.clone()?,
+                    })
+                })
+                .collect())
         }
     }
 
@@ -2363,8 +2385,12 @@ mod tests {
     impl crate::webhooks::WebhookRepository for MockRepository {
         async fn insert_webhook_deliveries(
             &self,
-            _: &[crate::webhooks::NewWebhookDelivery],
+            deliveries: &[crate::webhooks::NewWebhookDelivery],
         ) -> Result<(), WebhookRepositoryError> {
+            self.webhook_deliveries
+                .lock()
+                .unwrap()
+                .extend_from_slice(deliveries);
             Ok(())
         }
         async fn take_pending_webhook_deliveries(
@@ -2663,6 +2689,97 @@ mod tests {
                 .expect("mock Blink server should serve");
         });
         (format!("http://{addr}/graphql"), calls, bodies)
+    }
+
+    async fn start_blink_status_mock_server(
+        status: &'static str,
+        preimage: Option<String>,
+        fail: bool,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_route = Arc::clone(&calls);
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/graphql",
+            post(move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls_for_route);
+                let bodies = Arc::clone(&bodies_for_route);
+                let preimage = preimage.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body.clone());
+                    if fail {
+                        return Json(json!({
+                            "errors": [{"message": "upstream status hidden"}]
+                        }));
+                    }
+                    let payment_hash = body["variables"]["input"]["paymentHash"]
+                        .as_str()
+                        .expect("Blink status mock requires paymentHash")
+                        .to_string();
+                    Json(json!({
+                        "data": {
+                            "lnInvoicePaymentStatusByHash": {
+                                "status": status,
+                                "paymentHash": payment_hash,
+                                "paymentRequest": "lnbc1status",
+                                "paymentPreimage": preimage
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Blink status server should serve");
+        });
+        (format!("http://{addr}/graphql"), calls, bodies)
+    }
+
+    fn route_test_invoice(
+        provider: Option<AccountProvider>,
+        payment_hash: String,
+        invoice: &str,
+        preimage: Option<String>,
+    ) -> Invoice {
+        Invoice {
+            account_id: Some("acct_verify_blink".to_string()),
+            provider,
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("btc_wallet_verify".to_string()),
+            provider_payment_hash: Some(payment_hash.clone()),
+            payment_hash,
+            user_pubkey: String::new(),
+            invoice: invoice.to_string(),
+            preimage,
+            invoice_expiry: i64::MAX,
+            created_at: 0,
+            updated_at: 0,
+            domain: Some("verify.example.com".to_string()),
+            amount_received_sat: None,
+        }
+    }
+
+    async fn call_verify(state: State<MockRepository>, payment_hash: &str) -> Value {
+        let response = LnurlServer::<MockRepository>::verify(
+            Path(payment_hash.to_string()),
+            Extension(state),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await;
+        serde_json::from_slice(&body.expect("verify response body reads"))
+            .expect("verify response body is JSON")
     }
 
     async fn get_public_invoice(
@@ -3134,6 +3251,158 @@ mod tests {
         assert_eq!(verify_body["status"], "OK");
         assert_eq!(verify_body["settled"], false);
         assert!(verify_body.get("provider").is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_spark_and_unowned_invoices_remain_local_state_only_setl_01_d_07() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Spark),
+            "spark_verify_hash".to_string(),
+            "lnbc1sparkverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        repo.upsert_invoice(&route_test_invoice(
+            None,
+            "legacy_verify_hash".to_string(),
+            "lnbc1legacyverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let spark_body = call_verify(state.clone(), "spark_verify_hash").await;
+        assert_eq!(spark_body["status"], "OK");
+        assert_eq!(spark_body["settled"], false);
+        assert_eq!(spark_body["preimage"], Value::Null);
+        assert_eq!(spark_body["pr"], "lnbc1sparkverify");
+
+        let legacy_body = call_verify(state, "legacy_verify_hash").await;
+        assert_eq!(legacy_body["status"], "OK");
+        assert_eq!(legacy_body["settled"], true);
+        assert_eq!(legacy_body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(legacy_body["pr"], "lnbc1legacyverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_blink_local_preimage_returns_settled_without_status_setl_02() {
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            compute_payment_hash(TEST_PREIMAGE_HEX),
+            "lnbc1blinklocalverify",
+            Some(TEST_PREIMAGE_HEX.to_string()),
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &compute_payment_hash(TEST_PREIMAGE_HEX)).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1blinklocalverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_blink_status_preimage_uses_central_side_effects_setl_03_07_08_d_09_d_22() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkfallbackverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], true);
+        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
+        assert_eq!(body["pr"], "lnbc1blinkfallbackverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash),
+            "verify fallback must enqueue zap receipts through handle_invoice_paid"
+        );
+        assert_eq!(
+            repo.webhook_deliveries.lock().unwrap().len(),
+            1,
+            "verify fallback must enqueue webhook deliveries through handle_invoice_paid"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_blink_paid_status_without_preimage_remains_unsettled_setl_03_d_10() {
+        let payment_hash = "blink_paid_without_preimage_hash".to_string();
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinknopreimageverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], false);
+        assert_eq!(body["preimage"], Value::Null);
+        assert_eq!(body["pr"], "lnbc1blinknopreimageverify");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert!(invoice.preimage.is_none());
+        assert!(!repo.pending_zap_receipts.lock().unwrap().contains_key(&payment_hash));
+    }
+
+    #[tokio::test]
+    async fn verify_blink_status_error_returns_generic_lnurl_error_d_11() {
+        let payment_hash = "blink_status_error_hash".to_string();
+        let (endpoint, calls, _) = start_blink_status_mock_server("PAID", None, true).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkerrorverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let body = call_verify(state, &payment_hash).await;
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], "Internal server error");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn metadata_entries(metadata: &str) -> Vec<(String, String)> {
