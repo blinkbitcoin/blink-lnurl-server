@@ -253,6 +253,92 @@ pub struct ProviderRegistry {
     blink: Arc<BlinkProvider>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlinkSettlementNotification {
+    Ignored,
+    SettlementCandidate {
+        payment_hash: Option<String>,
+        preimage: Option<String>,
+    },
+}
+
+impl BlinkSettlementNotification {
+    pub const fn should_settle(&self) -> bool {
+        matches!(self, Self::SettlementCandidate { .. })
+    }
+
+    pub fn payment_hash(&self) -> Option<&str> {
+        match self {
+            Self::SettlementCandidate { payment_hash, .. } => payment_hash.as_deref(),
+            Self::Ignored => None,
+        }
+    }
+
+    pub fn preimage(&self) -> Option<&str> {
+        match self {
+            Self::SettlementCandidate { preimage, .. } => preimage.as_deref(),
+            Self::Ignored => None,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlinkSettlementWebhookPayload {
+    event_type: Option<String>,
+    transaction: Option<BlinkSettlementTransaction>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlinkSettlementTransaction {
+    status: Option<String>,
+    initiation_via: Option<BlinkSettlementInitiationVia>,
+    settlement_via: Option<BlinkSettlementVia>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlinkSettlementInitiationVia {
+    payment_hash: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlinkSettlementVia {
+    pre_image: Option<String>,
+}
+
+pub fn parse_blink_settlement_notification(
+    payload: &serde_json::Value,
+) -> Result<BlinkSettlementNotification, serde_json::Error> {
+    let payload: BlinkSettlementWebhookPayload = serde_json::from_value(payload.clone())?;
+
+    if payload.event_type.as_deref() != Some("receive.lightning") {
+        return Ok(BlinkSettlementNotification::Ignored);
+    }
+
+    let Some(transaction) = payload.transaction else {
+        return Ok(BlinkSettlementNotification::SettlementCandidate {
+            payment_hash: None,
+            preimage: None,
+        });
+    };
+
+    if transaction.status.as_deref() != Some("success") {
+        return Ok(BlinkSettlementNotification::Ignored);
+    }
+
+    Ok(BlinkSettlementNotification::SettlementCandidate {
+        payment_hash: transaction
+            .initiation_via
+            .and_then(|initiation| initiation.payment_hash),
+        preimage: transaction
+            .settlement_via
+            .and_then(|settlement| settlement.pre_image),
+    })
+}
+
 impl ProviderRegistry {
     pub fn new(wallet: Arc<spark_wallet::SparkWallet>, blink_client: blink_client::Client) -> Self {
         Self {

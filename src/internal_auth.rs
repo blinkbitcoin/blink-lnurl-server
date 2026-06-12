@@ -19,6 +19,7 @@ use crate::{models::InternalErrorResponse, state::State};
 
 pub const SCOPE_BLINK_ACCOUNTS_CREATE: &str = "blink:accounts:create";
 pub const SCOPE_ACCOUNTS_READ: &str = "accounts:read";
+pub const SCOPE_SETTLEMENT_WRITE: &str = "settlement:write";
 
 #[derive(Debug, Clone)]
 pub struct InternalAuthState {

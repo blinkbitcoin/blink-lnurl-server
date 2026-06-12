@@ -45,7 +45,10 @@ use crate::{
     zap::Zap,
 };
 use crate::{
-    providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError},
+    providers::{
+        CreateInvoiceRequest, PaymentStatusRequest, ProviderError,
+        parse_blink_settlement_notification,
+    },
     repository::{
         AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
         LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
@@ -1153,6 +1156,48 @@ where
             &body,
         )
         .await
+    }
+
+    pub async fn blink_invoice_paid(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<Value>,
+    ) -> Result<(), (StatusCode, Json<InternalErrorResponse>)> {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_SETTLEMENT_WRITE,
+        )?;
+
+        let parsed = parse_blink_settlement_notification(&payload).map_err(|e| {
+            trace!("invalid Blink settlement payload: {e}");
+            internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
+        })?;
+
+        if !parsed.should_settle() {
+            return Ok(());
+        }
+
+        let Some(payment_hash) = parsed.payment_hash() else {
+            trace!("missing paymentHash in Blink settlement payload");
+            return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
+        };
+
+        settle_blink_invoice_by_payment_hash(&state, payment_hash, parsed.preimage())
+            .await
+            .map_err(|e| {
+                error!(
+                    "failed to settle Blink invoice notification for {}: {}",
+                    payment_hash, e
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(InternalErrorResponse::new(
+                        INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                    )),
+                )
+            })?;
+
+        Ok(())
     }
 
     pub async fn create_internal_blink_account(
@@ -2965,7 +3010,10 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/internal/blink/invoice-paid")
-            .header("authorization", format!("Bearer {}", internal_test_token_with_scope(scope)))
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope(scope)),
+            )
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
                 serde_json::to_vec(&payload).expect("request serializes"),
@@ -4472,7 +4520,12 @@ mod tests {
             .unwrap()
             .expect("invoice exists");
         assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
-        assert!(repo.pending_zap_receipts.lock().unwrap().contains_key(&payment_hash));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
         assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
     }
 
@@ -4563,7 +4616,12 @@ mod tests {
             .unwrap()
             .expect("invoice exists");
         assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
-        assert!(repo.pending_zap_receipts.lock().unwrap().contains_key(&payment_hash));
+        assert!(
+            repo.pending_zap_receipts
+                .lock()
+                .unwrap()
+                .contains_key(&payment_hash)
+        );
         assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
     }
 
