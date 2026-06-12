@@ -1,4 +1,4 @@
-.PHONY: audit build check-code e2e reset-deps start start-deps stop-deps test-e2e test-in-ci test-integration test-rust
+.PHONY: audit build check-code e2e release-check reset-deps start start-deps stop-deps test-e2e test-in-ci test-integration test-rust
 
 build:
 	cargo build --locked --all-targets
@@ -34,3 +34,5 @@ test-integration: reset-deps
 	LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:5432/lnurl cargo test --locked postgres_tests -- --test-threads=1
 
 test-in-ci: test-rust test-integration
+
+release-check: check-code test-rust test-integration test-e2e audit

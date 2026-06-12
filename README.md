@@ -42,7 +42,24 @@ nix develop -c make build
 | `make start` | Start Postgres and run the LNURL server locally |
 | `make test-integration` | Run Postgres-backed Rust tests |
 | `make e2e` | Run Bats end-to-end tests |
+| `make release-check` | Run the full release gate: formatting, clippy, Rust tests, Postgres integration tests, mocked E2E tests, and dependency audit |
 | `make audit` | Run `cargo audit` |
+
+## Release Verification
+
+Run the complete local release gate before claiming milestone readiness:
+
+```shell
+nix develop -c make release-check
+```
+
+`release-check` runs the standard gates in order: `make check-code`, `make test-rust`, `make test-integration`, `make test-e2e`, and `make audit`. Treat any failed, skipped, flaky, or infrastructure-blocked command as release-blocking until it is fixed or precisely documented with the command, exit status, and blocker.
+
+## Mocked Blink E2E Posture
+
+Blink E2E coverage is deterministic and must not call live Blink services or Blink quickstart. The local E2E stack points the server at the checked-in `blink_graphql_mock` binary through `LNURL_BLINK_GRAPHQL_ENDPOINT` (or the matching `blink_graphql_endpoint` configuration option) so GraphQL invoice creation and payment-status behavior are exercised against local fixtures only.
+
+The mocked E2E setup documents environment variable names and local endpoints only; do not add private keys, service tokens, `.envrc` contents, or live Blink credentials to tests or docs.
 
 ## Build
 
