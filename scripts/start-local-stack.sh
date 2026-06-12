@@ -7,9 +7,11 @@ PID_FILE="${STATE_DIR}/server.pid"
 LOG_FILE="${STATE_DIR}/server.log"
 BIND_ADDR="127.0.0.1:8080"
 BASE_URL="http://${BIND_ADDR}"
-DB_URL="postgres://user:password@127.0.0.1:5432/lnurl"
+POSTGRES_PORT="${LNURL_POSTGRES_PORT:-5432}"
+DB_URL="postgres://user:password@127.0.0.1:${POSTGRES_PORT}/lnurl"
 LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl-server}"
 RESET_DB="${RESET_DB:-false}"
+BLINK_GRAPHQL_ARGS=()
 
 mkdir -p "${STATE_DIR}"
 
@@ -84,12 +86,17 @@ if [ ! -x "${LNURL_BIN}" ]; then
   cargo build --locked --bin lnurl-server
 fi
 
+if [ -n "${LNURL_BLINK_GRAPHQL_ENDPOINT:-}" ]; then
+  BLINK_GRAPHQL_ARGS=(--blink-graphql-endpoint "${LNURL_BLINK_GRAPHQL_ENDPOINT}")
+fi
+
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   "${LNURL_BIN}" \
     --address "${BIND_ADDR}" \
     --auto-migrate \
     --db-url "${DB_URL}" \
     --domains "localhost:8080,127.0.0.1:8080" \
+    "${BLINK_GRAPHQL_ARGS[@]}" \
     --log-level "info" \
     --network "regtest" \
     --scheme "http" \
