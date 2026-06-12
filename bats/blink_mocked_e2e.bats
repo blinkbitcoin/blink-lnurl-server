@@ -102,7 +102,7 @@ teardown_file() {
 }
 
 @test "blink: settlement webhook without preimage falls back to payment status" {
-  create_blink_account "blinksettlefallback10" "Blink settlement fallback wallet" "btc" "btc-wallet-paid-fallback-hooks" >/dev/null
+  create_blink_account "blinksettlefallback10" "Blink settlement fallback wallet" "btc" "btc-wallet-paid-fallback-settlement10" >/dev/null
   discovery="$(blink_lnurl_discovery "blinksettlefallback10")"
   invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
   payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
@@ -128,7 +128,7 @@ teardown_file() {
 }
 
 @test "blink: zap and webhook side effects use provider-neutral ownership" {
-  create_blink_account "blinkhooks" "Blink side effects wallet" "btc" "btc-wallet-paid-fallback-hooks" >/dev/null
+  create_blink_account "blinkhooks" "Blink side effects wallet" "btc" "btc-wallet-paid-fallback-hooks10" >/dev/null
   configure_domain_webhook "localhost:8080" "http://127.0.0.1:9/webhook" "test-secret"
   # Domain webhook configs are refreshed by the running server on its normal poll interval.
   sleep 65

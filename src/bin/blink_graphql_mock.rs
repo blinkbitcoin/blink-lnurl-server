@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 const FIXTURE_STATUS_PREIMAGE: [u8; 32] = [9_u8; 32];
-const FIXTURE_HOOKS_PREIMAGE: [u8; 32] = [10_u8; 32];
+const FIXTURE_SETTLEMENT_WEBHOOK_PREIMAGE: [u8; 32] = [10_u8; 32];
 const FIXTURE_SUPPLIED_WEBHOOK_PREIMAGE: [u8; 32] = [11_u8; 32];
+const FIXTURE_HOOKS_PREIMAGE: [u8; 32] = [12_u8; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MockScenario {
@@ -118,7 +119,9 @@ fn mock_invoice_response(body: &Value, wallet: Wallet) -> Value {
 
     let preimage = if wallet_id.contains("paid-fallback-preimage10") {
         FIXTURE_SUPPLIED_WEBHOOK_PREIMAGE
-    } else if wallet_id.contains("paid-fallback-hooks") {
+    } else if wallet_id.contains("paid-fallback-settlement10") {
+        FIXTURE_SETTLEMENT_WEBHOOK_PREIMAGE
+    } else if wallet_id.contains("paid-fallback-hooks10") {
         FIXTURE_HOOKS_PREIMAGE
     } else if wallet_id.contains("paid-fallback") {
         FIXTURE_STATUS_PREIMAGE
@@ -181,6 +184,7 @@ fn fixture_status_payment_hash() -> String {
 fn fixture_status_preimage_for_hash(payment_hash: &str) -> Option<[u8; 32]> {
     [
         FIXTURE_STATUS_PREIMAGE,
+        FIXTURE_SETTLEMENT_WEBHOOK_PREIMAGE,
         FIXTURE_HOOKS_PREIMAGE,
         FIXTURE_SUPPLIED_WEBHOOK_PREIMAGE,
     ]
