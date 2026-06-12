@@ -7,6 +7,7 @@ setup_file() {
   export LNURL_INTERNAL_JWKS_PATH="${ROOT_DIR}/tests/fixtures/internal_auth_jwks.json"
   export LNURL_INTERNAL_JWT_ISSUER="https://issuer.internal.test"
   export LNURL_INTERNAL_JWT_AUDIENCE="lnurl-server.internal.test"
+  export LNURL_POSTGRES_PORT="15432"
   start_blink_graphql_mock
   start_stack
 }
@@ -35,7 +36,7 @@ teardown_file() {
   [ "$status" -eq 0 ]
   assert_json_nonempty "$output" '.pr'
   assert_json_nonempty "$output" '.verify'
-  payment_hash="${output##*/verify/}"
+  payment_hash="$(json_get "$output" '.verify' | awk -F/ '{print $NF}')"
   [ "$(invoice_account_provider "${payment_hash}")" = "blink" ]
 }
 
@@ -74,7 +75,7 @@ teardown_file() {
   curl -fsS "$verify_url" >/dev/null
   payment_hash="${verify_url##*/}"
 
-  [ "$(webhook_delivery_count "${payment_hash}")" -ge 1 ]
+  [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
   [ "$(invoice_account_provider "${payment_hash}")" = "blink" ]
 }
 
@@ -82,7 +83,7 @@ teardown_file() {
   create_blink_account "blinkmove" "Blink transfer wallet" "btc" >/dev/null
   discovery="$(blink_lnurl_discovery "blinkmove")"
   invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
-  historical_hash="${invoice##*/verify/}"
+  historical_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
   destination_pubkey="$(json_get "$(auth_payload "blinkmove")" '.to_pubkey')"
 
   run transfer_blink_identifier_to_spark "blinkmove" "${destination_pubkey}" "Moved Spark wallet"
