@@ -55,6 +55,7 @@ fn assert_graphql_payment_status_request(request: &Request, payment_hash: &str) 
         .is_some_and(|query| {
             query.contains("LnInvoicePaymentStatusByHashQuery")
                 && query.contains("lnInvoicePaymentStatusByHash")
+                && query.contains("paymentPreimage")
         })
         && body
             .pointer("/variables/input/paymentHash")
@@ -265,6 +266,46 @@ async fn payment_status_maps_paid_status() {
             payment_hash: "paid-hash".to_string(),
             payment_request: Some("lnbc1paid".to_string()),
             preimage: None,
+            amount_received_sat: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn payment_status_maps_paid_status_with_payment_preimage() {
+    let server = MockServer::start().await;
+    let preimage = "00".repeat(32);
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| assert_graphql_payment_status_request(request, "paid-hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoicePaymentStatusByHash": {
+                    "status": "PAID",
+                    "paymentHash": "paid-hash",
+                    "paymentRequest": "lnbc1paid",
+                    "paymentPreimage": preimage
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let status = client
+        .payment_status("paid-hash")
+        .await
+        .expect("paid payment status with preimage should parse");
+
+    assert_eq!(
+        status,
+        PaymentStatus {
+            state: PaymentStatusState::Paid,
+            settled: true,
+            payment_hash: "paid-hash".to_string(),
+            payment_request: Some("lnbc1paid".to_string()),
+            preimage: Some(preimage),
             amount_received_sat: None,
         }
     );
