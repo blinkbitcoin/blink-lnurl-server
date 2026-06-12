@@ -15,6 +15,12 @@ fn invoice_request(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
     }
 }
 
+// TEST-03 traceability: this file owns detailed Blink GraphQL request-body
+// assertions. The mocked happy-path tests below cover BTC invoice creation, USD
+// invoice creation, and payment status variants; the endpoint and malformed/error
+// tests cover the deterministic no-live-Blink failure surfaces required by D-05
+// through D-07.
+
 fn assert_graphql_invoice_request(
     request: &Request,
     operation_name: &str,
