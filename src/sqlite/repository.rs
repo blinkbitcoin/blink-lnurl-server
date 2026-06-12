@@ -1708,6 +1708,32 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn spark_compatibility_registration_resolves_provider_neutral_owner() {
+        shared_tests::spark_compatibility_registration_resolves_provider_neutral_owner(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn blink_account_creation_persists_wallet_fields() {
+        shared_tests::blink_account_creation_persists_wallet_fields(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn global_identifier_conflict_rejects_cross_provider_duplicate() {
+        shared_tests::global_identifier_conflict_rejects_cross_provider_duplicate(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lookup_by_username_and_normalized_phone_matches() {
+        shared_tests::lookup_by_username_and_normalized_phone_matches(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
     async fn transfer_identifier_requires_source_owner() {
         shared_tests::transfer_identifier_requires_source_owner(&setup_test_db().await).await;
     }

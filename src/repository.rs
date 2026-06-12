@@ -737,6 +737,198 @@ pub mod shared_tests {
         assert_eq!(by_pubkey.account_id, account_id);
     }
 
+    pub async fn spark_compatibility_registration_resolves_provider_neutral_owner<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-15: Spark compatibility registration must remain visible
+        // through provider-neutral recipient lookup and legacy recover lookup.
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_compatibility_owner_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "test02-spark.example.com".to_string(),
+                identifier: "sparkcompat".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "Spark compatibility owner".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("test02-spark.example.com", "sparkcompat")
+            .await
+            .unwrap()
+            .expect("Spark registration should resolve provider-neutral owner");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Spark);
+        assert_eq!(recipient.identifier_kind, AccountIdentifierKind::Username);
+        assert_eq!(recipient.description, "Spark compatibility owner");
+        assert_eq!(
+            recipient.spark_pubkey.as_deref(),
+            Some("spark_compatibility_owner_pubkey")
+        );
+        assert!(recipient.blink_account_id.is_none());
+
+        let legacy_user = db
+            .get_user_by_pubkey(
+                "test02-spark.example.com",
+                "spark_compatibility_owner_pubkey",
+            )
+            .await
+            .unwrap()
+            .expect("Spark compatibility recover lookup should still work");
+        assert_eq!(legacy_user.name, "sparkcompat");
+        assert_eq!(legacy_user.description, "Spark compatibility owner");
+    }
+
+    pub async fn blink_account_creation_persists_wallet_fields<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-03: Blink account creation persists provider-neutral
+        // ownership plus BTC/USD/default-wallet fields for a username alias.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_test02_wallet_account".to_string(),
+            btc_wallet_id: "blink_test02_btc_wallet".to_string(),
+            usd_wallet_id: "blink_test02_usd_wallet".to_string(),
+            default_wallet: WalletKind::Usd,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "test02-blink.example.com".to_string(),
+                identifier: "blinkwallet".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "Blink wallet owner".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("test02-blink.example.com", "blinkwallet")
+            .await
+            .unwrap()
+            .expect("Blink username should resolve provider-neutral owner");
+        assert_eq!(recipient.account_id, account_id);
+        assert_eq!(recipient.provider, AccountProvider::Blink);
+        assert_eq!(recipient.identifier_kind, AccountIdentifierKind::Username);
+        assert_eq!(
+            recipient.blink_account_id.as_deref(),
+            Some("blink_test02_wallet_account")
+        );
+        assert_eq!(
+            recipient.btc_wallet_id.as_deref(),
+            Some("blink_test02_btc_wallet")
+        );
+        assert_eq!(
+            recipient.usd_wallet_id.as_deref(),
+            Some("blink_test02_usd_wallet")
+        );
+        assert_eq!(recipient.default_wallet, Some(WalletKind::Usd));
+        assert!(recipient.spark_pubkey.is_none());
+    }
+
+    pub async fn global_identifier_conflict_rejects_cross_provider_duplicate<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/T-09-02-01: the global (domain, identifier) uniqueness
+        // invariant rejects cross-provider duplicate ownership.
+        let identifier = NewAccountIdentifier {
+            domain: "test02-conflict.example.com".to_string(),
+            identifier: "duplicate".to_string(),
+            identifier_kind: AccountIdentifierKind::Username,
+            description: "Spark first owner".to_string(),
+        };
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(generate_account_id(AccountProvider::Spark)),
+            pubkey: "spark_test02_conflict_pubkey".to_string(),
+            identifier: identifier.clone(),
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(generate_account_id(AccountProvider::Blink)),
+                blink_account_id: "blink_test02_conflict_account".to_string(),
+                btc_wallet_id: "blink_test02_conflict_btc".to_string(),
+                usd_wallet_id: "blink_test02_conflict_usd".to_string(),
+                default_wallet: WalletKind::Btc,
+                identifiers: vec![identifier],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::IdentifierConflict)
+        ));
+    }
+
+    pub async fn lookup_by_username_and_normalized_phone_matches<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // TEST-02/D-03: repository lookup accepts the already-normalized E.164
+        // phone identifier produced by the public/internal identifier parser and
+        // returns the same Blink recipient shape as a username alias.
+        let account_id = generate_account_id(AccountProvider::Blink);
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some(account_id.clone()),
+            blink_account_id: "blink_test02_phone_account".to_string(),
+            btc_wallet_id: "blink_test02_phone_btc".to_string(),
+            usd_wallet_id: "blink_test02_phone_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "test02-phone.example.com".to_string(),
+                    identifier: "phoneuser".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "Blink username alias".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "test02-phone.example.com".to_string(),
+                    identifier: "+573005871212".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "Blink normalized phone alias".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+        let username = db
+            .resolve_recipient_by_identifier("test02-phone.example.com", "phoneuser")
+            .await
+            .unwrap()
+            .expect("username alias should resolve");
+        let phone = db
+            .resolve_recipient_by_identifier("test02-phone.example.com", "+573005871212")
+            .await
+            .unwrap()
+            .expect("normalized phone alias should resolve");
+
+        assert_eq!(username.account_id, account_id);
+        assert_eq!(phone.account_id, username.account_id);
+        assert_eq!(phone.provider, AccountProvider::Blink);
+        assert_eq!(phone.identifier_kind, AccountIdentifierKind::Phone);
+        assert_eq!(
+            phone.blink_account_id.as_deref(),
+            username.blink_account_id.as_deref()
+        );
+        assert_eq!(
+            phone.btc_wallet_id.as_deref(),
+            username.btc_wallet_id.as_deref()
+        );
+        assert_eq!(
+            phone.usd_wallet_id.as_deref(),
+            username.usd_wallet_id.as_deref()
+        );
+        assert_eq!(phone.default_wallet, username.default_wallet);
+    }
+
     pub async fn transfer_identifier_requires_source_owner<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
