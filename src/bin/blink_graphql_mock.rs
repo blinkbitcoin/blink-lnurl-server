@@ -157,8 +157,7 @@ fn mock_status_response(body: &Value, paid: bool) -> Value {
     };
     let preimage = paid.then(|| {
         fixture_status_preimage_for_hash(&payment_hash)
-            .map(hex::encode)
-            .unwrap_or_else(|| hex::encode(FIXTURE_STATUS_PREIMAGE))
+            .map_or_else(|| hex::encode(FIXTURE_STATUS_PREIMAGE), hex::encode)
     });
     json!({
         "data": {

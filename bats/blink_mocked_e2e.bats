@@ -7,7 +7,7 @@ setup_file() {
   export LNURL_INTERNAL_JWKS_PATH="${ROOT_DIR}/tests/fixtures/internal_auth_jwks.json"
   export LNURL_INTERNAL_JWT_ISSUER="https://issuer.internal.test"
   export LNURL_INTERNAL_JWT_AUDIENCE="lnurl-server.internal.test"
-  export LNURL_POSTGRES_PORT="15432"
+  export LNURL_POSTGRES_PORT="${LNURL_POSTGRES_PORT:-25432}"
   start_blink_graphql_mock
   start_stack
 }
