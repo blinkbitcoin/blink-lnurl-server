@@ -215,6 +215,95 @@ async fn maps_payload_errors_to_api_failure() {
 }
 
 #[tokio::test]
+async fn maps_usd_payload_errors_to_api_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_invoice_request(
+                request,
+                "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient",
+                "usd-wallet-id",
+            )
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": {
+                    "invoice": null,
+                    "errors": [{ "message": "usd wallet unavailable" }]
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .create_usd_invoice(invoice_request("usd-wallet-id"))
+        .await
+        .expect_err("USD payload errors must be semantic Blink API failures");
+
+    let BlinkClientError::ApiFailure(message) = error else {
+        panic!("expected ApiFailure error");
+    };
+    assert_eq!(message, "usd wallet unavailable");
+}
+
+#[tokio::test]
+async fn maps_missing_graphql_data_to_malformed_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_invoice_request(
+                request,
+                "lnInvoiceCreateOnBehalfOfRecipient",
+                "btc-wallet-id",
+            )
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .create_btc_invoice(invoice_request("btc-wallet-id"))
+        .await
+        .expect_err("missing GraphQL data must be rejected");
+
+    assert!(matches!(
+        error,
+        BlinkClientError::MalformedResponse("missing GraphQL data")
+    ));
+}
+
+#[tokio::test]
+async fn maps_invalid_json_to_transport_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| assert_graphql_payment_status_request(request, "bad-json-hash"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string("{not valid json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .payment_status("bad-json-hash")
+        .await
+        .expect_err("invalid JSON must not be accepted as a status response");
+
+    assert!(matches!(error, BlinkClientError::Transport(_)));
+}
+
+#[tokio::test]
 async fn maps_missing_invoice_fields_to_malformed_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
