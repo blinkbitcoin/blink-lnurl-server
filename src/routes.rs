@@ -3171,6 +3171,15 @@ mod tests {
         payload: InternalTransferToSparkRequest,
         scope: &str,
     ) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(&payload).expect("request serializes");
+        post_internal_transfer_to_spark_raw(app, body, scope).await
+    }
+
+    async fn post_internal_transfer_to_spark_raw(
+        app: Router,
+        body: impl Into<axum::body::Body>,
+        scope: &str,
+    ) -> (StatusCode, Value) {
         let request = Request::builder()
             .method("POST")
             .uri("/internal/identifiers/transfer-to-spark")
@@ -3179,9 +3188,7 @@ mod tests {
                 format!("Bearer {}", internal_test_token_with_scope(scope)),
             )
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                serde_json::to_vec(&payload).expect("request serializes"),
-            ))
+            .body(body.into())
             .expect("request builds");
 
         let response = app.oneshot(request).await.expect("route responds");
@@ -3380,7 +3387,9 @@ mod tests {
         InternalTransferToSparkRequest {
             domain: "Example.COM".to_string(),
             identifier: " Alice ".to_string(),
-            destination_spark_pubkey: "destination_spark_pubkey".to_string(),
+            destination_spark_pubkey:
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                    .to_string(),
             description: "Moved to Spark".to_string(),
         }
     }
@@ -5143,6 +5152,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_invalid_destination_pubkey_without_transfer() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+        let mut payload = valid_internal_transfer_to_spark_payload();
+        payload.destination_spark_pubkey = "not-a-pubkey".to_string();
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            payload,
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_missing_scope_rejects_malformed_json_before_parsing() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark_raw(
+            app,
+            "{",
+            "blink:accounts:create accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
     async fn internal_transfer_to_spark_rejects_spark_owned_source() {
         let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
         let app = internal_transfer_to_spark_app(repo.clone()).await;
@@ -5175,7 +5222,10 @@ mod tests {
         assert_eq!(body["domain"], "example.com");
         assert_eq!(body["identifier"], "alice");
         assert_eq!(body["provider"], "spark");
-        assert_eq!(body["spark_pubkey"], "destination_spark_pubkey");
+        assert_eq!(
+            body["spark_pubkey"],
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
         assert_eq!(body["lightning_address"], "alice@example.com");
         assert_eq!(body["lnurl"], "lnurlp://example.com/lnurlp/alice");
         assert_eq!(
@@ -5189,7 +5239,7 @@ mod tests {
         assert_eq!(transfer.source_account_id, "acct_blink_lookup");
         assert_eq!(
             transfer.destination_spark_pubkey,
-            "destination_spark_pubkey"
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
         );
         assert_eq!(transfer.description, "Moved to Spark");
     }
