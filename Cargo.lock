@@ -2320,6 +2320,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "spark",
+ "spark-client",
  "spark-wallet",
  "sqlx",
  "thiserror 2.0.18",
@@ -3874,6 +3875,20 @@ dependencies = [
  "unicode-normalization",
  "utils",
  "uuid",
+]
+
+[[package]]
+name = "spark-client"
+version = "0.1.1-dev"
+dependencies = [
+ "anyhow",
+ "bitcoin",
+ "hex",
+ "serde_json",
+ "spark",
+ "spark-wallet",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

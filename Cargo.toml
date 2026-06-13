@@ -4,7 +4,7 @@ edition = "2024"
 version = "0.1.1-dev"
 
 [workspace]
-members = ["crates/blink-client"]
+members = ["crates/blink-client", "crates/spark-client"]
 
 [[bin]]
 name = "lnurl-server"
@@ -31,6 +31,7 @@ regex = "1.11.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_with = "3.13.0"
+spark-client = { path = "crates/spark-client" }
 spark = { git = "https://github.com/breez/spark-sdk", rev = "2c80c32db4489447af4c5600c39c272d6e8845d2", package = "spark" }
 spark-wallet = { git = "https://github.com/breez/spark-sdk", rev = "2c80c32db4489447af4c5600c39c272d6e8845d2", package = "spark-wallet" }
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
