@@ -376,7 +376,9 @@ where
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
         args.blink_graphql_endpoint.clone(),
     ));
-    let providers = Arc::new(ProviderRegistry::new(Arc::clone(&wallet), blink_client));
+    let spark_client =
+        spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
+    let providers = Arc::new(ProviderRegistry::new(spark_client, blink_client));
 
     let state = State {
         db: repository,

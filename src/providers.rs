@@ -115,19 +115,19 @@ pub trait LnurlProvider: Send + Sync {
 }
 
 pub struct SparkProvider {
-    wallet: Option<Arc<spark_wallet::SparkWallet>>,
+    client: Option<spark_client::Client>,
 }
 
 impl SparkProvider {
-    pub fn new(wallet: Arc<spark_wallet::SparkWallet>) -> Self {
+    pub fn new(client: spark_client::Client) -> Self {
         Self {
-            wallet: Some(wallet),
+            client: Some(client),
         }
     }
 
     #[cfg(test)]
     fn new_without_wallet_for_tests() -> Self {
-        Self { wallet: None }
+        Self { client: None }
     }
 }
 
@@ -158,27 +158,25 @@ impl LnurlProvider for SparkProvider {
         };
         let pubkey =
             PublicKey::from_str(spark_pubkey).map_err(|_| ProviderError::InvalidSparkPubkey)?;
-        let Some(wallet) = self.wallet.as_ref() else {
+        let Some(client) = self.client.as_ref() else {
             return Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
-                "Spark wallet unavailable in provider unit test"
+                "Spark client unavailable in provider unit test"
             )));
         };
 
-        let invoice = wallet
-            .create_lightning_invoice(
-                request.amount_sat,
-                Some(spark_wallet::InvoiceDescription::DescriptionHash(
-                    request.description_hash,
-                )),
-                Some(pubkey),
-                request.expiry,
-                request.include_spark_address,
-            )
+        let invoice = client
+            .create_lightning_invoice(spark_client::CreateInvoiceRequest {
+                amount_sat: request.amount_sat,
+                description_hash: request.description_hash,
+                receiver_pubkey: pubkey,
+                expiry_secs: request.expiry,
+                include_spark_address: request.include_spark_address,
+            })
             .await
             .map_err(|e| ProviderError::InvoiceCreationFailed(e.into()))?;
 
         Ok(ProviderInvoice {
-            bolt11: invoice.invoice,
+            bolt11: invoice.bolt11,
             wallet_kind: WalletKind::Btc,
             wallet_id: None,
             provider_payment_hash: None,
@@ -340,9 +338,9 @@ pub fn parse_blink_settlement_notification(
 }
 
 impl ProviderRegistry {
-    pub fn new(wallet: Arc<spark_wallet::SparkWallet>, blink_client: blink_client::Client) -> Self {
+    pub fn new(spark_client: spark_client::Client, blink_client: blink_client::Client) -> Self {
         Self {
-            spark: Arc::new(SparkProvider::new(wallet)),
+            spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new(blink_client)),
         }
     }
@@ -406,7 +404,7 @@ mod tests {
     fn spark_provider_runtime_uses_spark_client_adapter_for_invoice_creation() {
         let providers_source = include_str!("providers.rs");
         let provider_runtime_source = providers_source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("providers source should have runtime section");
 

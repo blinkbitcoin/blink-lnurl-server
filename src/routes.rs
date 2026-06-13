@@ -2821,7 +2821,9 @@ mod tests {
             .unwrap(),
         );
         let providers = Arc::new(crate::providers::ProviderRegistry::new(
-            Arc::clone(&wallet),
+            spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
+                .await
+                .unwrap(),
             blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
         ));
         let (invoice_paid_trigger, _rx) = watch::channel(());
@@ -4222,8 +4224,9 @@ mod tests {
 
         let providers_source = include_str!("providers.rs");
         let provider_runtime_source = providers_source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
+            .and_then(|runtime| runtime.split("pub enum BlinkSettlementNotification").next())
             .expect("providers source should have runtime section");
         assert!(!provider_runtime_source.contains("use axum"));
         assert!(!provider_runtime_source.contains("serde_json"));
