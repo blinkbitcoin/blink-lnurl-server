@@ -1,17 +1,11 @@
-use spark::operator::OperatorConfig;
-use spark::operator::rpc::ConnectionManager;
-use spark::session_store::InMemorySessionStore;
-use spark::ssp::ServiceProvider;
-use spark_wallet::DefaultSigner;
 use std::{collections::HashSet, sync::Arc};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{RwLock, watch};
 
 use crate::providers::ProviderRegistry;
 
 pub struct State<DB> {
     pub db: DB,
     pub webhook_service: crate::webhooks::WebhookService<DB>,
-    pub wallet: Arc<spark_wallet::SparkWallet>,
     pub spark_client: spark_client::Client,
     pub providers: Arc<ProviderRegistry>,
     pub internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
@@ -24,12 +18,6 @@ pub struct State<DB> {
     pub ca_cert: Option<Vec<u8>>,
     pub crl_url: Option<String>,
     pub crl: HashSet<String>,
-    pub connection_manager: Arc<dyn ConnectionManager>,
-    pub coordinator: OperatorConfig,
-    pub signer: Arc<DefaultSigner>,
-    pub session_store: Arc<InMemorySessionStore>,
-    pub service_provider: Arc<ServiceProvider>,
-    pub subscribed_keys: Arc<Mutex<HashSet<String>>>,
     pub invoice_paid_trigger: watch::Sender<()>,
     pub webhook_secret: String,
 }
@@ -42,7 +30,6 @@ where
         Self {
             db: self.db.clone(),
             webhook_service: self.webhook_service.clone(),
-            wallet: Arc::clone(&self.wallet),
             spark_client: self.spark_client.clone(),
             providers: Arc::clone(&self.providers),
             internal_auth: self.internal_auth.as_ref().map(Arc::clone),
@@ -55,12 +42,6 @@ where
             ca_cert: self.ca_cert.clone(),
             crl_url: self.crl_url.clone(),
             crl: self.crl.clone(),
-            connection_manager: self.connection_manager.clone(),
-            coordinator: self.coordinator.clone(),
-            signer: self.signer.clone(),
-            session_store: self.session_store.clone(),
-            service_provider: self.service_provider.clone(),
-            subscribed_keys: Arc::clone(&self.subscribed_keys),
             invoice_paid_trigger: self.invoice_paid_trigger.clone(),
             webhook_secret: self.webhook_secret.clone(),
         }

@@ -16,17 +16,11 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
-use spark::operator::rpc::DefaultConnectionManager;
-use spark::session_store::InMemorySessionStore;
-use spark::ssp::{ServiceProvider, SparkWalletWebhookEventType};
-use spark::token::InMemoryTokenOutputStore;
-use spark::tree::InMemoryTreeStore;
-use spark_wallet::{DefaultSigner, Network, SparkWalletConfig};
 use sqlx::{PgPool, SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -76,7 +70,7 @@ struct Args {
 
     /// Spark network.
     #[arg(long, default_value = "mainnet")]
-    pub network: Network,
+    pub network: spark_client::Network,
 
     /// Scheme prefix for lnurl urls.
     #[arg(long, default_value = "https")]
@@ -239,41 +233,8 @@ where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
-
-    let mut spark_config = SparkWalletConfig::default_config(args.network);
-    spark_config.service_provider_config.schema_endpoint = Some("graphql/spark/rc".to_string());
-
-    // Create shared infrastructure components
-    let signer = Arc::new(DefaultSigner::new(&auth_seed, args.network)?);
-    let session_store = Arc::new(InMemorySessionStore::default());
-    let connection_manager: Arc<dyn spark::operator::rpc::ConnectionManager> =
-        Arc::new(DefaultConnectionManager::new());
-    let coordinator = spark_config.operator_pool.get_coordinator().clone();
-    let service_provider = Arc::new(ServiceProvider::new(
-        spark_config.service_provider_config.clone(),
-        signer.clone(),
-        session_store.clone(),
-        None,
-    ));
-
-    // Create wallet using shared signer
-    let wallet = Arc::new(
-        spark_wallet::SparkWallet::new(
-            spark_config.clone(),
-            signer.clone(),
-            session_store.clone(),
-            Arc::new(InMemoryTreeStore::default()),
-            Arc::new(InMemoryTokenOutputStore::default()),
-            Arc::clone(&connection_manager),
-            None,
-            None,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await?,
-    );
+    let spark_client =
+        spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
 
     let config_domains: Vec<String> = args
         .domains
@@ -327,8 +288,6 @@ where
         })
         .transpose()?;
 
-    let subscribed_keys = Arc::new(Mutex::new(HashSet::new()));
-
     // Create watch channel for triggering background processing
     let (invoice_paid_trigger, invoice_paid_rx) = watch::channel(());
 
@@ -366,24 +325,17 @@ where
 
     if let Some(webhook_domain) = &args.webhook_domain {
         let webhook_url = format!("{}://{}/webhook", args.scheme, webhook_domain);
-        register_webhook(
-            Arc::clone(&service_provider),
-            webhook_url,
-            webhook_secret.clone(),
-        );
+        register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
 
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
         args.blink_graphql_endpoint.clone(),
     ));
-    let spark_client =
-        spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
     let providers = Arc::new(ProviderRegistry::new(spark_client.clone(), blink_client));
 
     let state = State {
         db: repository,
         webhook_service,
-        wallet,
         spark_client,
         providers,
         internal_auth,
@@ -405,12 +357,6 @@ where
         ca_cert,
         crl_url: args.crl_url,
         crl,
-        connection_manager,
-        coordinator,
-        signer,
-        session_store,
-        service_provider,
-        subscribed_keys,
         invoice_paid_trigger,
         webhook_secret,
     };
@@ -561,18 +507,17 @@ async fn load_internal_auth_state(args: &Args) -> Option<Arc<internal_auth::Inte
     }
 }
 
-fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String, secret: String) {
+fn register_webhook(spark_client: spark_client::Client, webhook_url: String, secret: String) {
     tokio::spawn(async move {
         let mut delay = std::time::Duration::from_secs(1);
         let max_delay = std::time::Duration::from_mins(1);
         loop {
             info!("registering webhook with SSP at {}", webhook_url);
-            match service_provider
-                .register_wallet_webhook(
-                    &webhook_url,
-                    &secret,
-                    vec![SparkWalletWebhookEventType::SparkLightningReceiveFinished],
-                )
+            match spark_client
+                .register_wallet_webhook(spark_client::WebhookRegistrationRequest {
+                    webhook_url: webhook_url.clone(),
+                    secret: secret.clone(),
+                })
                 .await
             {
                 Ok(_) => {

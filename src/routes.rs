@@ -2803,37 +2803,8 @@ mod tests {
         internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
         blink_endpoint: &str,
     ) -> State<MockRepository> {
-        let network = spark_wallet::Network::Regtest;
+        let network = spark_client::Network::Regtest;
         let auth_seed = [7_u8; 32];
-        let spark_config = spark_wallet::SparkWalletConfig::default_config(network);
-        let signer = Arc::new(spark_wallet::DefaultSigner::new(&auth_seed, network).unwrap());
-        let session_store = Arc::new(spark::session_store::InMemorySessionStore::default());
-        let connection_manager: Arc<dyn spark::operator::rpc::ConnectionManager> =
-            Arc::new(spark::operator::rpc::DefaultConnectionManager::new());
-        let service_provider = Arc::new(spark::ssp::ServiceProvider::new(
-            spark_config.service_provider_config.clone(),
-            signer.clone(),
-            session_store.clone(),
-            None,
-        ));
-        let wallet = Arc::new(
-            spark_wallet::SparkWallet::new(
-                spark_config.clone(),
-                signer.clone(),
-                session_store.clone(),
-                Arc::new(spark::tree::InMemoryTreeStore::default()),
-                Arc::new(spark::token::InMemoryTokenOutputStore::default()),
-                Arc::clone(&connection_manager),
-                None,
-                None,
-                None,
-                None,
-                true,
-                None,
-            )
-            .await
-            .unwrap(),
-        );
         let spark_client =
             spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
                 .await
@@ -2846,7 +2817,6 @@ mod tests {
         State {
             db: repo.clone(),
             webhook_service: crate::webhooks::WebhookService::new(repo),
-            wallet,
             spark_client,
             providers,
             internal_auth,
@@ -2859,12 +2829,6 @@ mod tests {
             ca_cert: None,
             crl_url: None,
             crl: std::collections::HashSet::new(),
-            connection_manager,
-            coordinator: spark_config.operator_pool.get_coordinator().clone(),
-            signer,
-            session_store,
-            service_provider,
-            subscribed_keys: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             invoice_paid_trigger,
             webhook_secret: TEST_WEBHOOK_SECRET.to_string(),
         }
@@ -4277,7 +4241,9 @@ mod tests {
         assert!(production_main.contains("parse_auth_seed(args.ssp_auth_seed.as_deref())"));
         assert!(production_main.contains("spark_client::ClientConfig::new(args.network"));
         assert!(production_main.contains("register_webhook(spark_client.clone()"));
-        assert!(production_main.contains("format!(\"{}://{}/webhook\", args.scheme, webhook_domain)"));
+        assert!(
+            production_main.contains("format!(\"{}://{}/webhook\", args.scheme, webhook_domain)")
+        );
         assert!(production_main.contains("std::time::Duration::from_secs(1)"));
         assert!(production_main.contains("std::time::Duration::from_mins(1)"));
 
