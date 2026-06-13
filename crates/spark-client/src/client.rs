@@ -30,7 +30,8 @@ impl Client {
                 .map_err(|e| SparkClientError::WalletConstruction(e.into()))?,
         );
         let session_store = Arc::new(InMemorySessionStore::default());
-        let connection_manager: Arc<dyn ConnectionManager> = Arc::new(DefaultConnectionManager::new());
+        let connection_manager: Arc<dyn ConnectionManager> =
+            Arc::new(DefaultConnectionManager::new());
         let service_provider = Arc::new(ServiceProvider::new(
             spark_config.service_provider_config.clone(),
             signer.clone(),
@@ -71,7 +72,9 @@ impl Client {
             .wallet
             .create_lightning_invoice(
                 request.amount_sat,
-                Some(InvoiceDescription::DescriptionHash(request.description_hash)),
+                Some(InvoiceDescription::DescriptionHash(
+                    request.description_hash,
+                )),
                 Some(request.receiver_pubkey),
                 request.expiry_secs,
                 request.include_spark_address,
