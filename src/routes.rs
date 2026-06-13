@@ -4266,6 +4266,60 @@ mod tests {
     }
 
     #[test]
+    fn spark_bootstrap_and_state_source_use_adapter_boundary() {
+        let main_source = include_str!("main.rs");
+        let production_main = main_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("main source should have production section");
+        let state_source = include_str!("state.rs");
+
+        assert!(production_main.contains("parse_auth_seed(args.ssp_auth_seed.as_deref())"));
+        assert!(production_main.contains("spark_client::ClientConfig::new(args.network"));
+        assert!(production_main.contains("register_webhook(spark_client.clone()"));
+        assert!(production_main.contains("format!(\"{}://{}/webhook\", args.scheme, webhook_domain)"));
+        assert!(production_main.contains("std::time::Duration::from_secs(1)"));
+        assert!(production_main.contains("std::time::Duration::from_mins(1)"));
+
+        for marker in [
+            "use spark::",
+            "use spark_wallet::",
+            "SparkWalletConfig",
+            "DefaultSigner",
+            "ServiceProvider",
+            "InMemoryTreeStore",
+            "InMemoryTokenOutputStore",
+            "SparkWalletWebhookEventType",
+        ] {
+            assert!(
+                !production_main.contains(marker),
+                "main runtime must not contain raw Spark marker {marker}"
+            );
+        }
+
+        for marker in [
+            "use spark::",
+            "use spark_wallet::",
+            "SparkWallet",
+            "DefaultSigner",
+            "ServiceProvider",
+            "ConnectionManager",
+            "InMemorySessionStore",
+            "pub wallet",
+            "pub connection_manager",
+            "pub coordinator",
+            "pub signer",
+            "pub session_store",
+            "pub service_provider",
+        ] {
+            assert!(
+                !state_source.contains(marker),
+                "state must not expose raw Spark marker {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
         // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
         // alice+usd are public route identities only. Storage and dispatch must
