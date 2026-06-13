@@ -4233,6 +4233,22 @@ mod tests {
     }
 
     #[test]
+    fn spark_signature_validation_source_uses_adapter_boundary() {
+        let routes_source = include_str!("routes.rs");
+        let production_routes = routes_source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("routes source should have production section");
+        let state_source = include_str!("state.rs");
+
+        assert!(production_routes.contains("Signature::from_der"));
+        assert!(production_routes.contains("ACCEPTABLE_TIME_DIFF_SECS"));
+        assert!(!production_routes.contains("state.wallet.verify_message"));
+        assert!(production_routes.contains("state.spark_client.verify_message"));
+        assert!(state_source.contains("pub spark_client"));
+    }
+
+    #[test]
     fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
         // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
         // alice+usd are public route identities only. Storage and dispatch must
