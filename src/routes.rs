@@ -2009,6 +2009,13 @@ fn validate_description(description: &str) -> Result<(), (StatusCode, Json<Value
     Ok(())
 }
 
+async fn verify_with_spark_client<DB>(
+    state: &State<DB>,
+    request: spark_client::VerifyMessageRequest<'_>,
+) -> Result<(), spark_client::SparkClientError> {
+    state.spark_client.verify_message(request).await
+}
+
 async fn validate<DB>(
     pubkey: &str,
     signature: &str,
@@ -2045,9 +2052,13 @@ async fn validate<DB>(
         ));
     }
 
-    state
-        .wallet
-        .verify_message(&format!("{message}-{timestamp}"), &signature, &pubkey)
+    let signed_message = format!("{message}-{timestamp}");
+    let verify_request = spark_client::VerifyMessageRequest {
+        message: &signed_message,
+        signature: &signature,
+        public_key: &pubkey,
+    };
+    verify_with_spark_client(state, verify_request)
         .await
         .map_err(|e| {
             trace!("invalid signature with timestamp, could not verify: {}", e);
@@ -2091,9 +2102,12 @@ async fn verify_transfer_signature<DB>(
         )
     })?;
 
-    state
-        .wallet
-        .verify_message(message, &signature, &pk)
+    let verify_request = spark_client::VerifyMessageRequest {
+        message,
+        signature: &signature,
+        public_key: &pk,
+    };
+    verify_with_spark_client(state, verify_request)
         .await
         .map_err(|e| {
             trace!("invalid transfer signature, could not verify: {}", e);
@@ -2820,10 +2834,12 @@ mod tests {
             .await
             .unwrap(),
         );
-        let providers = Arc::new(crate::providers::ProviderRegistry::new(
+        let spark_client =
             spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
                 .await
-                .unwrap(),
+                .unwrap();
+        let providers = Arc::new(crate::providers::ProviderRegistry::new(
+            spark_client.clone(),
             blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
         ));
         let (invoice_paid_trigger, _rx) = watch::channel(());
@@ -2831,6 +2847,7 @@ mod tests {
             db: repo.clone(),
             webhook_service: crate::webhooks::WebhookService::new(repo),
             wallet,
+            spark_client,
             providers,
             internal_auth,
             scheme: "http".to_string(),

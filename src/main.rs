@@ -378,12 +378,13 @@ where
     ));
     let spark_client =
         spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
-    let providers = Arc::new(ProviderRegistry::new(spark_client, blink_client));
+    let providers = Arc::new(ProviderRegistry::new(spark_client.clone(), blink_client));
 
     let state = State {
         db: repository,
         webhook_service,
         wallet,
+        spark_client,
         providers,
         internal_auth,
         scheme: args.scheme,
