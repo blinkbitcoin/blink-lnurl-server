@@ -6236,13 +6236,11 @@ mod tests {
 
     // -- Transfer signature verification ---------------------------------------
     //
-    // The transfer route verifies signatures via SparkWallet::verify_message,
-    // which delegates to verify_signature_ecdsa. These exercise that
-    // verification over the route's canonical "transfer:{username}-{to_pubkey}"
-    // message without needing to construct a wallet.
+    // The transfer route verifies signatures through spark-client. These local
+    // checks exercise the same canonical "transfer:{username}-{to_pubkey}"
+    // message binding without constructing a runtime Spark client.
 
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
-    use spark::utils::verify_signature::verify_signature_ecdsa;
 
     /// Deterministic keypair from a seed byte.
     fn transfer_key(seed: u8) -> (SecretKey, PublicKey) {
@@ -6273,7 +6271,12 @@ mod tests {
         let sig = sign(&alice_secret, &message);
 
         assert!(
-            verify_signature_ecdsa(&secp, &message, &sig, &alice_pubkey).is_ok(),
+            secp.verify_ecdsa(
+                &Message::from_digest(sha256::Hash::hash(message.as_bytes()).to_byte_array()),
+                &sig,
+                &alice_pubkey,
+            )
+            .is_ok(),
             "a valid signature over the canonical message must verify"
         );
     }
@@ -6288,7 +6291,12 @@ mod tests {
         let sig = sign(&alice_secret, &message);
 
         assert!(
-            verify_signature_ecdsa(&secp, &message, &sig, &bob_pubkey).is_err(),
+            secp.verify_ecdsa(
+                &Message::from_digest(sha256::Hash::hash(message.as_bytes()).to_byte_array()),
+                &sig,
+                &bob_pubkey,
+            )
+            .is_err(),
             "a signature made by a different key must be rejected"
         );
     }
@@ -6308,7 +6316,12 @@ mod tests {
         let register_style = String::from("alice-1700000000");
         for other in [tampered_username, register_style] {
             assert!(
-                verify_signature_ecdsa(&secp, &other, &sig, &alice_pubkey).is_err(),
+                secp.verify_ecdsa(
+                    &Message::from_digest(sha256::Hash::hash(other.as_bytes()).to_byte_array()),
+                    &sig,
+                    &alice_pubkey,
+                )
+                .is_err(),
                 "signature must not verify against a different message: {other}"
             );
         }
