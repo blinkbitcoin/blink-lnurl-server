@@ -402,6 +402,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn spark_provider_runtime_uses_spark_client_adapter_for_invoice_creation() {
+        let providers_source = include_str!("providers.rs");
+        let provider_runtime_source = providers_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("providers source should have runtime section");
+
+        assert!(provider_runtime_source.contains("Option<spark_client::Client>"));
+        assert!(provider_runtime_source.contains("create_lightning_invoice"));
+        assert!(!provider_runtime_source.contains("spark_wallet::SparkWallet"));
+        assert!(!provider_runtime_source.contains("spark_wallet::InvoiceDescription"));
+    }
+
     #[tokio::test]
     async fn spark_provider_rejects_usd_wallet() {
         let provider = spark_provider_for_unit_tests();
