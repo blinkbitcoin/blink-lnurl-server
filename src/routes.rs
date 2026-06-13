@@ -4285,6 +4285,75 @@ mod tests {
         }
     }
 
+    fn strip_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn spark_client_extraction_source_audit_guards_runtime_boundaries() {
+        let main_source = include_str!("main.rs");
+        let state_source = include_str!("state.rs");
+        let providers_source = include_str!("providers.rs");
+        let e2e_auth_source = include_str!("bin/e2e_auth.rs");
+        let routes_source = include_str!("routes.rs");
+
+        let production_main = strip_line_comments(
+            main_source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .expect("main source should have production section"),
+        );
+        let production_state = strip_line_comments(state_source);
+        let production_providers = strip_line_comments(
+            providers_source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .and_then(|runtime| runtime.split("pub enum BlinkSettlementNotification").next())
+                .expect("providers source should have production section"),
+        );
+        let production_routes = strip_line_comments(
+            routes_source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .expect("routes source should have production section"),
+        );
+
+        assert!(e2e_auth_source.contains("spark_client::Client::build_auth_payload"));
+        for marker in ["use spark::", "use spark_wallet::"] {
+            assert!(
+                !e2e_auth_source.contains(marker),
+                "e2e_auth must use adapter signing, not raw marker {marker}"
+            );
+        }
+
+        for (name, source) in [
+            ("src/main.rs", production_main.as_str()),
+            ("src/state.rs", production_state.as_str()),
+            ("src/providers.rs", production_providers.as_str()),
+            ("src/routes.rs", production_routes.as_str()),
+        ] {
+            for marker in [
+                "use spark::",
+                "use spark_wallet::",
+                "spark_wallet::SparkWallet",
+                "SparkWalletConfig",
+                "DefaultSigner",
+                "state.wallet.verify_message",
+                "ServiceProvider::new",
+                "SparkWalletWebhookEventType",
+            ] {
+                assert!(
+                    !source.contains(marker),
+                    "{name} runtime boundary must not contain raw Spark marker {marker}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
         // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
