@@ -1192,12 +1192,12 @@ where
                     payload.payment_preimage.as_deref(),
                 )
                 .await
-                .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, e))?;
+                .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, &e))?;
             }
             BlinkInvoiceWebhookStatus::Expired => {
                 expire_blink_invoice_by_payment_hash(&state, &payload.payment_hash)
                     .await
-                    .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, e))?;
+                    .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, &e))?;
             }
         }
 
@@ -1737,7 +1737,7 @@ enum BlinkSettlementError {
 
 fn blink_webhook_settlement_error(
     payment_hash: &str,
-    error: BlinkSettlementError,
+    error: &BlinkSettlementError,
 ) -> (StatusCode, Json<Value>) {
     if matches!(
         error,

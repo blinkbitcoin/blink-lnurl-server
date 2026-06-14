@@ -92,6 +92,7 @@ The local stack uses:
 - `LNURL_DOMAINS=localhost:8080,127.0.0.1:8080`.
 - `LNURL_NETWORK=regtest`.
 - `LNURL_SCHEME=http`.
+- `LNURL_WEBHOOK_DOMAIN=localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks.
 
 Run end-to-end tests:
 
@@ -165,8 +166,10 @@ Important options:
 | `--scheme` | Scheme used in generated LNURL callback URLs | `https` |
 | `--min-sendable` | Minimum payment amount in millisatoshi | `1000` |
 | `--max-sendable` | Maximum payment amount in millisatoshi | `4000000000` |
-| `--webhook-domain` | Domain used when registering the Spark SSP webhook URL | unset |
+| `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
+
+`LNURL_WEBHOOK_DOMAIN` is required when running the server with Blink invoice support. Blink invoice creation passes a callback URL of `{LNURL_SCHEME}://{LNURL_WEBHOOK_DOMAIN}/webhook/blink` to Blink GraphQL for both BTC and USD invoices. The Blink callback route accepts flat provider payloads at public `POST /webhook/blink`; it is separate from the Spark SSP webhook at `POST /webhook`.
 
 For the complete list:
 
@@ -195,6 +198,7 @@ Authenticated routes always require Spark signatures. If `ca_cert` is configured
 | Public | GET | `/verify/{payment_hash}` | LUD-21 invoice verification endpoint |
 | Health | GET | `/health` | Health check endpoint |
 | Webhook | POST | `/webhook` | Spark SSP payment notification webhook |
+| Webhook | POST | `/webhook/blink` | Blink invoice status callback endpoint for flat `PAID` and `EXPIRED` payloads |
 | Authenticated | GET | `/lnurlpay/available/{identifier}` | Check if a username is available |
 | Authenticated | POST | `/lnurlpay/{pubkey}` | Register a username |
 | Authenticated | DELETE | `/lnurlpay/{pubkey}` | Unregister a username |
@@ -225,6 +229,7 @@ services:
       LNURL_DOMAINS: "localhost:8080,127.0.0.1:8080"
       LNURL_NETWORK: "regtest"
       LNURL_SCHEME: "http"
+      LNURL_WEBHOOK_DOMAIN: "localhost:8080"
     ports:
       - "8080:8080"
     depends_on:
