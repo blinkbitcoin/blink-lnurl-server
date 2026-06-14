@@ -1044,7 +1044,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 user_pubkey = excluded.user_pubkey,
                 invoice = excluded.invoice,
                 preimage = excluded.preimage,
-                expired_at = COALESCE(excluded.expired_at, invoices.expired_at),
+                expired_at = CASE
+                    WHEN excluded.preimage IS NOT NULL THEN NULL
+                    ELSE COALESCE(excluded.expired_at, invoices.expired_at)
+                END,
                 invoice_expiry = excluded.invoice_expiry,
                 updated_at = excluded.updated_at,
                 domain = excluded.domain,
@@ -1094,7 +1097,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT(payment_hash) DO UPDATE SET
                     preimage = excluded.preimage,
-                    expired_at = COALESCE(excluded.expired_at, invoices.expired_at),
+                    expired_at = CASE
+                        WHEN excluded.preimage IS NOT NULL THEN NULL
+                        ELSE COALESCE(excluded.expired_at, invoices.expired_at)
+                    END,
                     updated_at = excluded.updated_at,
                     account_id = COALESCE(excluded.account_id, invoices.account_id),
                     provider = COALESCE(excluded.provider, invoices.provider),
@@ -1182,7 +1188,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         sqlx::query(
             "UPDATE invoices
              SET expired_at = $1, updated_at = $1
-             WHERE payment_hash = $2",
+             WHERE payment_hash = $2 AND preimage IS NULL",
         )
         .bind(expired_at)
         .bind(payment_hash)

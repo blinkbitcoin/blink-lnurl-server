@@ -251,6 +251,13 @@ impl LnurlProvider for BlinkProvider {
             .payment_status(request.payment_hash)
             .await
             .map_err(ProviderError::BlinkPaymentStatusUnavailable)?;
+        if status.payment_hash != request.payment_hash {
+            return Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
+                "Blink payment-status hash mismatch: expected {}, got {}",
+                request.payment_hash,
+                status.payment_hash
+            )));
+        }
 
         Ok(ProviderPaymentStatus {
             settled: status.settled,
@@ -606,15 +613,21 @@ mod tests {
     }
 
     async fn start_blink_status_mock_server() -> String {
+        start_blink_status_mock_server_with_payment_hash("payment_hash").await
+    }
+
+    async fn start_blink_status_mock_server_with_payment_hash(
+        payment_hash: &'static str,
+    ) -> String {
         let app = axum::Router::new().route(
             "/graphql",
             axum::routing::post(
-                |axum::Json(_body): axum::Json<serde_json::Value>| async move {
+                move |axum::Json(_body): axum::Json<serde_json::Value>| async move {
                     axum::Json(serde_json::json!({
                         "data": {
                             "lnInvoicePaymentStatusByHash": {
                                 "status": "PAID",
-                                "paymentHash": "payment_hash",
+                                "paymentHash": payment_hash,
                                 "paymentRequest": "lnbc_invoice"
                             }
                         }
@@ -973,6 +986,23 @@ mod tests {
         assert!(status.settled);
         assert_eq!(status.preimage, None);
         assert_eq!(status.amount_received_sat, None);
+    }
+
+    #[tokio::test]
+    async fn blink_provider_rejects_payment_status_hash_mismatch() {
+        let endpoint = start_blink_status_mock_server_with_payment_hash("different_hash").await;
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
+
+        let err = provider
+            .payment_status(PaymentStatusRequest {
+                payment_hash: "payment_hash",
+            })
+            .await
+            .expect_err("Blink payment status hash mismatch should fail");
+
+        assert!(err.to_string().contains("payment-status hash mismatch"));
     }
 
     #[test]

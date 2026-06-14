@@ -1762,6 +1762,38 @@ pub mod shared_tests {
         let joined_invoice = joined_invoice.expect("joined invoice should be present");
         assert!(joined_invoice.preimage.is_none());
         assert_eq!(joined_invoice.expired_at, Some(expired_at));
+
+        let paid_at = expired_at.saturating_add(1_000);
+        let paid_preimage = Some("expired_state_paid_preimage".to_string());
+        let affected = db
+            .upsert_invoices_paid(&[Invoice {
+                preimage: paid_preimage.clone(),
+                expired_at: None,
+                updated_at: paid_at,
+                ..expired.clone()
+            }])
+            .await
+            .unwrap();
+        assert_eq!(affected, vec![payment_hash.clone()]);
+
+        let paid = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should round-trip after paid settlement");
+        assert_eq!(paid.preimage, paid_preimage.clone());
+        assert!(paid.expired_at.is_none());
+
+        db.mark_invoice_expired(&payment_hash, paid_at.saturating_add(1_000))
+            .await
+            .unwrap();
+        let still_paid = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("paid invoice should remain present");
+        assert_eq!(still_paid.preimage, paid_preimage);
+        assert!(still_paid.expired_at.is_none());
     }
 
     pub async fn metadata_account_id_round_trips_and_legacy_rows_remain_none<DB>(db: &DB)
