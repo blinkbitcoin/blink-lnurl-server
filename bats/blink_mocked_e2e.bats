@@ -9,6 +9,7 @@ setup_file() {
   export LNURL_INTERNAL_JWT_AUDIENCE="lnurl-server.internal.test"
   export LNURL_POSTGRES_PORT="${LNURL_POSTGRES_PORT:-25432}"
   export LNURL_NSEC="0101010101010101010101010101010101010101010101010101010101010101"
+  export LNURL_WEBHOOK_DOMAIN="localhost:8080"
   start_blink_graphql_mock
   start_stack
 }
@@ -95,8 +96,9 @@ teardown_file() {
   discovery="$(blink_lnurl_discovery "blinksettlepreimage10")"
   invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
   payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
+  payment_request="$(json_get "$invoice" '.pr')"
 
-  run blink_settlement_notify "$payment_hash" "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+  run blink_settlement_notify "$payment_hash" "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b" "$payment_request"
   [ "$status" -eq 0 ]
   [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
 }
@@ -110,6 +112,42 @@ teardown_file() {
   run blink_settlement_notify_without_preimage "$payment_hash"
   [ "$status" -eq 0 ]
   [ "$(invoice_has_preimage "${payment_hash}")" = "true" ]
+}
+
+@test "blink: expired webhook falls back to payment status and marks invoice expired" {
+  create_blink_account "blinkexpired10" "Blink expired wallet" "btc" "btc-wallet-expired-fallback10" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinkexpired10")"
+  invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
+  payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
+  payment_request="$(json_get "$invoice" '.pr')"
+
+  run blink_expired_notify "$payment_hash" "$payment_request"
+  [ "$status" -eq 0 ]
+  [ "$(invoice_has_preimage "${payment_hash}")" = "false" ]
+  [ "$(invoice_is_expired "${payment_hash}")" = "true" ]
+
+  verify_response="$(curl -fsS "$(json_get "$invoice" '.verify')")"
+  assert_json_equals "$verify_response" '.status' 'OK'
+  assert_json_equals "$verify_response" '.settled' 'false'
+  assert_json_equals "$verify_response" '.preimage' 'null'
+}
+
+@test "blink: settlement webhook rejects paymentRequest hash mismatch" {
+  create_blink_account "blinkmismatch10" "Blink mismatch wallet" "btc" "btc-wallet-paid-fallback-preimage10" >/dev/null
+  discovery="$(blink_lnurl_discovery "blinkmismatch10")"
+  invoice="$(blink_lnurl_callback "$(json_get "$discovery" '.callback')" "1000")"
+  payment_hash="$(json_get "$invoice" '.verify' | awk -F/ '{print $NF}')"
+  create_blink_account "blinkmismatchother10" "Blink mismatch other wallet" "btc" "btc-wallet-mismatch-other10" >/dev/null
+  other_discovery="$(blink_lnurl_discovery "blinkmismatchother10")"
+  mismatch_invoice="$(blink_lnurl_callback "$(json_get "$other_discovery" '.callback')" "1000")"
+  mismatch_payment_request="$(json_get "$mismatch_invoice" '.pr')"
+  request_body="$(jq -cn --arg payment_hash "$payment_hash" --arg payment_request "$mismatch_payment_request" '{paymentHash:$payment_hash,paymentRequest:$payment_request,status:"PAID"}')"
+
+  response="$(blink_settlement_notify_status_body "$request_body")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.' 'paymentRequest hash mismatch'
 }
 
 @test "blink: verify unsettled returns false without persisting preimage" {
@@ -269,7 +307,6 @@ teardown_file() {
 
 @test "blink: internal auth rejects missing invalid and wrong-scope tokens on critical routes" {
   account_body="$(create_blink_account_body "acct-authnegative10" "btc-wallet-authnegative10" "usd-wallet-authnegative10" "btc" "Auth negative wallet" "authnegative10")"
-  settlement_body="$(jq -cn --arg payment_hash "authnegativehash10" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{type:"SettlementViaIntraLedger"}}}')"
 
   response="$(post_internal_blink_account_status_body "$account_body")"
   [ "${response##*$'\n'}" = "401" ]
@@ -286,16 +323,6 @@ teardown_file() {
   response="$(internal_identifier_lookup_status_body "blinkmulti10" "not-a-jwt")"
   [ "${response##*$'\n'}" = "401" ]
   response="$(internal_identifier_lookup_status_body "blinkmulti10" "$(internal_test_token "blink:accounts:create")")"
-  code="${response##*$'\n'}"
-  body="${response%$'\n'*}"
-  [ "$code" = "403" ]
-  assert_json_equals "$body" '.error' 'forbidden'
-
-  response="$(blink_settlement_notify_status_body "$settlement_body")"
-  [ "${response##*$'\n'}" = "401" ]
-  response="$(blink_settlement_notify_status_body "$settlement_body" "not-a-jwt")"
-  [ "${response##*$'\n'}" = "401" ]
-  response="$(blink_settlement_notify_status_body "$settlement_body" "$(internal_test_token "accounts:read")")"
   code="${response##*$'\n'}"
   body="${response%$'\n'*}"
   [ "$code" = "403" ]

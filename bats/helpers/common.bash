@@ -11,7 +11,7 @@ BLINK_GRAPHQL_MOCK_PID_FILE="${STATE_DIR}/blink-graphql-mock.pid"
 BLINK_GRAPHQL_MOCK_LOG_FILE="${STATE_DIR}/blink-graphql-mock.log"
 
 start_stack() {
-  RESET_DB=true "${ROOT_DIR}/scripts/start-local-stack.sh"
+  LNURL_WEBHOOK_DOMAIN="${LNURL_WEBHOOK_DOMAIN:-localhost:8080}" RESET_DB=true "${ROOT_DIR}/scripts/start-local-stack.sh"
 }
 
 start_blink_graphql_mock() {
@@ -373,6 +373,14 @@ invoice_has_preimage() {
   sql_payment_hash="$(sql_literal_escape "${payment_hash}")"
   docker compose exec -T postgres psql -U user -d lnurl -tA \
     -c "SELECT CASE WHEN preimage IS NULL THEN 'false' ELSE 'true' END FROM invoices WHERE payment_hash = '${sql_payment_hash}'"
+}
+
+invoice_is_expired() {
+  local payment_hash="${1:?payment hash is required}"
+  local sql_payment_hash
+  sql_payment_hash="$(sql_literal_escape "${payment_hash}")"
+  docker compose exec -T postgres psql -U user -d lnurl -tA \
+    -c "SELECT CASE WHEN expired_at IS NULL THEN 'false' ELSE 'true' END FROM invoices WHERE payment_hash = '${sql_payment_hash}'"
 }
 
 configure_domain_webhook() {

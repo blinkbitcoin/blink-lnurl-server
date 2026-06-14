@@ -14,12 +14,14 @@ const FIXTURE_STATUS_PREIMAGE: [u8; 32] = [9_u8; 32];
 const FIXTURE_SETTLEMENT_WEBHOOK_PREIMAGE: [u8; 32] = [10_u8; 32];
 const FIXTURE_SUPPLIED_WEBHOOK_PREIMAGE: [u8; 32] = [11_u8; 32];
 const FIXTURE_HOOKS_PREIMAGE: [u8; 32] = [12_u8; 32];
+const FIXTURE_EXPIRED_WEBHOOK_PREIMAGE: [u8; 32] = [13_u8; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MockScenario {
     BtcInvoice,
     UsdInvoice,
     StatusPaid,
+    StatusExpired,
     StatusPending,
     GraphqlError,
     Malformed,
@@ -52,8 +54,13 @@ async fn graphql_handler(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
             StatusCode::OK,
             Json(mock_invoice_response(&body, Wallet::Usd)),
         ),
-        MockScenario::StatusPaid => (StatusCode::OK, Json(mock_status_response(&body, true))),
-        MockScenario::StatusPending => (StatusCode::OK, Json(mock_status_response(&body, false))),
+        MockScenario::StatusPaid => (StatusCode::OK, Json(mock_status_response(&body, "PAID"))),
+        MockScenario::StatusExpired => {
+            (StatusCode::OK, Json(mock_status_response(&body, "EXPIRED")))
+        }
+        MockScenario::StatusPending => {
+            (StatusCode::OK, Json(mock_status_response(&body, "PENDING")))
+        }
         MockScenario::GraphqlError => (
             StatusCode::OK,
             Json(json!({
@@ -90,6 +97,9 @@ fn scenario_from_request(body: &Value) -> MockScenario {
         {
             return MockScenario::StatusPaid;
         }
+        if fixture_expired_payment_hash() == payment_hash || payment_hash.contains("expired") {
+            return MockScenario::StatusExpired;
+        }
         return MockScenario::StatusPending;
     }
     if query.contains("lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient") {
@@ -123,6 +133,8 @@ fn mock_invoice_response(body: &Value, wallet: Wallet) -> Value {
         FIXTURE_SETTLEMENT_WEBHOOK_PREIMAGE
     } else if wallet_id.contains("paid-fallback-hooks10") {
         FIXTURE_HOOKS_PREIMAGE
+    } else if wallet_id.contains("expired-fallback") {
+        FIXTURE_EXPIRED_WEBHOOK_PREIMAGE
     } else if wallet_id.contains("paid-fallback") {
         FIXTURE_STATUS_PREIMAGE
     } else {
@@ -151,7 +163,7 @@ fn mock_invoice_response(body: &Value, wallet: Wallet) -> Value {
     }
 }
 
-fn mock_status_response(body: &Value, paid: bool) -> Value {
+fn mock_status_response(body: &Value, status: &str) -> Value {
     let requested_hash = body
         .pointer("/variables/input/paymentHash")
         .and_then(Value::as_str)
@@ -161,14 +173,14 @@ fn mock_status_response(body: &Value, paid: bool) -> Value {
     } else {
         requested_hash.to_string()
     };
-    let preimage = paid.then(|| {
+    let preimage = (status == "PAID").then(|| {
         fixture_status_preimage_for_hash(&payment_hash)
             .map_or_else(|| hex::encode(FIXTURE_STATUS_PREIMAGE), hex::encode)
     });
     json!({
         "data": {
             "lnInvoicePaymentStatusByHash": {
-                "status": if paid { "PAID" } else { "PENDING" },
+                "status": status,
                 "paymentHash": payment_hash,
                 "paymentRequest": null,
                 "paymentPreimage": preimage
@@ -179,6 +191,10 @@ fn mock_status_response(body: &Value, paid: bool) -> Value {
 
 fn fixture_status_payment_hash() -> String {
     sha256::Hash::hash(&FIXTURE_STATUS_PREIMAGE).to_string()
+}
+
+fn fixture_expired_payment_hash() -> String {
+    sha256::Hash::hash(&FIXTURE_EXPIRED_WEBHOOK_PREIMAGE).to_string()
 }
 
 fn fixture_status_preimage_for_hash(payment_hash: &str) -> Option<[u8; 32]> {
