@@ -244,16 +244,14 @@ blink_lnurl_callback() {
 blink_settlement_notify() {
   local payment_hash="${1:?payment hash is required}"
   local preimage="${2:?preimage is required}"
-  local token
-  token="$(internal_test_token "settlement:write")"
+  local payment_request="${3:-}"
 
   curl -fsS \
     --request POST \
     --header "Host: localhost:8080" \
     --header "Content-Type: application/json" \
-    --header "Authorization: Bearer ${token}" \
-    --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg preimage "${preimage}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{preImage:$preimage}}}')" \
-    "${BASE_URL}/internal/blink/invoice-paid"
+    --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg preimage "${preimage}" --arg payment_request "${payment_request}" '{paymentHash:$payment_hash,paymentPreimage:$preimage,status:"PAID"} + (if $payment_request == "" then {} else {paymentRequest:$payment_request} end)')" \
+    "${BASE_URL}/webhook/blink"
 }
 
 internal_identifier_lookup() {
@@ -284,35 +282,41 @@ internal_identifier_lookup_status_body() {
 
 blink_settlement_notify_without_preimage() {
   local payment_hash="${1:?payment hash is required}"
-  local token
-  token="$(internal_test_token "settlement:write")"
+  local payment_request="${2:-}"
 
   curl -fsS \
     --request POST \
     --header "Host: localhost:8080" \
     --header "Content-Type: application/json" \
-    --header "Authorization: Bearer ${token}" \
-    --data "$(jq -cn --arg payment_hash "${payment_hash}" '{eventType:"receive.lightning",transaction:{status:"success",initiationVia:{paymentHash:$payment_hash},settlementVia:{type:"SettlementViaIntraLedger"}}}')" \
-    "${BASE_URL}/internal/blink/invoice-paid"
+    --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg payment_request "${payment_request}" '{paymentHash:$payment_hash,status:"PAID"} + (if $payment_request == "" then {} else {paymentRequest:$payment_request} end)')" \
+    "${BASE_URL}/webhook/blink"
+}
+
+blink_expired_notify() {
+  local payment_hash="${1:?payment hash is required}"
+  local payment_request="${2:-}"
+
+  curl -fsS \
+    --request POST \
+    --header "Host: localhost:8080" \
+    --header "Content-Type: application/json" \
+    --data "$(jq -cn --arg payment_hash "${payment_hash}" --arg payment_request "${payment_request}" '{paymentHash:$payment_hash,status:"EXPIRED"} + (if $payment_request == "" then {} else {paymentRequest:$payment_request} end)')" \
+    "${BASE_URL}/webhook/blink"
 }
 
 blink_settlement_notify_status_body() {
   local body="${1:?body is required}"
-  local token="${2:-}"
   local headers=(
     --header "Host: localhost:8080"
     --header "Content-Type: application/json"
   )
-  if [ -n "${token}" ]; then
-    headers+=(--header "Authorization: Bearer ${token}")
-  fi
 
   curl -sS \
     --request POST \
     "${headers[@]}" \
     --data "${body}" \
     --write-out $'\n%{http_code}' \
-    "${BASE_URL}/internal/blink/invoice-paid"
+    "${BASE_URL}/webhook/blink"
 }
 
 transfer_blink_identifier_to_spark() {
