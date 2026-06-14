@@ -608,6 +608,7 @@ mod tests {
             description_hash: [7; 32],
             expiry,
             include_spark_address: true,
+            webhook_url: "https://lnurl.example/webhook/blink",
         }
     }
 
@@ -699,6 +700,10 @@ mod tests {
             btc_body["variables"]["input"]["descriptionHash"],
             hex::encode([7; 32])
         );
+        assert_eq!(
+            btc_body["variables"]["input"]["webhookUrl"],
+            "https://lnurl.example/webhook/blink"
+        );
         assert!(btc_body["variables"]["input"].get("expiresIn").is_none());
 
         let usd_invoice = provider
@@ -724,6 +729,10 @@ mod tests {
         assert_eq!(
             usd_body["variables"]["input"]["descriptionHash"],
             hex::encode([7; 32])
+        );
+        assert_eq!(
+            usd_body["variables"]["input"]["webhookUrl"],
+            "https://lnurl.example/webhook/blink"
         );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
     }

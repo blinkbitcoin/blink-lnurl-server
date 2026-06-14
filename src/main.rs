@@ -550,4 +550,32 @@ mod tests {
             blink_client::PRODUCTION_GRAPHQL_ENDPOINT
         );
     }
+
+    #[test]
+    fn startup_requires_webhook_domain_for_blink_webhook_url() {
+        let args = Args::parse_from(["lnurl-server", "--scheme", "https"]);
+
+        let err = build_blink_webhook_url(&args)
+            .expect_err("Blink webhook URL construction must require LNURL_WEBHOOK_DOMAIN");
+
+        assert!(
+            err.to_string().contains("LNURL_WEBHOOK_DOMAIN"),
+            "error should name the missing LNURL_WEBHOOK_DOMAIN: {err}"
+        );
+    }
+
+    #[test]
+    fn blink_webhook_url_uses_scheme_domain_and_fixed_path() {
+        let args = Args::parse_from([
+            "lnurl-server",
+            "--scheme",
+            "https",
+            "--webhook-domain",
+            "lnurl.example",
+        ]);
+
+        let url = build_blink_webhook_url(&args).expect("configured webhook domain should build URL");
+
+        assert_eq!(url, "https://lnurl.example/webhook/blink");
+    }
 }
