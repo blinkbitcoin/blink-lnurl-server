@@ -227,11 +227,25 @@ fn parse_auth_seed(hex_str: Option<&str>) -> [u8; 32] {
     seed
 }
 
+fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
+    let Some(webhook_domain) = args.webhook_domain.as_deref() else {
+        return Err(anyhow!(
+            "LNURL_WEBHOOK_DOMAIN is required to create Blink invoice webhookUrl callbacks"
+        ));
+    };
+
+    Ok(format!(
+        "{}://{}/webhook/blink",
+        args.scheme, webhook_domain
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_server<DB>(args: Args, repository: DB) -> Result<(), anyhow::Error>
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
+    let blink_webhook_url = build_blink_webhook_url(&args)?;
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     let spark_client =
         spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
@@ -331,7 +345,11 @@ where
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
         args.blink_graphql_endpoint.clone(),
     ));
-    let providers = Arc::new(ProviderRegistry::new(spark_client.clone(), blink_client));
+    let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
+        spark_client.clone(),
+        blink_client,
+        blink_webhook_url,
+    ));
 
     let state = State {
         db: repository,
@@ -574,7 +592,8 @@ mod tests {
             "lnurl.example",
         ]);
 
-        let url = build_blink_webhook_url(&args).expect("configured webhook domain should build URL");
+        let url =
+            build_blink_webhook_url(&args).expect("configured webhook domain should build URL");
 
         assert_eq!(url, "https://lnurl.example/webhook/blink");
     }
