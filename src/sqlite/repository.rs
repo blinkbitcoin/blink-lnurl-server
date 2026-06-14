@@ -1038,12 +1038,13 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn upsert_invoice(&self, invoice: &Invoice) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT(payment_hash) DO UPDATE SET
                 user_pubkey = excluded.user_pubkey,
                 invoice = excluded.invoice,
                 preimage = excluded.preimage,
+                expired_at = COALESCE(excluded.expired_at, invoices.expired_at),
                 invoice_expiry = excluded.invoice_expiry,
                 updated_at = excluded.updated_at,
                 domain = excluded.domain,
@@ -1058,6 +1059,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&invoice.user_pubkey)
         .bind(&invoice.invoice)
         .bind(&invoice.preimage)
+        .bind(invoice.expired_at)
         .bind(invoice.invoice_expiry)
         .bind(invoice.created_at)
         .bind(invoice.updated_at)
@@ -1088,10 +1090,11 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let mut affected = Vec::new();
         for invoice in invoices {
             let row: Option<(String,)> = sqlx::query_as(
-                "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT(payment_hash) DO UPDATE SET
                     preimage = excluded.preimage,
+                    expired_at = COALESCE(excluded.expired_at, invoices.expired_at),
                     updated_at = excluded.updated_at,
                     account_id = COALESCE(excluded.account_id, invoices.account_id),
                     provider = COALESCE(excluded.provider, invoices.provider),
@@ -1105,6 +1108,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .bind(&invoice.user_pubkey)
             .bind(&invoice.invoice)
             .bind(&invoice.preimage)
+            .bind(invoice.expired_at)
             .bind(invoice.invoice_expiry)
             .bind(invoice.created_at)
             .bind(invoice.updated_at)
@@ -1130,7 +1134,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         payment_hash: &str,
     ) -> Result<Option<Invoice>, LnurlRepositoryError> {
         let maybe_invoice = sqlx::query(
-            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash
+            "SELECT payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash
              FROM invoices
              WHERE payment_hash = $1",
         )
@@ -1139,12 +1143,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .await?
         .map(|row| {
             let provider = row
-                .try_get::<Option<String>, _>(10)?
+                .try_get::<Option<String>, _>(11)?
                 .map(|provider| AccountProvider::from_database_value(&provider))
                 .transpose()
                 .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
             let wallet_kind = row
-                .try_get::<Option<String>, _>(11)?
+                .try_get::<Option<String>, _>(12)?
                 .map(|wallet| WalletKind::from_database_value(&wallet))
                 .transpose()
                 .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
@@ -1153,21 +1157,38 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 user_pubkey: row.try_get(1)?,
                 invoice: row.try_get(2)?,
                 preimage: row.try_get(3)?,
-                expired_at: None,
-                invoice_expiry: row.try_get(4)?,
-                created_at: row.try_get(5)?,
-                updated_at: row.try_get(6)?,
-                domain: row.try_get(7)?,
-                amount_received_sat: row.try_get(8)?,
-                account_id: row.try_get(9)?,
+                expired_at: row.try_get(4)?,
+                invoice_expiry: row.try_get(5)?,
+                created_at: row.try_get(6)?,
+                updated_at: row.try_get(7)?,
+                domain: row.try_get(8)?,
+                amount_received_sat: row.try_get(9)?,
+                account_id: row.try_get(10)?,
                 provider,
                 wallet_kind,
-                wallet_id: row.try_get(12)?,
-                provider_payment_hash: row.try_get(13)?,
+                wallet_id: row.try_get(13)?,
+                provider_payment_hash: row.try_get(14)?,
             })
         })
         .transpose()?;
         Ok(maybe_invoice)
+    }
+
+    async fn mark_invoice_expired(
+        &self,
+        payment_hash: &str,
+        expired_at: i64,
+    ) -> Result<(), LnurlRepositoryError> {
+        sqlx::query(
+            "UPDATE invoices
+             SET expired_at = $1, updated_at = $1
+             WHERE payment_hash = $2",
+        )
+        .bind(expired_at)
+        .bind(payment_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn get_zap_and_invoice_by_payment_hash(
@@ -1188,6 +1209,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      i.account_id     AS i_account_id
              ,      i.invoice        AS i_invoice
              ,      i.preimage       AS i_preimage
+             ,      i.expired_at     AS i_expired_at
              ,      i.invoice_expiry AS i_invoice_expiry
              ,      i.created_at     AS i_created_at
              ,      i.updated_at     AS i_updated_at
@@ -1244,7 +1266,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     provider_payment_hash: row.try_get("i_provider_payment_hash")?,
                     invoice: row.try_get("i_invoice")?,
                     preimage: row.try_get("i_preimage")?,
-                    expired_at: None,
+                    expired_at: row.try_get("i_expired_at")?,
                     invoice_expiry: row.try_get("i_invoice_expiry")?,
                     created_at: row.try_get("i_created_at")?,
                     updated_at: row.try_get("i_updated_at")?,
@@ -1805,6 +1827,11 @@ mod provider_neutral_tests {
     #[tokio::test]
     async fn invoice_ownership_fields_round_trip() {
         shared_tests::invoice_ownership_fields_round_trip(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn invoice_expired_state_round_trips() {
+        shared_tests::invoice_expired_state_round_trips(&setup_test_db().await).await;
     }
 
     #[tokio::test]

@@ -1704,6 +1704,66 @@ pub mod shared_tests {
         invoice_provider_metadata_round_trips(db).await;
     }
 
+    pub async fn invoice_expired_state_round_trips<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let now = crate::time::now_millis();
+        let payment_hash = "invoice_expired_state_hash".to_string();
+        db.upsert_invoice(&Invoice {
+            account_id: None,
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Btc),
+            wallet_id: Some("expired_state_btc_wallet".to_string()),
+            provider_payment_hash: Some("expired_state_provider_hash".to_string()),
+            payment_hash: payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: "lnbc1expiredstate".to_string(),
+            preimage: None,
+            expired_at: None,
+            invoice_expiry: now.saturating_add(60_000),
+            created_at: now,
+            updated_at: now,
+            domain: Some("expired-state.example.com".to_string()),
+            amount_received_sat: None,
+        })
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should round-trip before expiry mark");
+        assert!(stored.preimage.is_none());
+        assert!(stored.expired_at.is_none());
+
+        let expired_at = now.saturating_add(30_000);
+        db.mark_invoice_expired(&payment_hash, expired_at)
+            .await
+            .unwrap();
+        db.mark_invoice_expired("unknown_invoice_expired_hash", expired_at)
+            .await
+            .unwrap();
+
+        let expired = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should round-trip after expiry mark");
+        assert!(expired.preimage.is_none());
+        assert_eq!(expired.expired_at, Some(expired_at));
+        assert_eq!(expired.updated_at, expired_at);
+
+        let (_, joined_invoice) = db
+            .get_zap_and_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap();
+        let joined_invoice = joined_invoice.expect("joined invoice should be present");
+        assert!(joined_invoice.preimage.is_none());
+        assert_eq!(joined_invoice.expired_at, Some(expired_at));
+    }
+
     pub async fn metadata_account_id_round_trips_and_legacy_rows_remain_none<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
