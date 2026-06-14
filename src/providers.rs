@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::repository::{AccountProvider, ResolvedRecipient, WalletKind};
 use bitcoin::secp256k1::PublicKey;
-use blink_client::BlinkClientError;
+use blink_client::{BlinkClientError, PaymentStatusState};
 
 const SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL: &str = "DEF-03-SPARK-PAYMENT-STATUS-PHASE-7: Spark payment status remains route-owned until Phase 7 SETL-01 settlement dispatch";
 
@@ -35,6 +35,7 @@ pub struct PaymentStatusRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPaymentStatus {
     pub settled: bool,
+    pub expired: bool,
     pub preimage: Option<String>,
     pub amount_received_sat: Option<i64>,
 }
@@ -74,6 +75,7 @@ pub struct BlinkProvider {
 }
 
 impl BlinkProvider {
+    #[allow(dead_code)]
     pub fn new(client: blink_client::Client) -> Self {
         Self::new_with_webhook_url(client, "http://127.0.0.1/webhook/blink")
     }
@@ -252,6 +254,7 @@ impl LnurlProvider for BlinkProvider {
 
         Ok(ProviderPaymentStatus {
             settled: status.settled,
+            expired: status.state == PaymentStatusState::Expired,
             preimage: status.preimage,
             amount_received_sat: status.amount_received_sat,
         })
@@ -263,6 +266,7 @@ pub struct ProviderRegistry {
     blink: Arc<BlinkProvider>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlinkSettlementNotification {
     Ignored,
@@ -272,6 +276,7 @@ pub enum BlinkSettlementNotification {
     },
 }
 
+#[allow(dead_code)]
 impl BlinkSettlementNotification {
     pub const fn should_settle(&self) -> bool {
         matches!(self, Self::SettlementCandidate { .. })
@@ -292,6 +297,7 @@ impl BlinkSettlementNotification {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlinkSettlementWebhookPayload {
@@ -299,6 +305,7 @@ struct BlinkSettlementWebhookPayload {
     transaction: Option<BlinkSettlementTransaction>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlinkSettlementTransaction {
@@ -307,18 +314,21 @@ struct BlinkSettlementTransaction {
     settlement_via: Option<BlinkSettlementVia>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlinkSettlementInitiationVia {
     payment_hash: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlinkSettlementVia {
     pre_image: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn parse_blink_settlement_notification(
     payload: &serde_json::Value,
 ) -> Result<BlinkSettlementNotification, serde_json::Error> {
@@ -350,6 +360,7 @@ pub fn parse_blink_settlement_notification(
 }
 
 impl ProviderRegistry {
+    #[allow(dead_code)]
     pub fn new(spark_client: spark_client::Client, blink_client: blink_client::Client) -> Self {
         Self::new_with_blink_webhook_url(
             spark_client,

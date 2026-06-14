@@ -390,10 +390,6 @@ where
             get(LnurlServer::<DB>::get_internal_identifier),
         )
         .route(
-            "/blink/invoice-paid",
-            post(LnurlServer::<DB>::blink_invoice_paid),
-        )
-        .route(
             "/identifiers/transfer-to-spark",
             post(LnurlServer::<DB>::transfer_identifier_to_spark),
         )
@@ -452,6 +448,7 @@ where
         )
         .route("/verify/{payment_hash}", get(LnurlServer::<DB>::verify))
         .route("/webhook", post(LnurlServer::<DB>::webhook))
+        .route("/webhook/blink", post(LnurlServer::<DB>::blink_webhook))
         .route("/health", get(|| async { StatusCode::OK }))
         .layer(Extension(state))
         .layer(
