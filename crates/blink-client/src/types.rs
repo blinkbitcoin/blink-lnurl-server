@@ -29,6 +29,7 @@ pub struct CreateInvoiceRequest<'a> {
     pub amount_sat: u64,
     pub description_hash_hex: Option<String>,
     pub expires_in_minutes: Option<u32>,
+    pub webhook_url: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

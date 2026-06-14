@@ -84,6 +84,9 @@ impl Client {
         if let Some(expires_in_minutes) = request.expires_in_minutes {
             input.insert("expiresIn".to_string(), json!(expires_in_minutes));
         }
+        if let Some(webhook_url) = request.webhook_url {
+            input.insert("webhookUrl".to_string(), json!(webhook_url));
+        }
 
         let response = self
             .http_client

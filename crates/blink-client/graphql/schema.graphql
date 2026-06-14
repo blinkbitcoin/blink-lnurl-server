@@ -17,6 +17,7 @@ input LnInvoiceCreateOnBehalfOfRecipientInput {
   amount: SatAmount!
   descriptionHash: String
   expiresIn: Minutes
+  webhookUrl: EndpointUrl
 }
 
 input LnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipientInput {
@@ -24,6 +25,7 @@ input LnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipientInput {
   amount: SatAmount!
   descriptionHash: String
   expiresIn: Minutes
+  webhookUrl: EndpointUrl
 }
 
 input LnInvoicePaymentStatusByHashInput {
@@ -61,3 +63,4 @@ scalar WalletId
 scalar SatAmount
 scalar Minutes
 scalar PaymentHash
+scalar EndpointUrl
