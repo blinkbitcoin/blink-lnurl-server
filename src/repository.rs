@@ -242,6 +242,8 @@ pub struct Invoice {
     pub user_pubkey: String,
     pub invoice: String,
     pub preimage: Option<String>,
+    /// Timestamp when the invoice was validated as expired by its provider.
+    pub expired_at: Option<i64>,
     pub invoice_expiry: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -387,6 +389,15 @@ pub trait LnurlRepository {
         &self,
         invoices: &[Invoice],
     ) -> Result<Vec<String>, LnurlRepositoryError>;
+
+    /// Mark a known invoice as expired without recording a payment preimage.
+    async fn mark_invoice_expired(
+        &self,
+        _payment_hash: &str,
+        _expired_at: i64,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
 
     /// Get an invoice by payment hash
     async fn get_invoice_by_payment_hash(
@@ -1338,6 +1349,7 @@ pub mod shared_tests {
             user_pubkey: "blink_invoice_legacy_pubkey".to_string(),
             invoice: "lnbc1blinktransferinvoice".to_string(),
             preimage: None,
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now,
@@ -1424,6 +1436,7 @@ pub mod shared_tests {
             user_pubkey: "spark_side_effect_pubkey".to_string(),
             invoice: "lnbc1sideeffect".to_string(),
             preimage: Some("side_effect_preimage".to_string()),
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now,
@@ -1496,6 +1509,7 @@ pub mod shared_tests {
             user_pubkey: "spark_side_effect_pubkey".to_string(),
             invoice: "lnbc1sideeffect-updated".to_string(),
             preimage: Some("side_effect_preimage".to_string()),
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now.saturating_add(1),
@@ -1604,6 +1618,7 @@ pub mod shared_tests {
             user_pubkey: "round_trip_spark_pubkey".to_string(),
             invoice: "lnbc1roundtripspark".to_string(),
             preimage: None,
+            expired_at: None,
             invoice_expiry: now.saturating_add(60_000),
             created_at: now,
             updated_at: now,
@@ -1620,6 +1635,7 @@ pub mod shared_tests {
             user_pubkey: String::new(),
             invoice: "lnbc1roundtripblink".to_string(),
             preimage: None,
+            expired_at: None,
             invoice_expiry: now.saturating_add(120_000),
             created_at: now,
             updated_at: now,
@@ -1721,6 +1737,7 @@ pub mod shared_tests {
             user_pubkey: pubkey.clone(),
             invoice: "lnbc1metadataowned".to_string(),
             preimage: Some("metadata_owned_preimage".to_string()),
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now,
@@ -1762,6 +1779,7 @@ pub mod shared_tests {
             user_pubkey: pubkey.clone(),
             invoice: "lnbc1metadatalegacy".to_string(),
             preimage: None,
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now.saturating_add(1),
             updated_at: now.saturating_add(1),
@@ -1837,6 +1855,7 @@ pub mod shared_tests {
             user_pubkey: "legacy_join_pubkey".to_string(),
             invoice: "lnbc1test02join".to_string(),
             preimage: Some("test02_join_preimage".to_string()),
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now,
@@ -1939,6 +1958,7 @@ pub mod shared_tests {
             user_pubkey: "spark_delete_preserve_pubkey".to_string(),
             invoice: "lnbc1deletepreserve".to_string(),
             preimage: Some("delete_preserve_preimage".to_string()),
+            expired_at: None,
             invoice_expiry: i64::MAX,
             created_at: now,
             updated_at: now,
