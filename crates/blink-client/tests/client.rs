@@ -12,6 +12,17 @@ fn invoice_request(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
         amount_sat: 21_000,
         description_hash_hex: Some("f".repeat(64)),
         expires_in_minutes: Some(30),
+        webhook_url: Some("https://lnurl.example/webhook/blink"),
+    }
+}
+
+fn invoice_request_without_webhook(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
+    CreateInvoiceRequest {
+        wallet_id,
+        amount_sat: 21_000,
+        description_hash_hex: Some("f".repeat(64)),
+        expires_in_minutes: Some(30),
+        webhook_url: None,
     }
 }
 
@@ -49,6 +60,29 @@ fn assert_graphql_invoice_request(
             .pointer("/variables/input/expiresIn")
             .and_then(Value::as_u64)
             == Some(30)
+        && body
+            .pointer("/variables/input/webhookUrl")
+            .and_then(Value::as_str)
+            == Some("https://lnurl.example/webhook/blink")
+}
+
+fn assert_graphql_invoice_request_without_webhook(
+    request: &Request,
+    operation_name: &str,
+    wallet_id: &str,
+) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        return false;
+    };
+
+    body.get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|query| query.contains(operation_name))
+        && body
+            .pointer("/variables/input/recipientWalletId")
+            .and_then(Value::as_str)
+            == Some(wallet_id)
+        && body.pointer("/variables/input/webhookUrl").is_none()
 }
 
 fn assert_graphql_payment_status_request(request: &Request, payment_hash: &str) -> bool {
@@ -139,6 +173,42 @@ async fn creates_usd_invoice_with_selected_wallet() {
 
     assert_eq!(invoice.payment_hash, "hash123");
     assert_eq!(invoice.bolt11, "lnbc1mocked");
+}
+
+#[tokio::test]
+async fn omits_webhook_url_when_not_configured() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_invoice_request_without_webhook(
+                request,
+                "lnInvoiceCreateOnBehalfOfRecipient",
+                "btc-wallet-id",
+            )
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoiceCreateOnBehalfOfRecipient": {
+                    "invoice": {
+                        "paymentRequest": "lnbc1mocked",
+                        "paymentHash": "hash123"
+                    },
+                    "errors": []
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let invoice = client
+        .create_btc_invoice(invoice_request_without_webhook("btc-wallet-id"))
+        .await
+        .expect("BTC invoice without webhook should still be created");
+
+    assert_eq!(invoice.payment_hash, "hash123");
 }
 
 #[tokio::test]
