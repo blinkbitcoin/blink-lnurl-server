@@ -386,3 +386,604 @@ fn internal_bad_request(message: &'static str) -> (StatusCode, Json<InternalErro
         Json(InternalErrorResponse::new(message)),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::test_support::*;
+    use serde_json::{Value, json};
+    #[tokio::test]
+    async fn create_internal_blink_account_happy_path_requires_valid_internal_token() {
+        // D-01/D-04/D-08/D-09/D-13/D-14/D-16/D-17/D-19: the internal account
+        // creation happy path is locked to /internal/blink/accounts, a scoped
+        // RS256 JWT, local deterministic JWKS/key fixtures, route-boundary
+        // normalization, and exactly one provider-neutral repository write.
+        let jwks = include_str!("../../tests/fixtures/internal_auth_jwks.json");
+        let private_key = include_bytes!("../../tests/fixtures/internal_auth_private.pem");
+        let auth_state = Arc::new(
+            crate::internal_auth::InternalAuthState::from_jwks_json(
+                jwks,
+                "https://issuer.internal.test".to_string(),
+                "lnurl-server.internal.test".to_string(),
+            )
+            .expect("test JWKS fixture must load"),
+        );
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("blink-internal-test-key".to_string());
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "sub": "blink-core-test-service",
+                "iss": "https://issuer.internal.test",
+                "aud": "lnurl-server.internal.test",
+                "exp": 4_102_444_800_u64,
+                "nbf": 1_700_000_000_u64,
+                "scope": "blink:accounts:create accounts:read"
+            }),
+            &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
+        )
+        .expect("test JWT must sign");
+
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), Some(auth_state)).await;
+        let app = Router::new()
+            .route(
+                "/internal/blink/accounts",
+                post(LnurlServer::<MockRepository>::create_internal_blink_account),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::internal_auth::internal_auth::<MockRepository>,
+            ))
+            .layer(Extension(state));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&CreateBlinkAccountRequest {
+                    domain: "Example.COM".to_string(),
+                    blink_account_id: "blink_account_123".to_string(),
+                    btc_wallet_id: "btc_wallet_123".to_string(),
+                    usd_wallet_id: "usd_wallet_123".to_string(),
+                    default_wallet: "usd".to_string(),
+                    description: "Blink account".to_string(),
+                    identifiers: vec![" Alice_123 ".to_string(), "+573005871212".to_string()],
+                })
+                .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let response: CreateBlinkAccountResponse =
+            serde_json::from_slice(&body).expect("response deserializes");
+        assert_eq!(response.provider, "blink");
+        assert_eq!(response.domain, "example.com");
+        assert_eq!(response.identifiers[0].identifier, "alice_123");
+
+        let created = repo.created_blink_accounts.lock().unwrap();
+        assert_eq!(
+            created.len(),
+            1,
+            "create_blink_account is called exactly once"
+        );
+        let account = &created[0];
+        assert!(
+            account
+                .account_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("acct_blink_"))
+        );
+        assert_eq!(account.blink_account_id, "blink_account_123");
+        assert_eq!(account.default_wallet, WalletKind::Usd);
+        assert_eq!(account.identifiers.len(), 2);
+        assert_eq!(account.identifiers[0].domain, "example.com");
+        assert_eq!(account.identifiers[0].identifier, "alice_123");
+        assert_eq!(
+            account.identifiers[0].identifier_kind,
+            AccountIdentifierKind::Username
+        );
+        assert_eq!(account.identifiers[0].description, "Blink account");
+        assert_eq!(account.identifiers[1].identifier, "+573005871212");
+        assert_eq!(
+            account.identifiers[1].identifier_kind,
+            AccountIdentifierKind::Phone
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_missing_identifiers_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers.clear();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_default_wallet_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.default_wallet = "eur".to_string();
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_invalid_identifier_without_repository_write()
+    {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["not valid".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_identifier"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_wallet_modifier_without_repository_write() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["alice+btc".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "wallet_modifier_not_allowed"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_validation_rejects_duplicate_normalized_identifier_without_repository_write()
+     {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let mut payload = valid_create_blink_account_payload();
+        payload.identifiers = vec!["Alice_123".to_string(), " alice_123 ".to_string()];
+
+        let (status, body) = post_internal_blink_account(app, payload).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "invalid_request"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_duplicate_blink_account_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::BlinkAccountExists);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "blink_account_exists"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_identifier_conflict_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::IdentifierConflict);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_conflict_maps_name_taken_fallback_to_409() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_creation(MockCreateBlinkAccountError::NameTaken);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "identifier_conflict"}));
+        assert_eq!(repo.created_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_fails_closed_when_internal_auth_config_is_absent() {
+        // D-03/D-07/D-27: absent configured internal auth state returns 401 before handler writes.
+        let repo = MockRepository::default();
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let app = internal_account_app_with_state(state);
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, Value::Null);
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_requires_create_scope_before_repository_write() {
+        // D-09/D-10: valid internal JWTs without the route scope receive 403.
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/blink/accounts")
+            .header(
+                "authorization",
+                format!("Bearer {}", internal_test_token_with_scope("accounts:read")),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&valid_create_blink_account_payload())
+                    .expect("request serializes"),
+            ))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body: Value = serde_json::from_slice(&body).expect("response body is JSON");
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_requires_transfer_scope() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "blink:accounts:create accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_route_rejects_invalid_scope_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "accounts:read",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(
+            repo.resolve_calls().is_empty(),
+            "scope failures must happen before repository lookups"
+        );
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_invalid_destination_pubkey_without_transfer() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+        let mut payload = valid_internal_transfer_to_spark_payload();
+        payload.destination_spark_pubkey = "not-a-pubkey".to_string();
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            payload,
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_missing_scope_rejects_malformed_json_before_parsing() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) =
+            post_internal_transfer_to_spark_raw(app, "{", "blink:accounts:create accounts:read")
+                .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_spark_owned_source() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_route_rejects_invalid_ownership_before_side_effects_test_01() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(
+            repo.blink_to_spark_transfer_count(),
+            0,
+            "non-Blink owners must not reach transfer side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_moves_blink_identifier_to_spark() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_transfer_to_spark_app(repo.clone()).await;
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(
+            body["spark_pubkey"],
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        assert_eq!(body["lightning_address"], "alice@example.com");
+        assert_eq!(body["lnurl"], "lnurlp://example.com/lnurlp/alice");
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(repo.blink_to_spark_transfers().len(), 1);
+        let transfer = repo.blink_to_spark_transfers().remove(0);
+        assert_eq!(transfer.domain, "example.com");
+        assert_eq!(transfer.identifier, "alice");
+        assert_eq!(transfer.source_account_id, "acct_blink_lookup");
+        assert_eq!(
+            transfer.destination_spark_pubkey,
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        assert_eq!(transfer.description, "Moved to Spark");
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_blink_parses_btc_modifier_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+btc",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+        assert_eq!(body["provider"], "blink");
+        assert_eq!(body["account_id"], "acct_blink_lookup");
+        assert_eq!(body["domain"], "example.com");
+        assert_eq!(body["identifier"], "alice");
+        assert_eq!(body["identifier_kind"], "username");
+        assert_eq!(body["description"], "Alice Blink account");
+        assert_eq!(body["requested_wallet"], "btc");
+        assert_eq!(
+            body["provider_details"]["blink_account_id"],
+            "blink_account_123"
+        );
+        assert_eq!(body["provider_details"]["btc_wallet_id"], "btc_wallet_123");
+        assert_eq!(body["provider_details"]["usd_wallet_id"], "usd_wallet_123");
+        assert_eq!(body["provider_details"]["default_wallet"], "usd");
+        assert!(
+            body["provider_details"]
+                .get("spark_pubkey")
+                .is_none_or(Value::is_null)
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_spark_returns_spark_details_and_usd_wallet_intent() {
+        let repo = MockRepository::default().with_resolved_recipient(spark_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/Example.COM/identifiers/bob+usd",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "bob".to_string())]
+        );
+        assert_eq!(body["provider"], "spark");
+        assert_eq!(body["account_id"], "acct_spark_lookup");
+        assert_eq!(body["requested_wallet"], "usd");
+        assert_eq!(body["provider_details"]["spark_pubkey"], "spark_pubkey_123");
+        assert!(
+            body["provider_details"]
+                .get("blink_account_id")
+                .is_none_or(Value::is_null)
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_requires_accounts_read_scope_before_repository_lookup() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("blink:accounts:create"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_returns_not_found_for_missing_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({"error": "not_found"}));
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_identifier_lookup_rejects_invalid_domain_and_identifier() {
+        let repo = MockRepository::default();
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (domain_status, domain_body) = get_internal_identifier(
+            app.clone(),
+            "/internal/domains/%20%20/identifiers/alice",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+        let (identifier_status, identifier_body) = get_internal_identifier(
+            app,
+            "/internal/domains/example.com/identifiers/alice+eur",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(domain_status, StatusCode::BAD_REQUEST);
+        assert_eq!(domain_body, json!({"error": "invalid_domain"}));
+        assert_eq!(identifier_status, StatusCode::BAD_REQUEST);
+        assert_eq!(identifier_body, json!({"error": "invalid_identifier"}));
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_rpc_style_identifier_lookup_route_is_not_mounted() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let app = internal_lookup_app(repo.clone()).await;
+
+        let (status, _body) = get_internal_identifier(
+            app,
+            "/internal/accounts/by-identifier/alice?domain=example.com",
+            internal_test_token_with_scope("accounts:read"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(repo.resolve_calls().is_empty());
+    }
+
+    #[test]
+    fn internal_identifier_lookup_route_shape_is_locked_to_restful_path() {
+        let main_source = include_str!("../main.rs");
+        assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
+        assert!(!main_source.contains("accounts/by-identifier"));
+    }
+
+    #[test]
+    fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
+        // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
+        // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
+        let main_source = include_str!("../main.rs");
+        let internal_mount = main_source
+            .find(".nest(\"/internal\", internal_router)")
+            .expect("internal router must be nested separately");
+        let spark_auth = main_source
+            .find("auth::auth::<DB>")
+            .expect("Spark compatibility routes must keep certificate auth");
+        let public_lnurl = main_source
+            .find("/.well-known/lnurlp/{identifier}")
+            .expect("public LNURL route must remain mounted");
+        let internal_auth = main_source
+            .find("internal_auth::internal_auth::<DB>")
+            .expect("internal router must use internal JWT middleware");
+
+        assert!(internal_auth < internal_mount);
+        assert!(internal_mount < spark_auth);
+        assert!(spark_auth < public_lnurl);
+        assert!(main_source.contains("/blink/accounts"));
+        assert!(main_source.contains("/lnurlpay/{pubkey}"));
+        assert!(main_source.contains("/lnurlp/{identifier}"));
+    }
+}

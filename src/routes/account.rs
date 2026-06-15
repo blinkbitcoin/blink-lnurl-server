@@ -624,3 +624,560 @@ pub(super) async fn sanitize_domain<DB>(
     warn!("domain not allowed: {}", domain);
     Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::invoice_paid::create_provider_invoice_for_account;
+    use crate::routes::test_support::*;
+    use lightning_invoice::Bolt11Invoice;
+    use serde_json::Value;
+    use std::str::FromStr;
+    fn assert_bad_username(result: Result<(), (StatusCode, Json<Value>)>) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected invalid username error");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String("invalid username".to_string()));
+    }
+
+    #[test]
+    fn create_update_username_validation_uses_blink_rules_after_trim() {
+        assert!(validate_username(&sanitize_username(" Alice_123 ")).is_ok());
+
+        for invalid in ["", "   ", " alice+foo ", " 12345 ", " bc1alice "] {
+            assert_bad_username(validate_username(&sanitize_username(invalid)));
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_keeps_legacy_names_but_blocks_phone_like_fallback() {
+        assert_eq!(
+            public_lookup_username("legacy.name"),
+            Ok(Some("legacy.name".to_string()))
+        );
+
+        for phone_like in ["12345", "3005871212"] {
+            assert_eq!(public_lookup_username(phone_like), Ok(None));
+        }
+        for phone_like in ["573005871212", "+573005871212", "00573005871212"] {
+            assert_eq!(
+                public_lookup_username(phone_like),
+                Ok(Some("+573005871212".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn public_lookup_identifier_strips_recognized_modifiers_and_rejects_others() {
+        assert_eq!(
+            public_lookup_username("alice+BTC"),
+            Ok(Some("alice".to_string()))
+        );
+
+        for invalid in ["alice+eur", "alice+btc+usd"] {
+            assert_eq!(
+                public_lookup_username(invalid),
+                Err(crate::identifier::IdentifierError::InvalidModifier)
+            );
+        }
+    }
+
+    #[test]
+    fn public_identifier_rejects_invalid_wallet_modifier_test_01() {
+        let btc = parse_public_identifier_for_public_route("Alice+BTC")
+            .expect("BTC modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(btc.canonical, "alice");
+        assert_eq!(btc.wallet, Some(WalletKind::Btc));
+        assert_eq!(btc.callback_identifier, "alice+btc");
+
+        let usd = parse_public_identifier_for_public_route("alice+Usd")
+            .expect("USD modifier should parse")
+            .expect("username should produce public intent");
+        assert_eq!(usd.canonical, "alice");
+        assert_eq!(usd.wallet, Some(WalletKind::Usd));
+        assert_eq!(usd.callback_identifier, "alice+usd");
+
+        for invalid in ["alice+eur", "alice+btc+usd", "alice+usd+btc"] {
+            assert!(
+                matches!(
+                    parse_public_identifier_for_public_route(invalid),
+                    Err(IdentifierError::InvalidModifier)
+                ),
+                "invalid wallet modifier must fail before route lookup: {invalid}"
+            );
+        }
+    }
+
+    // -- Spark management account-backed compatibility ------------------------
+
+    fn handler_source(name: &str) -> &'static str {
+        const SOURCES: [&str; 6] = [
+            include_str!("mod.rs"),
+            include_str!("account.rs"),
+            include_str!("internal.rs"),
+            include_str!("lnurl_pay.rs"),
+            include_str!("webhook.rs"),
+            include_str!("zap.rs"),
+        ];
+
+        let marker = format!("    pub async fn {name}(");
+        for source in SOURCES {
+            if let Some(start) = source.find(&marker) {
+                let rest = &source[start..];
+                let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+                return &rest[..next];
+            }
+        }
+
+        panic!("handler must exist");
+    }
+
+    #[test]
+    fn spark_management_routes_use_provider_neutral_repository_calls() {
+        let register = handler_source("register");
+        assert!(
+            register.contains("upsert_spark_registration"),
+            "register must write through the account-backed Spark registration API"
+        );
+        assert!(
+            !register.contains("upsert_user"),
+            "register must not write exclusively through the legacy user API"
+        );
+
+        let available = handler_source("available");
+        assert!(
+            available.contains("resolve_recipient_by_identifier"),
+            "availability must resolve account-backed identifiers"
+        );
+        assert!(
+            !available.contains("get_user_by_name"),
+            "availability must not rely exclusively on legacy user lookup"
+        );
+
+        let recover = handler_source("recover");
+        assert!(
+            recover.contains("get_account_by_spark_pubkey"),
+            "recover must prove Spark account ownership through provider-neutral lookup"
+        );
+
+        let unregister = handler_source("unregister");
+        assert!(
+            unregister.contains("delete_spark_registration"),
+            "unregister must delete only the active Spark registration"
+        );
+        assert!(
+            unregister.contains("&username"),
+            "unregister must pass the signed canonical username into repository deletion"
+        );
+        assert!(
+            unregister.contains("spark_unregister_error"),
+            "unregister must map not-owned targeted deletion to the public not-found convention"
+        );
+        assert!(
+            !unregister.contains("delete_user"),
+            "unregister must not delete the legacy user row directly from the route"
+        );
+    }
+
+    #[test]
+    fn transfer_route_uses_provider_neutral_identifier_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "transfer must build the provider-neutral IdentifierTransfer DTO"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "transfer must move ownership through the provider-neutral repository API"
+        );
+        assert!(
+            transfer.contains("destination_spark_pubkey"),
+            "transfer must pass the verified destination Spark pubkey to the repository"
+        );
+        assert!(
+            !transfer.contains("get_account_by_spark_pubkey(&to_pubkey)"),
+            "transfer must not require a pre-existing destination Spark account"
+        );
+        assert!(
+            !transfer.contains("transfer_username"),
+            "transfer must not rely exclusively on legacy username transfer"
+        );
+        assert!(
+            transfer.contains("verify_transfer_signature"),
+            "transfer must preserve both Spark signature checks"
+        );
+    }
+
+    #[test]
+    fn spark_transfer_route_contract_still_uses_provider_neutral_transfer() {
+        let transfer = handler_source("transfer");
+        assert!(
+            transfer.matches("verify_transfer_signature").count() >= 2,
+            "public Spark transfer must keep both Spark signature verifications"
+        );
+        assert!(
+            transfer.contains("from_pk == to_pk"),
+            "public Spark transfer must keep same source/target pubkey rejection"
+        );
+        assert!(
+            transfer.contains("IdentifierTransfer"),
+            "public Spark transfer must still construct IdentifierTransfer"
+        );
+        assert!(
+            transfer.contains("transfer_identifier"),
+            "public Spark transfer must still call transfer_identifier"
+        );
+        assert!(
+            transfer.contains("TransferLnurlPayResponse"),
+            "public Spark transfer response type must stay unchanged"
+        );
+        assert!(
+            !transfer.contains("SCOPE_TRANSFER_WRITE") && !transfer.contains("require_scope"),
+            "public Spark transfer route must not require internal JWT scopes"
+        );
+
+        let internal_transfer = handler_source("transfer_identifier_to_spark");
+        assert!(
+            internal_transfer.contains("SCOPE_TRANSFER_WRITE"),
+            "only the internal Blink-to-Spark transfer route should require transfer:write"
+        );
+        assert!(
+            internal_transfer.contains("AccountProvider::Blink"),
+            "internal transfer must reject non-Blink current owners"
+        );
+    }
+
+    #[test]
+    fn transfer_provider_neutral_conflicts_keep_legacy_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_transfer_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+
+        let (status, Json(body)) =
+            spark_transfer_error(LnurlRepositoryError::SourceNotOwner, "alice");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            Value::String("source pubkey does not own this username".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_response_preserves_account_id_field() {
+        let field_names: Vec<_> = serde_json::to_value(ListMetadataMetadata {
+            payment_hash: "metadata_hash".to_string(),
+            account_id: Some("acct_spark_metadata".to_string()),
+            sender_comment: None,
+            nostr_zap_request: None,
+            nostr_zap_receipt: None,
+            updated_at: 42,
+            preimage: None,
+        })
+        .expect("metadata should serialize")
+        .as_object()
+        .expect("metadata should serialize as object")
+        .keys()
+        .cloned()
+        .collect();
+
+        assert_eq!(
+            field_names,
+            vec![
+                "account_id",
+                "nostr_zap_receipt",
+                "nostr_zap_request",
+                "payment_hash",
+                "preimage",
+                "sender_comment",
+                "updated_at",
+            ]
+        );
+    }
+
+    #[test]
+    fn spark_registration_conflicts_keep_duplicate_name_contract() {
+        for error in [
+            LnurlRepositoryError::NameTaken,
+            LnurlRepositoryError::IdentifierConflict,
+        ] {
+            let (status, Json(body)) = spark_registration_error(error, "alice");
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, Value::String("name already taken".to_string()));
+        }
+    }
+
+    #[test]
+    fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
+        // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
+        // alice+usd are public route identities only. Storage and dispatch must
+        // use the resolved canonical recipient/account metadata instead.
+        let invoice = handler_source("handle_invoice");
+        assert!(
+            invoice.contains("public_recipient.callback_identifier"),
+            "callback metadata hashing should preserve requested public identity"
+        );
+        assert!(
+            invoice.contains("Some(&account_id)")
+                && invoice.contains("public_recipient.recipient.provider")
+                && invoice.contains("res.wallet_id.as_deref()"),
+            "invoice persistence must use resolved account/provider/wallet metadata"
+        );
+        assert!(
+            !invoice.contains("identifier+btc")
+                && !invoice.contains("identifier+usd")
+                && !invoice.contains("callback_identifier.clone()"),
+            "virtual aliases must not be persisted as account identifiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_transfer_public_invoice_uses_spark_provider() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+        assert_eq!(
+            public_recipient.recipient.spark_pubkey.as_deref(),
+            Some("spark_after_transfer_pubkey")
+        );
+
+        let (_payment_hash, bolt11) = generate_route_test_invoice(31);
+        let invoice = Bolt11Invoice::from_str(&bolt11).expect("test invoice parses");
+        let payment_hash = invoice.payment_hash().to_string();
+        create_provider_invoice_for_account(
+            &repo,
+            &payment_hash,
+            Some(&public_recipient.recipient.account_id),
+            Some(public_recipient.recipient.provider),
+            Some(WalletKind::Btc),
+            None,
+            None,
+            public_recipient
+                .recipient
+                .spark_pubkey
+                .as_deref()
+                .expect("Spark recipient has pubkey"),
+            &bolt11,
+            i64::MAX,
+            &public_recipient.recipient.domain,
+        )
+        .await
+        .expect("post-transfer Spark invoice should persist");
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("new invoice should be persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Spark));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Btc));
+        assert_eq!(stored.wallet_id, None);
+        assert_eq!(stored.provider_payment_hash, None);
+        assert_eq!(
+            stored.account_id.as_deref(),
+            Some("acct_spark_after_transfer")
+        );
+        assert_eq!(stored.user_pubkey, "spark_after_transfer_pubkey");
+        assert_eq!(stored.domain.as_deref(), Some("example.com"));
+    }
+
+    #[tokio::test]
+    async fn post_transfer_historical_blink_invoice_owner_is_unchanged() {
+        let repo =
+            MockRepository::default().with_resolved_recipient(post_transfer_spark_recipient());
+        let historical_payment_hash = "historical_blink_before_transfer".to_string();
+        repo.upsert_invoice(&Invoice {
+            account_id: Some("acct_original_blink".to_string()),
+            provider: Some(AccountProvider::Blink),
+            wallet_kind: Some(WalletKind::Usd),
+            wallet_id: Some("original_blink_usd_wallet".to_string()),
+            provider_payment_hash: Some("original_blink_provider_hash".to_string()),
+            payment_hash: historical_payment_hash.clone(),
+            user_pubkey: String::new(),
+            invoice: "lnbc1historicalblink".to_string(),
+            preimage: None,
+            expired_at: None,
+            invoice_expiry: i64::MAX,
+            created_at: 1,
+            updated_at: 1,
+            domain: Some("example.com".to_string()),
+            amount_received_sat: Some(42),
+        })
+        .await
+        .unwrap();
+
+        let state = internal_route_test_state(repo.clone(), None).await;
+        let intent = parse_public_identifier_for_public_route("alice")
+            .expect("identifier should parse")
+            .expect("username should resolve as public intent");
+        let public_recipient = resolve_public_recipient(&state, "example.com", intent)
+            .await
+            .expect("lookup should not fail")
+            .expect("transferred identifier should resolve");
+        assert_eq!(public_recipient.recipient.provider, AccountProvider::Spark);
+
+        let stored = repo
+            .get_invoice_by_payment_hash(&historical_payment_hash)
+            .await
+            .unwrap()
+            .expect("historical Blink invoice should remain persisted");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.account_id.as_deref(), Some("acct_original_blink"));
+        assert_eq!(stored.wallet_kind, Some(WalletKind::Usd));
+        assert_eq!(
+            stored.wallet_id.as_deref(),
+            Some("original_blink_usd_wallet")
+        );
+        assert_eq!(stored.payment_hash, historical_payment_hash);
+        assert_eq!(stored.amount_received_sat, Some(42));
+    }
+
+    #[test]
+    fn spark_recipient_adapts_to_legacy_recover_fields() {
+        let recipient = crate::repository::ResolvedRecipient {
+            account_id: "acct_spark_test".to_string(),
+            provider: crate::repository::AccountProvider::Spark,
+            domain: "example.com".to_string(),
+            identifier: "alice".to_string(),
+            identifier_kind: crate::repository::AccountIdentifierKind::Username,
+            description: "Alice wallet".to_string(),
+            spark_pubkey: Some("spark_pubkey".to_string()),
+            blink_account_id: None,
+            btc_wallet_id: None,
+            usd_wallet_id: None,
+            default_wallet: None,
+        };
+
+        let user = spark_user_from_recipient(recipient).expect("Spark recipient should adapt");
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.domain, "example.com");
+        assert_eq!(user.pubkey, "spark_pubkey");
+        assert_eq!(user.description, "Alice wallet");
+    }
+
+    #[test]
+    fn invoice_callback_writes_account_owned_side_effects() {
+        let invoice_callback = handler_source("handle_invoice");
+        assert!(
+            invoice_callback.contains("account_id"),
+            "invoice callback must carry resolved account ownership into side effects"
+        );
+        assert!(
+            invoice_callback.contains("create_provider_invoice_for_account"),
+            "invoice callback must use provider-aware account invoice construction"
+        );
+        assert!(
+            !invoice_callback.contains("crate::invoice_paid::create_invoice(")
+                && !invoice_callback.contains("invoice_paid::create_invoice("),
+            "migrated invoice callback must not use the legacy account-less helper"
+        );
+    }
+
+    // -- Transfer signature verification ---------------------------------------
+    //
+    // The transfer route verifies signatures through spark-client. These local
+    // checks exercise the same canonical "transfer:{username}-{to_pubkey}"
+    // message binding without constructing a runtime Spark client.
+
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+
+    /// Deterministic keypair from a seed byte.
+    fn transfer_key(seed: u8) -> (SecretKey, PublicKey) {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let public = PublicKey::from_secret_key(&secp, &secret);
+        (secret, public)
+    }
+
+    /// Sign `message` the way the SDK does: ECDSA over `sha256(message)`.
+    fn sign(secret: &SecretKey, message: &str) -> Signature {
+        let secp = Secp256k1::new();
+        let digest = sha256::Hash::hash(message.as_bytes());
+        secp.sign_ecdsa(&Message::from_digest(digest.to_byte_array()), secret)
+    }
+
+    /// The canonical message the transfer route signs and verifies.
+    fn transfer_message(username: &str, to_pubkey: &PublicKey) -> String {
+        format!("transfer:{username}-{}", hex::encode(to_pubkey.serialize()))
+    }
+
+    #[test]
+    fn transfer_signature_accepts_valid() {
+        let secp = Secp256k1::new();
+        let (alice_secret, alice_pubkey) = transfer_key(1);
+        let (_, bob_pubkey) = transfer_key(2);
+        let message = transfer_message("alice", &bob_pubkey);
+        let sig = sign(&alice_secret, &message);
+
+        assert!(
+            secp.verify_ecdsa(
+                &Message::from_digest(sha256::Hash::hash(message.as_bytes()).to_byte_array()),
+                &sig,
+                &alice_pubkey,
+            )
+            .is_ok(),
+            "a valid signature over the canonical message must verify"
+        );
+    }
+
+    #[test]
+    fn transfer_signature_rejects_forged_signer() {
+        // Alice signs, but the request attributes the signature to Bob's key.
+        let secp = Secp256k1::new();
+        let (alice_secret, _) = transfer_key(1);
+        let (_, bob_pubkey) = transfer_key(2);
+        let message = transfer_message("alice", &bob_pubkey);
+        let sig = sign(&alice_secret, &message);
+
+        assert!(
+            secp.verify_ecdsa(
+                &Message::from_digest(sha256::Hash::hash(message.as_bytes()).to_byte_array()),
+                &sig,
+                &bob_pubkey,
+            )
+            .is_err(),
+            "a signature made by a different key must be rejected"
+        );
+    }
+
+    #[test]
+    fn transfer_signature_is_bound_to_message() {
+        // A signature verifies only for the exact bytes signed: changing the
+        // username invalidates it, and a register-style "{name}-{timestamp}"
+        // signature cannot be replayed as a transfer (the "transfer:" prefix
+        // domain-separates the two flows).
+        let secp = Secp256k1::new();
+        let (alice_secret, alice_pubkey) = transfer_key(1);
+        let (_, bob_pubkey) = transfer_key(2);
+        let sig = sign(&alice_secret, &transfer_message("alice", &bob_pubkey));
+
+        let tampered_username = transfer_message("mallory", &bob_pubkey);
+        let register_style = String::from("alice-1700000000");
+        for other in [tampered_username, register_style] {
+            assert!(
+                secp.verify_ecdsa(
+                    &Message::from_digest(sha256::Hash::hash(other.as_bytes()).to_byte_array()),
+                    &sig,
+                    &alice_pubkey,
+                )
+                .is_err(),
+                "signature must not verify against a different message: {other}"
+            );
+        }
+    }
+}
