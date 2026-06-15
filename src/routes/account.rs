@@ -27,7 +27,7 @@ use crate::{
     user::User,
 };
 
-use super::{LnurlServer, PublicIdentifierIntent, PublicRecipient};
+use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
 
 impl<DB> LnurlServer<DB>
 where
@@ -342,7 +342,7 @@ where
         .await
         .map_err(|e| {
             error!("failed to execute query: {}", e);
-            super::lnurl_error("internal server error")
+            super::lnurl_pay::lnurl_error("internal server error")
         })?;
 
     Ok(recipient.map(|recipient| PublicRecipient {

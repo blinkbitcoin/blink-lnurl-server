@@ -10,7 +10,7 @@ use crate::{
     time::now_millis,
 };
 
-use super::{LnurlServer, account, lnurl_error};
+use super::{LnurlServer, account, lnurl_pay::lnurl_error};
 
 impl<DB> LnurlServer<DB>
 where
