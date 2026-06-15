@@ -1,9 +1,22 @@
 mod account;
+mod internal;
 mod lnurl_pay;
+mod webhook;
 mod zap;
+#[allow(unused_imports)]
 pub use lnurl_pay::{LnurlPayCallbackParams, PayResponse, Tag};
+#[cfg(test)]
+#[allow(unused_imports)]
+use webhook::process_webhook;
+pub(crate) use webhook::settle_blink_invoice_by_payment_hash;
+#[allow(unused_imports)]
+pub use webhook::{BlinkInvoiceWebhookPayload, BlinkInvoiceWebhookStatus};
 
+#[cfg(test)]
+#[allow(unused_imports)]
 use crate::identifier::{IdentifierKind, WalletModifier, parse_public_identifier};
+#[cfg(test)]
+#[allow(unused_imports)]
 use crate::models::{
     CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
     INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS, INTERNAL_ERROR_IDENTIFIER_CONFLICT,
@@ -14,6 +27,8 @@ use crate::models::{
     InternalTransferToSparkRequest, InternalTransferToSparkResponse, InvoicePaidRequest,
     InvoicesPaidRequest,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 use axum::{
     Extension, Json,
     body::Bytes,
@@ -21,19 +36,40 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 use axum_extra::extract::Host;
+#[cfg(test)]
+#[allow(unused_imports)]
 use bitcoin::{
     hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256},
     secp256k1::XOnlyPublicKey,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
+#[cfg(test)]
+#[allow(unused_imports)]
 use nostr::{Event, JsonUtil};
+#[cfg(test)]
+#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[allow(unused_imports)]
 use serde_json::{Value, json};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::collections::HashSet;
+use std::marker::PhantomData;
+#[cfg(test)]
+#[allow(unused_imports)]
 use std::str::FromStr;
-use std::{collections::HashSet, marker::PhantomData};
+#[cfg(test)]
+#[allow(unused_imports)]
 use tracing::{debug, error, trace, warn};
 
+#[cfg(test)]
+#[allow(unused_imports)]
 use crate::{
     invoice_paid::{
         HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
@@ -43,6 +79,8 @@ use crate::{
     time::now_millis,
     zap::Zap,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 use crate::{
     providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError},
     repository::{
@@ -77,749 +115,8 @@ const fn public_lnurl_error_reasons() -> [&'static str; 6] {
     ]
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BlinkInvoiceWebhookPayload {
-    pub payment_hash: String,
-    pub payment_preimage: Option<String>,
-    pub payment_request: Option<String>,
-    pub status: BlinkInvoiceWebhookStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum BlinkInvoiceWebhookStatus {
-    #[serde(rename = "PAID")]
-    Paid,
-    #[serde(rename = "EXPIRED")]
-    Expired,
-}
-
 pub struct LnurlServer<DB> {
     db: PhantomData<DB>,
-}
-
-impl<DB> LnurlServer<DB>
-where
-    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
-{
-    /// Webhook endpoint for SSP payment notifications.
-    /// Verifies HMAC-SHA256 signature and processes payment preimages.
-    pub async fn webhook(
-        Extension(state): Extension<State<DB>>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Result<(), (StatusCode, Json<Value>)> {
-        process_webhook(
-            &state.db,
-            &state.webhook_service,
-            &state.webhook_secret,
-            &state.invoice_paid_trigger,
-            &headers,
-            &body,
-        )
-        .await
-    }
-
-    pub async fn blink_webhook(
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<BlinkInvoiceWebhookPayload>,
-    ) -> Result<(), (StatusCode, Json<Value>)> {
-        validate_blink_payment_request_hash(
-            &payload.payment_hash,
-            payload.payment_request.as_deref(),
-        )?;
-
-        match payload.status {
-            BlinkInvoiceWebhookStatus::Paid => {
-                settle_blink_invoice_by_payment_hash(
-                    &state,
-                    &payload.payment_hash,
-                    payload.payment_preimage.as_deref(),
-                )
-                .await
-                .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, &e))?;
-            }
-            BlinkInvoiceWebhookStatus::Expired => {
-                expire_blink_invoice_by_payment_hash(&state, &payload.payment_hash)
-                    .await
-                    .map_err(|e| blink_webhook_settlement_error(&payload.payment_hash, &e))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn transfer_identifier_to_spark(
-        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
-        Extension(state): Extension<State<DB>>,
-        body: Bytes,
-    ) -> Result<Json<InternalTransferToSparkResponse>, (StatusCode, Json<InternalErrorResponse>)>
-    {
-        crate::internal_auth::require_scope(
-            &principal,
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
-        )?;
-
-        let payload: InternalTransferToSparkRequest =
-            serde_json::from_slice(&body).map_err(|e| {
-                trace!("invalid internal transfer request JSON: {e}");
-                internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
-            })?;
-
-        let domain = validate_internal_domain(&payload.domain)?;
-        let parsed = parse_public_identifier(&payload.identifier).map_err(|e| {
-            trace!(
-                "invalid internal transfer identifier '{}': {e:?}",
-                payload.identifier
-            );
-            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
-        })?;
-        if parsed.wallet.is_some() {
-            return Err(internal_bad_request(
-                INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
-            ));
-        }
-        let identifier = parsed.canonical;
-        let destination_spark_pubkey =
-            validate_internal_required_string(&payload.destination_spark_pubkey)?;
-        let destination_spark_pubkey = account::parse_pubkey(&destination_spark_pubkey)
-            .map_err(|_| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))?
-            .to_string();
-        let description = validate_internal_description(&payload.description)?;
-
-        let source_recipient = state
-            .db
-            .resolve_recipient_by_identifier(&domain, &identifier)
-            .await
-            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
-        let Some(source_recipient) = source_recipient else {
-            return Err(internal_transfer_to_spark_error(
-                LnurlRepositoryError::SourceNotOwner,
-                &domain,
-                &identifier,
-            ));
-        };
-        if source_recipient.provider != AccountProvider::Blink {
-            return Err(internal_transfer_to_spark_error(
-                LnurlRepositoryError::InvalidOwnership,
-                &domain,
-                &identifier,
-            ));
-        }
-
-        state
-            .db
-            .transfer_blink_identifier_to_spark(&BlinkToSparkIdentifierTransfer {
-                domain: domain.clone(),
-                identifier: identifier.clone(),
-                source_account_id: source_recipient.account_id,
-                destination_spark_pubkey: destination_spark_pubkey.clone(),
-                description,
-            })
-            .await
-            .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
-
-        Ok(Json(InternalTransferToSparkResponse {
-            domain: domain.clone(),
-            identifier: identifier.clone(),
-            provider: AccountProvider::Spark.as_str().to_string(),
-            spark_pubkey: destination_spark_pubkey,
-            lightning_address: format!("{identifier}@{domain}"),
-            lnurl: format!("lnurlp://{domain}/lnurlp/{identifier}"),
-        }))
-    }
-
-    pub async fn create_internal_blink_account(
-        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<CreateBlinkAccountRequest>,
-    ) -> Result<Json<CreateBlinkAccountResponse>, (StatusCode, Json<InternalErrorResponse>)> {
-        crate::internal_auth::require_scope(
-            &principal,
-            crate::internal_auth::SCOPE_BLINK_ACCOUNTS_CREATE,
-        )?;
-
-        let domain = validate_internal_domain(&payload.domain)?;
-        let blink_account_id = validate_internal_required_string(&payload.blink_account_id)?;
-        let btc_wallet_id = validate_internal_required_string(&payload.btc_wallet_id)?;
-        let usd_wallet_id = validate_internal_required_string(&payload.usd_wallet_id)?;
-        let description = validate_internal_description(&payload.description)?;
-        if payload.identifiers.is_empty() {
-            return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
-        }
-
-        let default_wallet = parse_internal_default_wallet(&payload.default_wallet)?;
-        let mut identifiers = Vec::with_capacity(payload.identifiers.len());
-        let mut response_identifiers = Vec::with_capacity(payload.identifiers.len());
-        let mut seen_identifiers = HashSet::with_capacity(payload.identifiers.len());
-        for raw_identifier in &payload.identifiers {
-            let parsed = parse_public_identifier(raw_identifier).map_err(|e| {
-                trace!("invalid internal account identifier '{raw_identifier}': {e:?}");
-                internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
-            })?;
-            if parsed.wallet.is_some() {
-                return Err(internal_bad_request(
-                    INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED,
-                ));
-            }
-            if !seen_identifiers.insert((domain.clone(), parsed.canonical.clone())) {
-                return Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST));
-            }
-            let identifier_kind = match parsed.kind {
-                IdentifierKind::Username => AccountIdentifierKind::Username,
-                IdentifierKind::Phone => AccountIdentifierKind::Phone,
-            };
-            let kind = identifier_kind.as_str().to_string();
-            identifiers.push(NewAccountIdentifier {
-                domain: domain.clone(),
-                identifier: parsed.canonical.clone(),
-                identifier_kind,
-                description: description.clone(),
-            });
-            response_identifiers.push(InternalAccountIdentifierResponse {
-                identifier: parsed.canonical,
-                kind,
-                description: description.clone(),
-            });
-        }
-
-        let account_id = generate_account_id(AccountProvider::Blink);
-        let account = NewBlinkAccount {
-            account_id: Some(account_id.clone()),
-            blink_account_id: blink_account_id.clone(),
-            btc_wallet_id: btc_wallet_id.clone(),
-            usd_wallet_id: usd_wallet_id.clone(),
-            default_wallet,
-            identifiers,
-        };
-
-        state
-            .db
-            .create_blink_account(&account)
-            .await
-            .map_err(internal_account_creation_error)?;
-
-        Ok(Json(CreateBlinkAccountResponse {
-            account_id,
-            provider: AccountProvider::Blink.as_str().to_string(),
-            blink_account_id,
-            btc_wallet_id,
-            usd_wallet_id,
-            default_wallet: default_wallet.as_str().to_string(),
-            domain,
-            identifiers: response_identifiers,
-        }))
-    }
-
-    pub async fn get_internal_identifier(
-        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
-        Path((domain, identifier)): Path<(String, String)>,
-        Extension(state): Extension<State<DB>>,
-    ) -> Result<Json<InternalIdentifierLookupResponse>, (StatusCode, Json<InternalErrorResponse>)>
-    {
-        crate::internal_auth::require_scope(&principal, crate::internal_auth::SCOPE_ACCOUNTS_READ)?;
-
-        let domain = validate_internal_lookup_domain(&domain)?;
-        let parsed = parse_public_identifier(&identifier).map_err(|e| {
-            trace!("invalid internal lookup identifier '{identifier}': {e:?}");
-            internal_bad_request(INTERNAL_ERROR_INVALID_IDENTIFIER)
-        })?;
-
-        let recipient = state
-            .db
-            .resolve_recipient_by_identifier(&domain, &parsed.canonical)
-            .await
-            .map_err(|e| internal_lookup_storage_error(&e))?;
-        let Some(recipient) = recipient else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
-            ));
-        };
-
-        Ok(Json(internal_identifier_lookup_response(
-            recipient,
-            parsed.wallet,
-        )))
-    }
-}
-
-fn internal_identifier_lookup_response(
-    recipient: ResolvedRecipient,
-    requested_wallet: Option<WalletModifier>,
-) -> InternalIdentifierLookupResponse {
-    InternalIdentifierLookupResponse {
-        provider: recipient.provider.as_str().to_string(),
-        account_id: recipient.account_id,
-        domain: recipient.domain,
-        identifier: recipient.identifier,
-        identifier_kind: recipient.identifier_kind.as_str().to_string(),
-        description: recipient.description,
-        requested_wallet: requested_wallet
-            .map(|wallet| wallet_modifier_response_value(wallet).to_string()),
-        provider_details: InternalProviderDetailsResponse {
-            spark_pubkey: recipient.spark_pubkey,
-            blink_account_id: recipient.blink_account_id,
-            btc_wallet_id: recipient.btc_wallet_id,
-            usd_wallet_id: recipient.usd_wallet_id,
-            default_wallet: recipient
-                .default_wallet
-                .map(|wallet| wallet.as_str().to_string()),
-        },
-    }
-}
-
-const fn wallet_modifier_response_value(modifier: WalletModifier) -> &'static str {
-    match modifier {
-        WalletModifier::Btc => "btc",
-        WalletModifier::Usd => "usd",
-    }
-}
-
-fn validate_internal_domain(
-    domain: &str,
-) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
-    let domain = domain.trim().to_lowercase();
-    if domain.is_empty() {
-        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
-    } else {
-        Ok(domain)
-    }
-}
-
-fn validate_internal_lookup_domain(
-    domain: &str,
-) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
-    let domain = domain.trim().to_lowercase();
-    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
-        Err(internal_bad_request(INTERNAL_ERROR_INVALID_DOMAIN))
-    } else {
-        Ok(domain)
-    }
-}
-
-fn validate_internal_required_string(
-    value: &str,
-) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
-    let value = value.trim();
-    if value.is_empty() {
-        Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
-    } else {
-        Ok(value.to_string())
-    }
-}
-
-fn validate_internal_description(
-    description: &str,
-) -> Result<String, (StatusCode, Json<InternalErrorResponse>)> {
-    let description = validate_internal_required_string(description)?;
-    lnurl_pay::validate_description(&description)
-        .map(|()| description)
-        .map_err(|(_status, _body)| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))
-}
-
-fn parse_internal_default_wallet(
-    wallet: &str,
-) -> Result<WalletKind, (StatusCode, Json<InternalErrorResponse>)> {
-    match wallet.trim().to_lowercase().as_str() {
-        "btc" => Ok(WalletKind::Btc),
-        "usd" => Ok(WalletKind::Usd),
-        _ => Err(internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)),
-    }
-}
-
-fn internal_account_creation_error(
-    error: LnurlRepositoryError,
-) -> (StatusCode, Json<InternalErrorResponse>) {
-    match error {
-        LnurlRepositoryError::BlinkAccountExists => (
-            StatusCode::CONFLICT,
-            Json(InternalErrorResponse::new(
-                INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS,
-            )),
-        ),
-        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
-            StatusCode::CONFLICT,
-            Json(InternalErrorResponse::new(
-                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
-            )),
-        ),
-        error => {
-            error!("failed to create internal Blink account: {error}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(InternalErrorResponse::new(
-                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
-                )),
-            )
-        }
-    }
-}
-
-fn internal_transfer_to_spark_error(
-    error: LnurlRepositoryError,
-    domain: &str,
-    identifier: &str,
-) -> (StatusCode, Json<InternalErrorResponse>) {
-    match error {
-        LnurlRepositoryError::SourceNotOwner | LnurlRepositoryError::AccountNotFound => (
-            StatusCode::NOT_FOUND,
-            Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
-        ),
-        LnurlRepositoryError::InvalidOwnership | LnurlRepositoryError::InvalidProvider => (
-            StatusCode::CONFLICT,
-            Json(InternalErrorResponse::new(INTERNAL_ERROR_INVALID_REQUEST)),
-        ),
-        LnurlRepositoryError::IdentifierConflict | LnurlRepositoryError::NameTaken => (
-            StatusCode::CONFLICT,
-            Json(InternalErrorResponse::new(
-                INTERNAL_ERROR_IDENTIFIER_CONFLICT,
-            )),
-        ),
-        error => {
-            error!(
-                "failed to transfer internal identifier {identifier}@{domain} to Spark: {error}"
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(InternalErrorResponse::new(
-                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
-                )),
-            )
-        }
-    }
-}
-
-fn internal_lookup_storage_error(
-    error: &LnurlRepositoryError,
-) -> (StatusCode, Json<InternalErrorResponse>) {
-    error!("failed to resolve internal identifier lookup: {error}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(InternalErrorResponse::new(
-            INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
-        )),
-    )
-}
-
-fn internal_bad_request(message: &'static str) -> (StatusCode, Json<InternalErrorResponse>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(InternalErrorResponse::new(message)),
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-async fn process_webhook<DB>(
-    db: &DB,
-    webhook_service: &crate::webhooks::WebhookService<DB>,
-    webhook_secret: &str,
-    invoice_paid_trigger: &tokio::sync::watch::Sender<()>,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<(), (StatusCode, Json<Value>)>
-where
-    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
-{
-    // Verify HMAC-SHA256 signature
-    let signature_header = headers
-        .get("X-Spark-Signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            trace!("missing X-Spark-Signature header");
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(Value::String("missing signature".into())),
-            )
-        })?;
-
-    let signature_bytes = hex::decode(signature_header).map_err(|_| {
-        trace!("invalid signature hex encoding");
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-
-    let mut engine = HmacEngine::<sha256::Hash>::new(webhook_secret.as_bytes());
-    engine.input(body);
-    let expected_hmac: Hmac<sha256::Hash> = Hmac::from_engine(engine);
-
-    if expected_hmac.to_byte_array() != signature_bytes.as_slice() {
-        trace!("invalid webhook signature");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(Value::String("invalid signature".into())),
-        ));
-    }
-
-    // Parse the body
-    let payload: SspWebhookPayload = serde_json::from_slice(body).map_err(|e| {
-        trace!("invalid webhook payload: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid payload".into())),
-        )
-    })?;
-
-    // Only process lightning receive finished events
-    if payload.event_type != "SPARK_LIGHTNING_RECEIVE_FINISHED" {
-        debug!("ignoring webhook event type: {}", payload.event_type);
-        return Ok(());
-    }
-
-    let payment_preimage = payload.payment_preimage.ok_or_else(|| {
-        trace!("missing payment_preimage in webhook payload");
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("missing payment_preimage".into())),
-        )
-    })?;
-
-    let receiver_pubkey = payload.receiver_identity_public_key.ok_or_else(|| {
-        trace!("missing receiver_identity_public_key in webhook payload");
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("missing receiver_identity_public_key".into())),
-        )
-    })?;
-
-    // Compute payment hash from preimage
-    let preimage_bytes = hex::decode(&payment_preimage).map_err(|e| {
-        trace!("invalid preimage hex: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid preimage".into())),
-        )
-    })?;
-    let payment_hash = sha256::Hash::hash(&preimage_bytes).to_string();
-
-    // Look up invoice
-    let invoice = db
-        .get_invoice_by_payment_hash(&payment_hash)
-        .await
-        .map_err(|e| {
-            error!("failed to get invoice: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Value::String("internal server error".into())),
-            )
-        })?;
-
-    let Some(invoice) = invoice else {
-        debug!(
-            "no invoice found for payment hash {} from webhook",
-            payment_hash
-        );
-        return Ok(());
-    };
-
-    // Verify invoice belongs to the receiver
-    if invoice.user_pubkey != receiver_pubkey {
-        warn!(
-            "webhook invoice user mismatch: expected={}, got={}",
-            receiver_pubkey, invoice.user_pubkey
-        );
-        return Ok(());
-    }
-
-    let amount_received_sat = match &payload.htlc_amount {
-        Some(amount) if amount.unit == "SATOSHI" => Some(amount.value),
-        Some(amount) if amount.unit == "MILLISATOSHI" => {
-            if amount.value % 1000 != 0 {
-                warn!(
-                    "truncating htlc_amount from {} msat to {} sat",
-                    amount.value,
-                    amount.value / 1000
-                );
-            }
-            Some(amount.value / 1000)
-        }
-        Some(amount) => {
-            warn!("unexpected htlc_amount unit: {}", amount.unit);
-            None
-        }
-        None => None,
-    };
-
-    // Handle the invoice paid event
-    if let Err(e) = handle_invoice_paid(
-        db,
-        webhook_service,
-        &payment_hash,
-        &payment_preimage,
-        amount_received_sat,
-        invoice_paid_trigger,
-    )
-    .await
-    {
-        error!(
-            "failed to handle webhook invoice paid for {}: {}",
-            payment_hash, e
-        );
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Value::String("internal server error".into())),
-        ));
-    }
-
-    debug!(
-        "webhook processed: invoice {} paid for pubkey {}",
-        payment_hash, receiver_pubkey
-    );
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(super) enum BlinkSettlementError {
-    #[error(transparent)]
-    Repository(#[from] LnurlRepositoryError),
-    #[error(transparent)]
-    Provider(#[from] ProviderError),
-    #[error(transparent)]
-    InvoicePaid(#[from] HandleInvoicePaidError),
-}
-
-fn blink_webhook_settlement_error(
-    payment_hash: &str,
-    error: &BlinkSettlementError,
-) -> (StatusCode, Json<Value>) {
-    if matches!(
-        error,
-        BlinkSettlementError::InvoicePaid(
-            HandleInvoicePaidError::InvalidInvoice(_) | HandleInvoicePaidError::InvalidPreimage(_)
-        )
-    ) {
-        trace!(
-            "invalid Blink webhook payload for {}: {}",
-            payment_hash, error
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid payload".into())),
-        );
-    }
-
-    error!(
-        "failed to process Blink webhook for {}: {}",
-        payment_hash, error
-    );
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(Value::String("internal server error".into())),
-    )
-}
-
-fn validate_blink_payment_request_hash(
-    payment_hash: &str,
-    payment_request: Option<&str>,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(payment_request) = payment_request else {
-        return Ok(());
-    };
-
-    let invoice = Bolt11Invoice::from_str(payment_request).map_err(|e| {
-        trace!("invalid Blink webhook paymentRequest: {e}");
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid paymentRequest".into())),
-        )
-    })?;
-
-    if invoice.payment_hash().to_string() != payment_hash {
-        trace!("Blink webhook paymentRequest hash does not match paymentHash");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("paymentRequest hash mismatch".into())),
-        ));
-    }
-
-    Ok(())
-}
-
-pub(super) async fn settle_blink_invoice_by_payment_hash<DB>(
-    state: &State<DB>,
-    payment_hash: &str,
-    supplied_preimage: Option<&str>,
-) -> Result<Option<String>, BlinkSettlementError>
-where
-    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
-{
-    let Some(invoice) = state.db.get_invoice_by_payment_hash(payment_hash).await? else {
-        return Ok(None);
-    };
-    if invoice.provider != Some(AccountProvider::Blink) {
-        return Ok(None);
-    }
-
-    if let Some(preimage) = supplied_preimage {
-        handle_invoice_paid(
-            &state.db,
-            &state.webhook_service,
-            payment_hash,
-            preimage,
-            None,
-            &state.invoice_paid_trigger,
-        )
-        .await?;
-        return Ok(Some(preimage.to_string()));
-    }
-
-    let status = state
-        .providers
-        .provider_for(AccountProvider::Blink)
-        .payment_status(PaymentStatusRequest { payment_hash })
-        .await?;
-
-    if !status.settled {
-        return Ok(None);
-    }
-
-    let Some(preimage) = status.preimage else {
-        return Ok(None);
-    };
-
-    handle_invoice_paid(
-        &state.db,
-        &state.webhook_service,
-        payment_hash,
-        &preimage,
-        status.amount_received_sat,
-        &state.invoice_paid_trigger,
-    )
-    .await?;
-
-    Ok(Some(preimage))
-}
-
-async fn expire_blink_invoice_by_payment_hash<DB>(
-    state: &State<DB>,
-    payment_hash: &str,
-) -> Result<(), BlinkSettlementError>
-where
-    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
-{
-    let Some(invoice) = state.db.get_invoice_by_payment_hash(payment_hash).await? else {
-        return Ok(());
-    };
-    if invoice.provider != Some(AccountProvider::Blink) {
-        return Ok(());
-    }
-
-    let status = state
-        .providers
-        .provider_for(AccountProvider::Blink)
-        .payment_status(PaymentStatusRequest { payment_hash })
-        .await?;
-
-    if status.expired {
-        state
-            .db
-            .mark_invoice_expired(payment_hash, now_millis())
-            .await?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -871,21 +168,6 @@ fn spark_user_from_recipient(
     recipient: ResolvedRecipient,
 ) -> Result<crate::user::User, LnurlRepositoryError> {
     account::spark_user_from_recipient(recipient)
-}
-
-#[derive(Debug, Deserialize)]
-struct SspWebhookPayload {
-    #[serde(rename = "type")]
-    event_type: String,
-    payment_preimage: Option<String>,
-    receiver_identity_public_key: Option<String>,
-    htlc_amount: Option<SspAmount>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SspAmount {
-    value: i64,
-    unit: String,
 }
 
 #[cfg(test)]
@@ -2007,10 +1289,12 @@ mod tests {
     // -- Spark management account-backed compatibility ------------------------
 
     fn handler_source(name: &str) -> &'static str {
-        const SOURCES: [&str; 4] = [
+        const SOURCES: [&str; 6] = [
             include_str!("mod.rs"),
             include_str!("account.rs"),
+            include_str!("internal.rs"),
             include_str!("lnurl_pay.rs"),
+            include_str!("webhook.rs"),
             include_str!("zap.rs"),
         ];
 
