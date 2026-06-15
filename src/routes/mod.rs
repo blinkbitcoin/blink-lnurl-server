@@ -1,7 +1,7 @@
-use crate::identifier::{
-    IdentifierError, IdentifierKind, WalletModifier, canonical_spark_username,
-    parse_public_identifier,
-};
+mod account;
+mod zap;
+
+use crate::identifier::{IdentifierKind, WalletModifier, parse_public_identifier};
 use crate::models::{
     CheckUsernameAvailableResponse, CreateBlinkAccountRequest, CreateBlinkAccountResponse,
     INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS, INTERNAL_ERROR_IDENTIFIER_CONFLICT,
@@ -10,10 +10,7 @@ use crate::models::{
     INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
     InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
     InternalTransferToSparkRequest, InternalTransferToSparkResponse, InvoicePaidRequest,
-    InvoicesPaidRequest, ListMetadataRequest, ListMetadataResponse, PublishZapReceiptRequest,
-    PublishZapReceiptResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
-    RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
-    TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
+    InvoicesPaidRequest,
 };
 use axum::{
     Extension, Json,
@@ -25,10 +22,10 @@ use axum::{
 use axum_extra::extract::Host;
 use bitcoin::{
     hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256},
-    secp256k1::{PublicKey, XOnlyPublicKey, ecdsa::Signature},
+    secp256k1::XOnlyPublicKey,
 };
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
-use nostr::{Alphabet, Event, EventBuilder, JsonUtil, Kind, TagStandard, key::Keys};
+use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -41,18 +38,17 @@ use crate::{
         handle_invoices_paid,
     },
     repository::LnurlSenderComment,
-    time::{now_millis, now_u64},
+    time::now_millis,
     zap::Zap,
 };
 use crate::{
     providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError},
     repository::{
-        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
-        LnurlRepository, LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount,
-        NewSparkRegistration, ResolvedRecipient, WalletKind, generate_account_id,
+        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, LnurlRepository,
+        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, ResolvedRecipient, WalletKind,
+        generate_account_id,
     },
     state::State,
-    user::User,
 };
 
 const ACCEPTABLE_TIME_DIFF_SECS: u64 = 600;
@@ -174,8 +170,8 @@ where
         Path(identifier): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
-        let username = canonical_spark_username_for_route(&identifier)?;
-        let domain = sanitize_domain(&state, &host).await?;
+        let username = account::canonical_spark_username_for_route(&identifier)?;
+        let domain = account::sanitize_domain(&state, &host).await?;
         let recipient = state
             .db
             .resolve_recipient_by_identifier(&domain, &username)
@@ -193,494 +189,6 @@ where
         }))
     }
 
-    pub async fn register(
-        Host(host): Host,
-        Path(pubkey): Path<String>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<RegisterLnurlPayRequest>,
-    ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = canonical_spark_username_for_route(&payload.username)?;
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &username,
-            payload.timestamp,
-            &state,
-        )
-        .await?;
-        validate_description(&payload.description)?;
-        let domain = sanitize_domain(&state, &host).await?;
-
-        let registration = NewSparkRegistration {
-            account_id: None,
-            pubkey: pubkey.to_string(),
-            identifier: NewAccountIdentifier {
-                domain: domain.clone(),
-                identifier: username.clone(),
-                identifier_kind: AccountIdentifierKind::Username,
-                description: payload.description,
-            },
-        };
-
-        if let Err(e) = state.db.upsert_spark_registration(&registration).await {
-            return Err(spark_registration_error(e, &username));
-        }
-
-        debug!("registered user '{username}' for pubkey {pubkey}");
-        let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
-        Ok(Json(RegisterLnurlPayResponse {
-            lnurl,
-            lightning_address: format!("{username}@{domain}"),
-        }))
-    }
-
-    pub async fn transfer(
-        Host(host): Host,
-        Path(to_pubkey): Path<String>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<TransferLnurlPayRequest>,
-    ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let username = canonical_spark_username_for_route(&payload.username)?;
-        validate_description(&payload.description)?;
-
-        let message = format!("transfer:{username}-{to_pubkey}");
-        let from_pk = verify_transfer_signature(
-            &payload.from_pubkey,
-            &payload.from_signature,
-            &message,
-            &state,
-        )
-        .await?;
-        let to_pk =
-            verify_transfer_signature(&to_pubkey, &payload.to_signature, &message, &state).await?;
-
-        if from_pk == to_pk {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(Value::String(
-                    "transfer source and target are the same pubkey".into(),
-                )),
-            ));
-        }
-
-        let domain = sanitize_domain(&state, &host).await?;
-        let from_pubkey = from_pk.to_string();
-        let to_pubkey = to_pk.to_string();
-
-        let source_recipient = state
-            .db
-            .resolve_recipient_by_identifier(&domain, &username)
-            .await
-            .map_err(|e| spark_transfer_error(e, &username))?
-            .ok_or_else(|| spark_transfer_error(LnurlRepositoryError::SourceNotOwner, &username))?;
-
-        if source_recipient.spark_pubkey.as_deref() != Some(from_pubkey.as_str()) {
-            return Err(spark_transfer_error(
-                LnurlRepositoryError::SourceNotOwner,
-                &username,
-            ));
-        }
-
-        if let Err(e) = state
-            .db
-            .transfer_identifier(&IdentifierTransfer {
-                domain: domain.clone(),
-                identifier: username.clone(),
-                source_account_id: source_recipient.account_id,
-                destination_spark_pubkey: to_pubkey.clone(),
-                description: payload.description,
-            })
-            .await
-        {
-            return Err(spark_transfer_error(e, &username));
-        }
-
-        debug!("transferred '{username}' from {from_pk} to {to_pk}");
-        let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
-        Ok(Json(TransferLnurlPayResponse {
-            lnurl,
-            lightning_address: format!("{username}@{domain}"),
-        }))
-    }
-
-    pub async fn unregister(
-        Host(host): Host,
-        Path(pubkey): Path<String>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<UnregisterLnurlPayRequest>,
-    ) -> Result<(), (StatusCode, Json<Value>)> {
-        let username = canonical_spark_username_for_route(&payload.username)?;
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &username,
-            payload.timestamp,
-            &state,
-        )
-        .await?;
-        let domain = sanitize_domain(&state, &host).await?;
-
-        state
-            .db
-            .get_account_by_spark_pubkey(&pubkey.to_string())
-            .await
-            .map_err(storage_error)?;
-
-        state
-            .db
-            .delete_spark_registration(&domain, &pubkey.to_string(), &username)
-            .await
-            .map_err(|e| spark_unregister_error(e, &username))?;
-        debug!("unregistered user '{username}' for pubkey {pubkey}");
-        Ok(())
-    }
-
-    pub async fn recover(
-        Host(host): Host,
-        Path(pubkey): Path<String>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<RecoverLnurlPayRequest>,
-    ) -> Result<Json<RecoverLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &pubkey,
-            payload.timestamp,
-            &state,
-        )
-        .await?;
-        let domain = sanitize_domain(&state, &host).await?;
-
-        let account = state
-            .db
-            .get_account_by_spark_pubkey(&pubkey.to_string())
-            .await
-            .map_err(storage_error)?;
-        if account.is_none() {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(Value::String("user not found".into())),
-            ));
-        }
-
-        let user = state
-            .db
-            .get_user_by_pubkey(&domain, &pubkey.to_string())
-            .await
-            .map_err(storage_error)?;
-
-        match user {
-            Some(user) => {
-                let lnurl = format!("lnurlp://{}/lnurlp/{}", &user.domain, user.name);
-                Ok(Json(RecoverLnurlPayResponse {
-                    lnurl,
-                    lightning_address: format!("{}@{}", user.name, &user.domain),
-                    username: user.name,
-                    description: user.description,
-                }))
-            }
-            None => Err((
-                StatusCode::NOT_FOUND,
-                Json(Value::String("user not found".into())),
-            )),
-        }
-    }
-
-    pub async fn list_metadata(
-        Path(pubkey): Path<String>,
-        Query(params): Query<ListMetadataRequest>,
-        Extension(state): Extension<State<DB>>,
-    ) -> Result<Json<ListMetadataResponse>, (StatusCode, Json<Value>)> {
-        let pubkey = validate(
-            &pubkey,
-            &params.signature,
-            &pubkey,
-            params.timestamp,
-            &state,
-        )
-        .await?;
-        let offset = params.offset.unwrap_or(DEFAULT_METADATA_OFFSET);
-        let limit = params.limit.unwrap_or(DEFAULT_METADATA_LIMIT);
-        let metadata = state
-            .db
-            .get_metadata_by_pubkey(&pubkey.to_string(), offset, limit, params.updated_after)
-            .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
-        Ok(Json(ListMetadataResponse { metadata }))
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub async fn publish_zap_receipt(
-        Path((pubkey, payment_hash)): Path<(String, String)>,
-        Extension(state): Extension<State<DB>>,
-        Json(payload): Json<PublishZapReceiptRequest>,
-    ) -> Result<Json<PublishZapReceiptResponse>, (StatusCode, Json<Value>)> {
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &payload.zap_receipt,
-            payload.timestamp,
-            &state,
-        )
-        .await?;
-
-        if payload.zap_receipt.len() > MAX_NOSTR_EVENT_SIZE {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "zap receipt too large"})),
-            ));
-        }
-
-        // Parse and validate the zap receipt
-        let zap_receipt = Event::from_json(&payload.zap_receipt).map_err(|e| {
-            trace!("invalid zap receipt, could not parse: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid zap receipt"})),
-            )
-        })?;
-
-        // Validate it's a zap receipt (kind 9735)
-        if zap_receipt.kind != Kind::ZapReceipt {
-            trace!(
-                "event is not a zap receipt, got kind: {:?}",
-                zap_receipt.kind
-            );
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "event is not a zap receipt"})),
-            ));
-        }
-
-        // Verify the zap receipt signature
-        if zap_receipt.verify().is_err() {
-            trace!("invalid zap receipt signature");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid zap receipt signature"})),
-            ));
-        }
-
-        // Extract preimage from zap receipt for LUD-21 backward compatibility
-        // This allows old clients using publish_zap_receipt to still populate
-        // the invoice's preimage for the verify endpoint
-        let preimage_from_receipt = zap_receipt.tags.iter().find_map(|t| {
-            if let Some(TagStandard::Preimage(p)) = t.as_standardized() {
-                Some(p.clone())
-            } else {
-                None
-            }
-        });
-
-        // Get the existing zap record
-        let mut zap = state
-            .db
-            .get_zap_by_payment_hash(&payment_hash)
-            .await
-            .map_err(|e| {
-                error!("failed to query zap: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-            })?
-            .ok_or_else(|| {
-                trace!("zap not found for payment hash: {}", payment_hash);
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "zap not found"})),
-                )
-            })?;
-
-        // Verify the zap belongs to this user
-        if zap.user_pubkey != pubkey.to_string() {
-            trace!("zap does not belong to this user");
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "unauthorized"})),
-            ));
-        }
-
-        // If we have a preimage, call the invoice paid handler for LUD-21 compatibility
-        // This ensures the preimage is stored in the invoices table
-        if let Some(preimage) = &preimage_from_receipt {
-            match handle_invoice_paid(
-                &state.db,
-                &state.webhook_service,
-                &payment_hash,
-                preimage,
-                None,
-                &state.invoice_paid_trigger,
-            )
-            .await
-            {
-                Err(HandleInvoicePaidError::InvalidPreimage(_)) => {
-                    trace!("invalid preimage in zap receipt for {}", payment_hash);
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": "invalid preimage"})),
-                    ));
-                }
-                Err(e) => {
-                    // Log but don't fail - this is for backward compatibility
-                    debug!(
-                        "Failed to handle invoice paid from zap receipt for {}: {}",
-                        payment_hash, e
-                    );
-                }
-                Ok(()) => {}
-            }
-        }
-
-        // Check if zap receipt already exists
-        let mut published = false;
-        if let Some(zap_receipt) = &zap.zap_event {
-            debug!(
-                "Zap receipt already exists for payment hash {}",
-                payment_hash
-            );
-            return Ok(Json(PublishZapReceiptResponse {
-                published,
-                zap_receipt: zap_receipt.clone(),
-            }));
-        }
-
-        // Parse the zap request to get relay info
-        let zap_request = Event::from_json(&zap.zap_request).map_err(|e| {
-            error!("failed to parse stored zap request: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-        })?;
-
-        // Determine if we need to recreate the zap receipt with server nostr key
-        let zap_receipt = match (zap.is_user_nostr_key, &state.nostr_keys) {
-            (true, _) => zap_receipt,
-            (false, None) => {
-                warn!("server nostr keys not configured, but should publish zap receipt.");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": "zap receipt should be server-published, but server does not support nostr (anymore)"}),
-                    ),
-                ));
-            }
-            (false, Some(signing_keys)) => {
-                // Recreate zap receipt signed by server nostr key
-                let preimage = zap_receipt.tags.iter().find_map(|t| {
-                    if let Some(TagStandard::Preimage(p)) = t.as_standardized() {
-                        Some(p.clone())
-                    } else {
-                        None
-                    }
-                });
-
-                let invoice = zap_receipt
-                    .tags
-                    .iter()
-                    .find_map(|t| {
-                        if let Some(TagStandard::Bolt11(b)) = t.as_standardized() {
-                            Some(b)
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        warn!("zap receipt missing bolt11 tag");
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({"error": "zap receipt missing bolt11 tag"})),
-                        )
-                    })?;
-
-                let zap_request_event = Event::from_json(&zap.zap_request).map_err(|e| {
-                    error!("failed to parse zap request: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                })?;
-                let builder = EventBuilder::zap_receipt(invoice, preimage, &zap_request_event);
-
-                builder.sign_with_keys(signing_keys).map_err(|e| {
-                    error!("failed to sign zap receipt: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                })?
-            }
-        };
-
-        let relays: Vec<_> = zap_request
-            .tags
-            .iter()
-            .filter_map(|t| {
-                if let Some(TagStandard::Relays(r)) = t.as_standardized() {
-                    Some(r.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .take(MAX_NOSTR_RELAYS)
-            .collect();
-
-        if !relays.is_empty() {
-            // The nostr keys are not really needed here, but we use them to create the client
-            let publish_nostr_keys = match &state.nostr_keys {
-                Some(keys) => keys.clone(),
-                None => Keys::generate(),
-            };
-            let nostr_client = nostr_sdk::Client::new(publish_nostr_keys);
-            for r in &relays {
-                if let Err(e) = nostr_client.add_relay(r).await {
-                    warn!("Failed to add relay {r}: {e}");
-                }
-            }
-
-            nostr_client.connect().await;
-
-            if let Err(e) = nostr_client.send_event(&zap_receipt).await {
-                error!("Failed to publish zap receipt to relays: {e}");
-            } else {
-                debug!("Published zap receipt to {} relays", relays.len());
-                published = true;
-            }
-
-            nostr_client.disconnect().await;
-        }
-
-        let zap_receipt_json = zap_receipt.try_as_json().map_err(|e| {
-            error!("failed to serialize zap receipt: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-        })?;
-        zap.zap_event = Some(zap_receipt_json.clone());
-        zap.updated_at = now_millis();
-        state.db.upsert_zap(&zap).await.map_err(|e| {
-            error!("failed to save zap receipt: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-        })?;
-
-        Ok(Json(PublishZapReceiptResponse {
-            published,
-            zap_receipt: zap_receipt_json,
-        }))
-    }
-
     pub async fn handle_lnurl_pay(
         Host(host): Host,
         Path(identifier): Path<String>,
@@ -690,16 +198,17 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let domain = sanitize_domain(&state, &host).await?;
-        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
-            .map_err(|e| {
+        let domain = account::sanitize_domain(&state, &host).await?;
+        let Some(public_identifier) =
+            account::parse_public_identifier_for_public_route(&identifier).map_err(|e| {
                 trace!("invalid public identifier '{identifier}': {e:?}");
                 lnurl_error("invalid identifier")
             })?
         else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let public_recipient =
+            account::resolve_public_recipient(&state, &domain, public_identifier).await?;
         let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
@@ -746,16 +255,17 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
-        let Some(public_identifier) = parse_public_identifier_for_public_route(&identifier)
-            .map_err(|e| {
+        let Some(public_identifier) =
+            account::parse_public_identifier_for_public_route(&identifier).map_err(|e| {
                 trace!("invalid public identifier '{identifier}': {e:?}");
                 lnurl_error("invalid identifier")
             })?
         else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let domain = sanitize_domain(&state, &host).await?;
-        let public_recipient = resolve_public_recipient(&state, &domain, public_identifier).await?;
+        let domain = account::sanitize_domain(&state, &host).await?;
+        let public_recipient =
+            account::resolve_public_recipient(&state, &domain, public_identifier).await?;
         let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
@@ -816,7 +326,7 @@ where
                 trace!("invalid nostr event, could not parse: {}", e);
                 lnurl_error("invalid nostr event")
             })?;
-            validate_nostr_zap_request(amount_msat, &event, expected_nostr_pubkey)?;
+            zap::validate_nostr_zap_request(amount_msat, &event, expected_nostr_pubkey)?;
             sha256::Hash::hash(raw_event.as_bytes())
         } else {
             let metadata = get_metadata_for_recipient(
@@ -1021,7 +531,7 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<InvoicePaidRequest>,
     ) -> Result<(), (StatusCode, Json<Value>)> {
-        let pubkey = validate(
+        let pubkey = account::validate(
             &pubkey,
             &payload.signature,
             &payload.preimage,
@@ -1118,7 +628,7 @@ where
             ));
         }
 
-        let pubkey = validate(
+        let pubkey = account::validate(
             &pubkey,
             &payload.signature,
             &pubkey,
@@ -1237,7 +747,7 @@ where
         let identifier = parsed.canonical;
         let destination_spark_pubkey =
             validate_internal_required_string(&payload.destination_spark_pubkey)?;
-        let destination_spark_pubkey = parse_pubkey(&destination_spark_pubkey)
+        let destination_spark_pubkey = account::parse_pubkey(&destination_spark_pubkey)
             .map_err(|_| internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST))?
             .to_string();
         let description = validate_internal_description(&payload.description)?;
@@ -1877,171 +1387,26 @@ where
     Ok(())
 }
 
-fn validate_nostr_zap_request(
-    amount_msat: u64,
-    event: &Event,
-    expected_nostr_pubkey: XOnlyPublicKey,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    if event.kind != Kind::ZapRequest {
-        trace!("nostr event is incorrect kind");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 1. It MUST have a valid nostr signature
-    if event.verify().is_err() {
-        trace!("invalid nostr event, does not verify");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 2. It MUST have tags
-    if event.tags.is_empty() {
-        trace!("invalid nostr event, missing tags");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 3. It MUST have only one p tag for the advertised recipient pubkey.
-    let mut p_tags = event
-        .tags
-        .iter()
-        .filter(|tag| {
-            tag.single_letter_tag()
-                .is_some_and(|t| t.is_lowercase() && t.character == Alphabet::P)
-        })
-        .filter_map(nostr::Tag::content);
-    let Some(p_tag) = p_tags.next() else {
-        trace!("invalid nostr event, missing 'p' tag");
-        return Err(lnurl_error("invalid nostr event"));
-    };
-    if p_tags.next().is_some() {
-        trace!("invalid nostr event, missing or multiple 'p' tags");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-    if p_tag != expected_nostr_pubkey.to_string() {
-        trace!("invalid nostr event, 'p' tag does not match recipient pubkey");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 4. It MUST have 0 or 1 e tags
-    if event
-        .tags
-        .iter()
-        .filter_map(nostr::Tag::single_letter_tag)
-        .filter(|t| t.is_lowercase() && t.character == Alphabet::E)
-        .count()
-        > 1
-    {
-        trace!("invalid nostr event, multiple 'e' tags");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 5. There should be a relays tag with the relays to send the zap receipt to.
-    if !event
-        .tags
-        .iter()
-        .any(|t| matches!(t.as_standardized(), Some(TagStandard::Relays(_))))
-    {
-        trace!("invalid nostr event, missing relay tag");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 6. If there is an amount tag, it MUST be equal to the amount query parameter.
-    if let Some(millisats) = event.tags.iter().find_map(|t| {
-        if let Some(TagStandard::Amount { millisats, .. }) = t.as_standardized() {
-            Some(millisats)
-        } else {
-            None
-        }
-    }) && *millisats != amount_msat
-    {
-        trace!("invalid nostr event, amount does not match");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-
-    // 7. If there is an 'a' tag, it MUST be a valid event coordinate
-    // NOTE: Assuming the tag is well-formed and contains the necessary fields, because it's standard.
-
-    // 8. There MUST be 0 or 1 P tags. If there is one, it MUST be equal to the zap receipt's pubkey.
-    // TODO(Phase 7): Enforce optional NIP-57 P-tag recipient checks when provider-neutral zap receipt keys are migrated.
-    Ok(())
-}
-
-fn canonical_spark_username_for_route(username: &str) -> Result<String, (StatusCode, Json<Value>)> {
-    canonical_spark_username(username).map_err(|e| {
-        trace!("invalid Spark username: {e:?}");
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid username".into())),
-        )
-    })
-}
-
 #[cfg(test)]
 fn validate_username(username: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    canonical_spark_username_for_route(username).map(|_| ())
+    account::validate_username(username)
 }
 
 #[cfg(test)]
-fn public_lookup_username(identifier: &str) -> Result<Option<String>, IdentifierError> {
-    let trimmed = identifier.trim();
-    if trimmed.is_empty() {
-        return Err(IdentifierError::EmptyIdentifier);
-    }
-
-    match parse_public_identifier(trimmed) {
-        Ok(parsed) => Ok(Some(parsed.canonical)),
-        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
-            Ok(Some(sanitize_username(trimmed)))
-        }
-        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+fn public_lookup_username(
+    identifier: &str,
+) -> Result<Option<String>, crate::identifier::IdentifierError> {
+    account::public_lookup_username(identifier)
 }
 
+#[cfg(test)]
 fn parse_public_identifier_for_public_route(
     identifier: &str,
-) -> Result<Option<PublicIdentifierIntent>, IdentifierError> {
-    let trimmed = identifier.trim();
-    if trimmed.is_empty() {
-        return Err(IdentifierError::EmptyIdentifier);
-    }
-
-    match parse_public_identifier(trimmed) {
-        Ok(parsed) => {
-            let wallet = parsed.wallet.map(wallet_modifier_to_kind);
-            let callback_identifier = match parsed.wallet {
-                Some(WalletModifier::Btc) => format!("{}+btc", parsed.canonical),
-                Some(WalletModifier::Usd) => format!("{}+usd", parsed.canonical),
-                None => parsed.canonical.clone(),
-            };
-            Ok(Some(PublicIdentifierIntent {
-                canonical: parsed.canonical,
-                wallet,
-                callback_identifier,
-            }))
-        }
-        Err(IdentifierError::InvalidUsername) if is_legacy_spark_lookup_candidate(trimmed) => {
-            Ok(Some(PublicIdentifierIntent {
-                canonical: sanitize_username(trimmed),
-                wallet: None,
-                callback_identifier: sanitize_username(trimmed),
-            }))
-        }
-        Err(IdentifierError::InvalidPhoneNumber) if is_phone_like_public_identifier(trimmed) => {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
+) -> Result<Option<PublicIdentifierIntent>, crate::identifier::IdentifierError> {
+    account::parse_public_identifier_for_public_route(identifier)
 }
 
-const fn wallet_modifier_to_kind(modifier: WalletModifier) -> WalletKind {
-    match modifier {
-        WalletModifier::Btc => WalletKind::Btc,
-        WalletModifier::Usd => WalletKind::Usd,
-    }
-}
-
+#[cfg(test)]
 async fn resolve_public_recipient<DB>(
     state: &State<DB>,
     domain: &str,
@@ -2050,31 +1415,7 @@ async fn resolve_public_recipient<DB>(
 where
     DB: LnurlRepository + Clone + Send + Sync + 'static,
 {
-    let recipient = state
-        .db
-        .resolve_recipient_by_identifier(domain, &intent.canonical)
-        .await
-        .map_err(|e| {
-            error!("failed to execute query: {}", e);
-            lnurl_error("internal server error")
-        })?;
-
-    Ok(recipient.map(|recipient| PublicRecipient {
-        recipient,
-        wallet: intent.wallet,
-        callback_identifier: intent.callback_identifier,
-    }))
-}
-
-fn is_legacy_spark_lookup_candidate(identifier: &str) -> bool {
-    !is_phone_like_public_identifier(identifier)
-        && !identifier.char_indices().skip(1).any(|(_, ch)| ch == '+')
-}
-
-fn is_phone_like_public_identifier(identifier: &str) -> bool {
-    identifier.starts_with('+')
-        || identifier.starts_with("00")
-        || identifier.chars().all(|ch| ch.is_ascii_digit())
+    account::resolve_public_recipient(state, domain, intent).await
 }
 
 fn validate_description(description: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -2087,137 +1428,8 @@ fn validate_description(description: &str) -> Result<(), (StatusCode, Json<Value
     Ok(())
 }
 
-async fn verify_with_spark_client<DB>(
-    state: &State<DB>,
-    request: spark_client::VerifyMessageRequest<'_>,
-) -> Result<(), spark_client::SparkClientError> {
-    state.spark_client.verify_message(request).await
-}
-
-async fn validate<DB>(
-    pubkey: &str,
-    signature: &str,
-    message: &str,
-    timestamp: u64,
-    state: &State<DB>,
-) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let pubkey = parse_pubkey(pubkey)?;
-    let signature = hex::decode(signature).map_err(|e| {
-        trace!("invalid signature, could not decode: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-    let signature = Signature::from_der(&signature).map_err(|e| {
-        trace!("invalid signature, could not parse: {:?}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-
-    let now = now_u64();
-    let diff = timestamp.abs_diff(now);
-    if diff > ACCEPTABLE_TIME_DIFF_SECS {
-        trace!(
-            "invalid timestamp, too far off: {}, now: {}, diff: {}",
-            timestamp, now, diff
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid timestamp".into())),
-        ));
-    }
-
-    let signed_message = format!("{message}-{timestamp}");
-    let verify_request = spark_client::VerifyMessageRequest {
-        message: &signed_message,
-        signature: &signature,
-        public_key: &pubkey,
-    };
-    verify_with_spark_client(state, verify_request)
-        .await
-        .map_err(|e| {
-            trace!("invalid signature with timestamp, could not verify: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(Value::String("invalid signature".into())),
-            )
-        })?;
-
-    Ok(pubkey)
-}
-
-/// Verify a transfer-route signature over the canonical message
-/// `"transfer:{username}-{to_pubkey}"`. Used symmetrically on both ends: the
-/// current owner A and the new owner B sign the exact same bytes, and the
-/// route calls this once per signature. No timestamp — replay can only
-/// re-execute the same A → B → username transfer, which the server-side
-/// atomic delete bounds to the case where A still owns the name. The
-/// `"transfer:"` prefix domain-separates from `validate()`'s
-/// `"{message}-{timestamp}"` format so a captured register signature cannot
-/// be replayed as a transfer.
-async fn verify_transfer_signature<DB>(
-    pubkey: &str,
-    signature: &str,
-    message: &str,
-    state: &State<DB>,
-) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let pk = parse_pubkey(pubkey)?;
-    let signature = hex::decode(signature).map_err(|e| {
-        trace!("invalid transfer signature, could not decode: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-    let signature = Signature::from_der(&signature).map_err(|e| {
-        trace!("invalid transfer signature, could not parse: {:?}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-
-    let verify_request = spark_client::VerifyMessageRequest {
-        message,
-        signature: &signature,
-        public_key: &pk,
-    };
-    verify_with_spark_client(state, verify_request)
-        .await
-        .map_err(|e| {
-            trace!("invalid transfer signature, could not verify: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(Value::String("invalid signature".into())),
-            )
-        })?;
-
-    Ok(pk)
-}
-
-fn parse_pubkey(pubkey: &str) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let pubkey = hex::decode(pubkey).map_err(|e| {
-        trace!("invalid pubkey, could not decode: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid pubkey".into())),
-        )
-    })?;
-    let pubkey = PublicKey::from_slice(&pubkey).map_err(|e| {
-        trace!("invalid pubkey, could not parse: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid pubkey".into())),
-        )
-    })?;
-    Ok(pubkey)
-}
-
 #[cfg(test)]
-fn get_metadata(domain: &str, user: &User) -> String {
+fn get_metadata(domain: &str, user: &crate::user::User) -> String {
     json!(vec![
         vec!["text/plain", &user.description],
         vec!["text/identifier", &format!("{}@{}", user.name, domain)],
@@ -2266,83 +1478,6 @@ fn callback_expiry_for_provider(
     Ok(Some(seconds.div_ceil(60)))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn storage_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
-    error!("failed to execute query: {error}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(Value::String("internal server error".into())),
-    )
-}
-
-fn spark_transfer_error(error: LnurlRepositoryError, username: &str) -> (StatusCode, Json<Value>) {
-    match error {
-        LnurlRepositoryError::SourceNotOwner => {
-            trace!("transfer source pubkey does not own username '{username}'");
-            (
-                StatusCode::NOT_FOUND,
-                Json(Value::String(
-                    "source pubkey does not own this username".into(),
-                )),
-            )
-        }
-        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
-            trace!("name already taken during transfer: {username}");
-            (
-                StatusCode::CONFLICT,
-                Json(Value::String("name already taken".into())),
-            )
-        }
-        LnurlRepositoryError::General(err) => {
-            error!("failed to execute transfer query: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Value::String("internal server error".into())),
-            )
-        }
-        LnurlRepositoryError::BlinkAccountExists
-        | LnurlRepositoryError::AccountNotFound
-        | LnurlRepositoryError::InvalidOwnership
-        | LnurlRepositoryError::InvalidProvider
-        | LnurlRepositoryError::InvalidIdentifierKind => {
-            error!("unexpected provider-neutral transfer error: {error}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Value::String("internal server error".into())),
-            )
-        }
-    }
-}
-
-fn spark_unregister_error(
-    error: LnurlRepositoryError,
-    username: &str,
-) -> (StatusCode, Json<Value>) {
-    match error {
-        LnurlRepositoryError::SourceNotOwner => {
-            trace!("unregister pubkey does not own username '{username}'");
-            (StatusCode::NOT_FOUND, Json(Value::String(String::new())))
-        }
-        error => storage_error(error),
-    }
-}
-
-fn spark_registration_error(
-    error: LnurlRepositoryError,
-    username: &str,
-) -> (StatusCode, Json<Value>) {
-    match error {
-        LnurlRepositoryError::NameTaken | LnurlRepositoryError::IdentifierConflict => {
-            trace!("name already taken: {username}");
-            (
-                StatusCode::CONFLICT,
-                Json(Value::String("name already taken".into())),
-            )
-        }
-        error => storage_error(error),
-    }
-}
-
 fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>) {
     match error {
         ProviderError::UnsupportedWallet { provider, wallet } => {
@@ -2374,24 +1509,24 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
     }
 }
 
-#[allow(dead_code)]
-fn spark_user_from_recipient(recipient: ResolvedRecipient) -> Result<User, LnurlRepositoryError> {
-    if recipient.provider != AccountProvider::Spark
-        || recipient.identifier_kind != AccountIdentifierKind::Username
-    {
-        return Err(LnurlRepositoryError::InvalidProvider);
-    }
+#[cfg(test)]
+fn spark_transfer_error(error: LnurlRepositoryError, username: &str) -> (StatusCode, Json<Value>) {
+    account::spark_transfer_error(error, username)
+}
 
-    let Some(pubkey) = recipient.spark_pubkey else {
-        return Err(LnurlRepositoryError::InvalidOwnership);
-    };
+#[cfg(test)]
+fn spark_registration_error(
+    error: LnurlRepositoryError,
+    username: &str,
+) -> (StatusCode, Json<Value>) {
+    account::spark_registration_error(error, username)
+}
 
-    Ok(User {
-        domain: recipient.domain,
-        pubkey,
-        name: recipient.identifier,
-        description: recipient.description,
-    })
+#[cfg(test)]
+fn spark_user_from_recipient(
+    recipient: ResolvedRecipient,
+) -> Result<crate::user::User, LnurlRepositoryError> {
+    account::spark_user_from_recipient(recipient)
 }
 
 fn lnurl_error(message: &str) -> (StatusCode, Json<Value>) {
@@ -2423,25 +1558,15 @@ struct SspAmount {
     unit: String,
 }
 
-async fn sanitize_domain<DB>(
-    state: &State<DB>,
-    domain: &str,
-) -> Result<String, (StatusCode, Json<Value>)> {
-    let domain = domain.trim().to_lowercase();
-    // If domains list is empty allow all domains (for testing)
-    let domains = state.domains.read().await;
-    if domains.is_empty() || domains.contains(&domain) {
-        return Ok(domain);
-    }
-    warn!("domain not allowed: {}", domain);
-    Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identifier::IdentifierError;
     use crate::models::ListMetadataMetadata;
-    use crate::repository::{Invoice, LnurlRepositoryError, LnurlSenderComment, PendingZapReceipt};
+    use crate::models::sanitize_username;
+    use crate::repository::{
+        IdentifierTransfer, Invoice, LnurlRepositoryError, LnurlSenderComment, PendingZapReceipt,
+    };
     use crate::user::User;
     use crate::webhooks::NewWebhookDelivery;
     use crate::webhooks::repository::WebhookRepositoryError;
@@ -2452,6 +1577,7 @@ mod tests {
     use axum::middleware;
     use axum::routing::{get, post};
     use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+    use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3550,12 +2676,22 @@ mod tests {
     // -- Spark management account-backed compatibility ------------------------
 
     fn handler_source(name: &str) -> &'static str {
-        let source = include_str!("mod.rs");
+        const SOURCES: [&str; 3] = [
+            include_str!("mod.rs"),
+            include_str!("account.rs"),
+            include_str!("zap.rs"),
+        ];
+
         let marker = format!("    pub async fn {name}(");
-        let start = source.find(&marker).expect("handler must exist");
-        let rest = &source[start..];
-        let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
-        &rest[..next]
+        for source in SOURCES {
+            if let Some(start) = source.find(&marker) {
+                let rest = &source[start..];
+                let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+                return &rest[..next];
+            }
+        }
+
+        panic!("handler must exist");
     }
 
     #[test]
@@ -4300,10 +3436,11 @@ mod tests {
     #[test]
     fn spark_signature_validation_source_uses_adapter_boundary() {
         let routes_source = include_str!("mod.rs");
-        let production_routes = routes_source
+        let production_mod = routes_source
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("routes source should have production section");
+        let production_routes = format!("{production_mod}\n{}", include_str!("account.rs"));
         let state_source = include_str!("../state.rs");
 
         assert!(production_routes.contains("Signature::from_der"));
