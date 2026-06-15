@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.2.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.2.0)
+
+
+### Features
+
+- Add Blink provider support (#15)
+
 # [blink-lnurl-server release v0.1.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.1.0)
 
 
@@ -16,5 +23,3 @@
 - Bump DeterminateSystems/magic-nix-cache-action (#3)
 - Bump DeterminateSystems/nix-installer-action from 21 to 22 (#2)
 - Initialize repository
-
-
