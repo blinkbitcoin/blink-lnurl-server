@@ -68,7 +68,7 @@ const BLINK_BTC_EXPIRY_LIMIT_SECS: u32 = 86_400;
 const BLINK_USD_EXPIRY_LIMIT_SECS: u32 = 300;
 
 #[cfg(test)]
-const fn public_lnurl_phase_6_error_reasons() -> [&'static str; 6] {
+const fn public_lnurl_error_reasons() -> [&'static str; 6] {
     [
         "unsupported wallet",
         "expiry too long",
@@ -4600,12 +4600,12 @@ mod tests {
     }
 
     #[test]
-    fn phase_6_public_lnurl_error_reason_contract_is_explicit_and_plain() {
+    fn public_lnurl_error_reason_contract_is_explicit_and_plain() {
         // D-16/D-17/D-18/D-19: public LNURL error categories must stay stable,
         // plain, and provider-neutral so Blink internals never leak through
         // user-correctable or upstream provider failures.
         assert_eq!(
-            public_lnurl_phase_6_error_reasons(),
+            public_lnurl_error_reasons(),
             [
                 "unsupported wallet",
                 "expiry too long",
@@ -4616,7 +4616,7 @@ mod tests {
             ]
         );
 
-        for reason in public_lnurl_phase_6_error_reasons() {
+        for reason in public_lnurl_error_reasons() {
             let (status, Json(body)) = lnurl_error(reason);
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["status"], "ERROR");
