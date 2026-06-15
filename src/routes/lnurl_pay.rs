@@ -33,7 +33,7 @@ use crate::{
 
 use super::{
     BLINK_BTC_EXPIRY_LIMIT_SECS, BLINK_USD_EXPIRY_LIMIT_SECS, LnurlServer, MAX_COMMENT_LENGTH,
-    MAX_NOSTR_EVENT_SIZE, account, settle_blink_invoice_by_payment_hash,
+    MAX_NOSTR_EVENT_SIZE, account, webhook,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -436,7 +436,7 @@ where
             && invoice.expired_at.is_none()
             && invoice.provider == Some(AccountProvider::Blink)
         {
-            match settle_blink_invoice_by_payment_hash(&state, &payment_hash, None).await {
+            match webhook::settle_blink_invoice_by_payment_hash(&state, &payment_hash, None).await {
                 Ok(Some(preimage)) => {
                     invoice.preimage = Some(preimage);
                 }

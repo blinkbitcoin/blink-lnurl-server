@@ -251,7 +251,7 @@ where
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BlinkSettlementError {
+pub(super) enum BlinkSettlementError {
     #[error(transparent)]
     Repository(#[from] LnurlRepositoryError),
     #[error(transparent)]
@@ -317,7 +317,7 @@ fn validate_blink_payment_request_hash(
     Ok(())
 }
 
-pub(crate) async fn settle_blink_invoice_by_payment_hash<DB>(
+pub(super) async fn settle_blink_invoice_by_payment_hash<DB>(
     state: &State<DB>,
     payment_hash: &str,
     supplied_preimage: Option<&str>,

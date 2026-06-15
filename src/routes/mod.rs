@@ -11,7 +11,6 @@ use std::marker::PhantomData;
 #[cfg(test)]
 #[allow(unused_imports)]
 use webhook::process_webhook;
-pub(crate) use webhook::settle_blink_invoice_by_payment_hash;
 #[allow(unused_imports)]
 pub use webhook::{BlinkInvoiceWebhookPayload, BlinkInvoiceWebhookStatus};
 
