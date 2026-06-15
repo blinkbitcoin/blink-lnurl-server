@@ -42,7 +42,24 @@ nix develop -c make build
 | `make start` | Start Postgres and run the LNURL server locally |
 | `make test-integration` | Run Postgres-backed Rust tests |
 | `make e2e` | Run Bats end-to-end tests |
+| `make release-check` | Run the full release gate: formatting, clippy, Rust tests, Postgres integration tests, mocked E2E tests, and dependency audit |
 | `make audit` | Run `cargo audit` |
+
+## Release Verification
+
+Run the complete local release gate before claiming milestone readiness:
+
+```shell
+nix develop -c make release-check
+```
+
+`release-check` runs the standard gates in order: `make check-code`, `make test-rust`, `make test-integration`, `make test-e2e`, and `make audit`. Treat any failed, skipped, flaky, or infrastructure-blocked command as release-blocking until it is fixed or precisely documented with the command, exit status, and blocker.
+
+## Mocked Blink E2E Posture
+
+Blink E2E coverage is deterministic and must not call live Blink services or Blink quickstart. The local E2E stack points the server at the checked-in `blink_graphql_mock` binary through `LNURL_BLINK_GRAPHQL_ENDPOINT` (or the matching `blink_graphql_endpoint` configuration option) so GraphQL invoice creation and payment-status behavior are exercised against local fixtures only.
+
+The mocked E2E setup documents environment variable names and local endpoints only; do not add private keys, service tokens, `.envrc` contents, or live Blink credentials to tests or docs.
 
 ## Build
 
@@ -75,6 +92,7 @@ The local stack uses:
 - `LNURL_DOMAINS=localhost:8080,127.0.0.1:8080`.
 - `LNURL_NETWORK=regtest`.
 - `LNURL_SCHEME=http`.
+- `LNURL_WEBHOOK_DOMAIN=localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks.
 
 Run end-to-end tests:
 
@@ -148,8 +166,10 @@ Important options:
 | `--scheme` | Scheme used in generated LNURL callback URLs | `https` |
 | `--min-sendable` | Minimum payment amount in millisatoshi | `1000` |
 | `--max-sendable` | Maximum payment amount in millisatoshi | `4000000000` |
-| `--webhook-domain` | Domain used when registering the Spark SSP webhook URL | unset |
+| `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
+
+`LNURL_WEBHOOK_DOMAIN` is required when running the server with Blink invoice support. Blink invoice creation passes a callback URL of `{LNURL_SCHEME}://{LNURL_WEBHOOK_DOMAIN}/webhook/blink` to Blink GraphQL for both BTC and USD invoices. The Blink callback route accepts flat provider payloads at public `POST /webhook/blink`; it is separate from the Spark SSP webhook at `POST /webhook`.
 
 For the complete list:
 
@@ -178,6 +198,7 @@ Authenticated routes always require Spark signatures. If `ca_cert` is configured
 | Public | GET | `/verify/{payment_hash}` | LUD-21 invoice verification endpoint |
 | Health | GET | `/health` | Health check endpoint |
 | Webhook | POST | `/webhook` | Spark SSP payment notification webhook |
+| Webhook | POST | `/webhook/blink` | Blink invoice status callback endpoint for flat `PAID` and `EXPIRED` payloads |
 | Authenticated | GET | `/lnurlpay/available/{identifier}` | Check if a username is available |
 | Authenticated | POST | `/lnurlpay/{pubkey}` | Register a username |
 | Authenticated | DELETE | `/lnurlpay/{pubkey}` | Unregister a username |
@@ -208,6 +229,7 @@ services:
       LNURL_DOMAINS: "localhost:8080,127.0.0.1:8080"
       LNURL_NETWORK: "regtest"
       LNURL_SCHEME: "http"
+      LNURL_WEBHOOK_DOMAIN: "localhost:8080"
     ports:
       - "8080:8080"
     depends_on:

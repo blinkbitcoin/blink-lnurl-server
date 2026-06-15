@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "blink-internal-test-key",
+      "alg": "RS256",
+      "n": "3il10XugoJ6WoaE2l-aV0T7tvgdUUHDpUj8ko6UCDnv1KTIYZ6ps1dquScSO0RDL-Y9A54UXYnzMCPO9P9zra1Gbj4d6VhKvpaTW_tfmS60CYJ9tAi1L7nXBDhh5QlJoJ50Y06Sxh6Qp4-bUTjh3zO5GyxMv8lC1NcSDBuuBjcyTBwQ9BnMYWGs-s0RvVyyA28ijORS2v75-Be8zCEitw5y4adYtSCdTvkBqIcHD15mES7tlOqLpXzxmdD2rDSsCTc1EZKl4DArc7gchWByOUNcd9NlBaoL3iP8vDNOAvSfpooQe-l2ejRJZjeWMYbNIhXQzwQALE1TJfCV5PcAMiQ",
+      "e": "AQAB"
+    }
+  ]
+}

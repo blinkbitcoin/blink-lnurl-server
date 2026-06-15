@@ -1,4 +1,6 @@
-use crate::{repository::LnurlRepository, routes::LnurlServer, state::State};
+use crate::{
+    providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
+};
 use anyhow::anyhow;
 use axum::{
     Extension, Router,
@@ -14,17 +16,11 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
-use spark::operator::rpc::DefaultConnectionManager;
-use spark::session_store::InMemorySessionStore;
-use spark::ssp::{ServiceProvider, SparkWalletWebhookEventType};
-use spark::token::InMemoryTokenOutputStore;
-use spark::tree::InMemoryTreeStore;
-use spark_wallet::{DefaultSigner, Network, SparkWalletConfig};
 use sqlx::{PgPool, SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -33,9 +29,12 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 mod auth;
 mod domains;
 mod error;
+mod identifier;
+mod internal_auth;
 mod invoice_paid;
 mod models;
 mod postgresql;
+mod providers;
 mod repository;
 mod routes;
 mod sqlite;
@@ -71,7 +70,7 @@ struct Args {
 
     /// Spark network.
     #[arg(long, default_value = "mainnet")]
-    pub network: Network,
+    pub network: spark_client::Network,
 
     /// Scheme prefix for lnurl urls.
     #[arg(long, default_value = "https")]
@@ -124,6 +123,26 @@ struct Args {
     /// for audit/debugging before they are cleaned up periodically.
     #[arg(long, default_value = "90")]
     pub webhook_delivery_ttl_days: u32,
+
+    /// Blink public GraphQL endpoint used for Blink provider invoice/status calls.
+    #[arg(long, default_value = "https://api.blink.sv/graphql")]
+    pub blink_graphql_endpoint: String,
+
+    /// URL to fetch Blink Core internal-auth JWKS from at startup.
+    #[arg(long)]
+    pub internal_jwks_url: Option<String>,
+
+    /// Local path to read Blink Core internal-auth JWKS from at startup.
+    #[arg(long)]
+    pub internal_jwks_path: Option<String>,
+
+    /// Expected issuer for Blink Core internal-auth JWTs.
+    #[arg(long)]
+    pub internal_jwt_issuer: Option<String>,
+
+    /// Expected audience for Blink Core internal-auth JWTs.
+    #[arg(long)]
+    pub internal_jwt_audience: Option<String>,
 }
 
 #[tokio::main]
@@ -208,47 +227,28 @@ fn parse_auth_seed(hex_str: Option<&str>) -> [u8; 32] {
     seed
 }
 
+fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
+    let Some(webhook_domain) = args.webhook_domain.as_deref() else {
+        return Err(anyhow!(
+            "LNURL_WEBHOOK_DOMAIN is required to create Blink invoice webhookUrl callbacks"
+        ));
+    };
+
+    Ok(format!(
+        "{}://{}/webhook/blink",
+        args.scheme, webhook_domain
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_server<DB>(args: Args, repository: DB) -> Result<(), anyhow::Error>
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
+    let blink_webhook_url = build_blink_webhook_url(&args)?;
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
-
-    let mut spark_config = SparkWalletConfig::default_config(args.network);
-    spark_config.service_provider_config.schema_endpoint = Some("graphql/spark/rc".to_string());
-
-    // Create shared infrastructure components
-    let signer = Arc::new(DefaultSigner::new(&auth_seed, args.network)?);
-    let session_store = Arc::new(InMemorySessionStore::default());
-    let connection_manager: Arc<dyn spark::operator::rpc::ConnectionManager> =
-        Arc::new(DefaultConnectionManager::new());
-    let coordinator = spark_config.operator_pool.get_coordinator().clone();
-    let service_provider = Arc::new(ServiceProvider::new(
-        spark_config.service_provider_config.clone(),
-        signer.clone(),
-        session_store.clone(),
-        None,
-    ));
-
-    // Create wallet using shared signer
-    let wallet = Arc::new(
-        spark_wallet::SparkWallet::new(
-            spark_config.clone(),
-            signer.clone(),
-            session_store.clone(),
-            Arc::new(InMemoryTreeStore::default()),
-            Arc::new(InMemoryTokenOutputStore::default()),
-            Arc::clone(&connection_manager),
-            None,
-            None,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await?,
-    );
+    let spark_client =
+        spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
 
     let config_domains: Vec<String> = args
         .domains
@@ -263,6 +263,8 @@ where
     }
 
     let domains = domains::start(repository.clone()).await?;
+
+    let internal_auth = load_internal_auth_state(&args).await;
 
     let ca_cert = args
         .ca_cert
@@ -299,8 +301,6 @@ where
             Ok::<_, anyhow::Error>(keys)
         })
         .transpose()?;
-
-    let subscribed_keys = Arc::new(Mutex::new(HashSet::new()));
 
     // Create watch channel for triggering background processing
     let (invoice_paid_trigger, invoice_paid_rx) = watch::channel(());
@@ -339,17 +339,24 @@ where
 
     if let Some(webhook_domain) = &args.webhook_domain {
         let webhook_url = format!("{}://{}/webhook", args.scheme, webhook_domain);
-        register_webhook(
-            Arc::clone(&service_provider),
-            webhook_url,
-            webhook_secret.clone(),
-        );
+        register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
+
+    let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
+        args.blink_graphql_endpoint.clone(),
+    ));
+    let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
+        spark_client.clone(),
+        blink_client,
+        blink_webhook_url,
+    ));
 
     let state = State {
         db: repository,
         webhook_service,
-        wallet,
+        spark_client,
+        providers,
+        internal_auth,
         scheme: args.scheme,
         min_sendable: args.min_sendable,
         max_sendable: args.max_sendable,
@@ -368,17 +375,31 @@ where
         ca_cert,
         crl_url: args.crl_url,
         crl,
-        connection_manager,
-        coordinator,
-        signer,
-        session_store,
-        service_provider,
-        subscribed_keys,
         invoice_paid_trigger,
         webhook_secret,
     };
 
+    // Mounted below as POST /internal/blink/accounts for Blink Core.
+    let internal_router = Router::new()
+        .route(
+            "/blink/accounts",
+            post(LnurlServer::<DB>::create_internal_blink_account),
+        )
+        .route(
+            "/domains/{domain}/identifiers/{identifier}",
+            get(LnurlServer::<DB>::get_internal_identifier),
+        )
+        .route(
+            "/identifiers/transfer-to-spark",
+            post(LnurlServer::<DB>::transfer_identifier_to_spark),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            internal_auth::internal_auth::<DB>,
+        ));
+
     let server_router = Router::new()
+        .nest("/internal", internal_router)
         .route(
             "/lnurlpay/available/{identifier}",
             get(LnurlServer::<DB>::available),
@@ -427,6 +448,7 @@ where
         )
         .route("/verify/{payment_hash}", get(LnurlServer::<DB>::verify))
         .route("/webhook", post(LnurlServer::<DB>::webhook))
+        .route("/webhook/blink", post(LnurlServer::<DB>::blink_webhook))
         .route("/health", get(|| async { StatusCode::OK }))
         .layer(Extension(state))
         .layer(
@@ -455,18 +477,62 @@ where
     Ok(())
 }
 
-fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String, secret: String) {
+async fn load_internal_auth_state(args: &Args) -> Option<Arc<internal_auth::InternalAuthState>> {
+    let (Some(issuer), Some(audience)) = (
+        args.internal_jwt_issuer.clone(),
+        args.internal_jwt_audience.clone(),
+    ) else {
+        debug!("internal auth issuer/audience not fully configured; /internal fails closed");
+        return None;
+    };
+
+    let jwks_json = if let Some(path) = &args.internal_jwks_path {
+        match std::fs::read_to_string(path) {
+            Ok(jwks) => Some(jwks),
+            Err(e) => {
+                error!("failed to read internal JWKS from {path}: {e}");
+                None
+            }
+        }
+    } else if let Some(url) = &args.internal_jwks_url {
+        match reqwest::Client::new().get(url).send().await {
+            Ok(response) => match response.text().await {
+                Ok(jwks) => Some(jwks),
+                Err(e) => {
+                    error!("failed to read internal JWKS response body from {url}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                error!("failed to fetch internal JWKS from {url}: {e}");
+                None
+            }
+        }
+    } else {
+        debug!("internal auth JWKS source not configured; /internal fails closed");
+        None
+    }?;
+
+    match internal_auth::InternalAuthState::from_jwks_json(&jwks_json, issuer, audience) {
+        Ok(state) => Some(Arc::new(state)),
+        Err(e) => {
+            error!("failed to parse internal JWKS; /internal fails closed: {e}");
+            None
+        }
+    }
+}
+
+fn register_webhook(spark_client: spark_client::Client, webhook_url: String, secret: String) {
     tokio::spawn(async move {
         let mut delay = std::time::Duration::from_secs(1);
         let max_delay = std::time::Duration::from_mins(1);
         loop {
             info!("registering webhook with SSP at {}", webhook_url);
-            match service_provider
-                .register_wallet_webhook(
-                    &webhook_url,
-                    &secret,
-                    vec![SparkWalletWebhookEventType::SparkLightningReceiveFinished],
-                )
+            match spark_client
+                .register_wallet_webhook(spark_client::WebhookRegistrationRequest {
+                    webhook_url: webhook_url.clone(),
+                    secret: secret.clone(),
+                })
                 .await
             {
                 Ok(_) => {
@@ -484,4 +550,48 @@ fn register_webhook(service_provider: Arc<ServiceProvider>, webhook_url: String,
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blink_graphql_endpoint_default_is_production() {
+        let args = Args::parse_from(["lnurl-server"]);
+
+        assert_eq!(
+            args.blink_graphql_endpoint,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn startup_requires_webhook_domain_for_blink_webhook_url() {
+        let args = Args::parse_from(["lnurl-server", "--scheme", "https"]);
+
+        let err = build_blink_webhook_url(&args)
+            .expect_err("Blink webhook URL construction must require LNURL_WEBHOOK_DOMAIN");
+
+        assert!(
+            err.to_string().contains("LNURL_WEBHOOK_DOMAIN"),
+            "error should name the missing LNURL_WEBHOOK_DOMAIN: {err}"
+        );
+    }
+
+    #[test]
+    fn blink_webhook_url_uses_scheme_domain_and_fixed_path() {
+        let args = Args::parse_from([
+            "lnurl-server",
+            "--scheme",
+            "https",
+            "--webhook-domain",
+            "lnurl.example",
+        ]);
+
+        let url =
+            build_blink_webhook_url(&args).expect("configured webhook domain should build URL");
+
+        assert_eq!(url, "https://lnurl.example/webhook/blink");
+    }
 }

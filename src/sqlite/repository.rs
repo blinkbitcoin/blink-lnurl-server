@@ -1,7 +1,11 @@
 use crate::models::ListMetadataMetadata;
 use sqlx::{Row, SqlitePool};
 
-use crate::repository::{Invoice, LnurlSenderComment, PendingZapReceipt, WebhookPayloadData};
+use crate::repository::{
+    Account, AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
+    IdentifierTransfer, Invoice, LnurlSenderComment, NewBlinkAccount, NewSparkRegistration,
+    PendingZapReceipt, ResolvedRecipient, WalletKind, WebhookPayloadData, generate_account_id,
+};
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
 };
@@ -23,7 +27,70 @@ impl LnurlRepository {
     }
 }
 
+fn map_resolved_recipient(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ResolvedRecipient, LnurlRepositoryError> {
+    let provider = AccountProvider::from_database_value(row.try_get("provider")?)?;
+    let identifier_kind =
+        AccountIdentifierKind::from_database_value(row.try_get("identifier_kind")?)?;
+    let spark_pubkey: Option<String> = row.try_get("spark_pubkey")?;
+    let blink_account_id: Option<String> = row.try_get("blink_account_id")?;
+    let btc_wallet_id: Option<String> = row.try_get("btc_wallet_id")?;
+    let usd_wallet_id: Option<String> = row.try_get("usd_wallet_id")?;
+    let default_wallet = row
+        .try_get::<Option<String>, _>("default_wallet")?
+        .map(|wallet| WalletKind::from_database_value(&wallet))
+        .transpose()?;
+
+    match provider {
+        AccountProvider::Spark => {
+            if spark_pubkey.is_none()
+                || blink_account_id.is_some()
+                || btc_wallet_id.is_some()
+                || usd_wallet_id.is_some()
+                || default_wallet.is_some()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+        }
+        AccountProvider::Blink => {
+            if spark_pubkey.is_some()
+                || blink_account_id.is_none()
+                || btc_wallet_id.is_none()
+                || usd_wallet_id.is_none()
+                || default_wallet.is_none()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+        }
+    }
+
+    Ok(ResolvedRecipient {
+        account_id: row.try_get("account_id")?,
+        provider,
+        domain: row.try_get("domain")?,
+        identifier: row.try_get("identifier")?,
+        identifier_kind,
+        description: row.try_get("description")?,
+        spark_pubkey,
+        blink_account_id,
+        btc_wallet_id,
+        usd_wallet_id,
+        default_wallet,
+    })
+}
+
+fn map_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account, LnurlRepositoryError> {
+    Ok(Account {
+        account_id: row.try_get("account_id")?,
+        provider: AccountProvider::from_database_value(row.try_get("provider")?)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 #[async_trait::async_trait]
+#[allow(clippy::too_many_lines)]
 impl crate::repository::LnurlRepository for LnurlRepository {
     async fn delete_user(&self, domain: &str, pubkey: &str) -> Result<(), LnurlRepositoryError> {
         sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2")
@@ -95,9 +162,640 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&user.pubkey)
         .bind(&user.name)
         .bind(&user.description)
-        .bind(now())
+        .bind(crate::time::now())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn resolve_recipient_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<ResolvedRecipient>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT a.account_id AS account_id
+             ,      a.provider AS provider
+             ,      ai.domain AS domain
+             ,      ai.identifier AS identifier
+             ,      ai.identifier_kind AS identifier_kind
+             ,      ai.description AS description
+             ,      s.pubkey AS spark_pubkey
+             ,      b.blink_account_id AS blink_account_id
+             ,      b.btc_wallet_id AS btc_wallet_id
+             ,      b.usd_wallet_id AS usd_wallet_id
+             ,      b.default_wallet AS default_wallet
+             FROM account_identifiers ai
+             JOIN accounts a ON a.account_id = ai.account_id
+             LEFT JOIN spark_accounts s ON s.account_id = a.account_id
+             LEFT JOIN blink_accounts b ON b.account_id = a.account_id
+             WHERE ai.domain = $1 AND ai.identifier = $2",
+        )
+        .bind(domain)
+        .bind(identifier)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_resolved_recipient(&row))
+        .transpose()
+    }
+
+    async fn get_account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT account_id, provider, created_at, updated_at
+             FROM accounts
+             WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_account(&row))
+        .transpose()
+    }
+
+    async fn get_account_by_spark_pubkey(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<Account>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT a.account_id, a.provider, a.created_at, a.updated_at
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_account(&row))
+        .transpose()
+    }
+
+    async fn upsert_spark_registration(
+        &self,
+        registration: &NewSparkRegistration,
+    ) -> Result<(), LnurlRepositoryError> {
+        registration.validate()?;
+        let now = now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        let account_id = if let Some(account_id) = &registration.account_id {
+            account_id.clone()
+        } else if let Some((account_id,)) = sqlx::query_as::<_, (String,)>(
+            "SELECT account_id FROM spark_accounts WHERE pubkey = $1",
+        )
+        .bind(&registration.pubkey)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            account_id
+        } else {
+            generate_account_id(AccountProvider::Spark)
+        };
+
+        if let Some((provider,)) =
+            sqlx::query_as::<_, (String,)>("SELECT provider FROM accounts WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            && AccountProvider::from_database_value(&provider)? != AccountProvider::Spark
+        {
+            return Err(LnurlRepositoryError::InvalidProvider);
+        }
+
+        if let Some((owner_account_id,)) = sqlx::query_as::<_, (String,)>(
+            "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
+        )
+        .bind(&registration.identifier.domain)
+        .bind(&registration.identifier.identifier)
+        .fetch_optional(&mut *tx)
+        .await?
+            && owner_account_id != account_id
+        {
+            return Err(LnurlRepositoryError::IdentifierConflict);
+        }
+
+        if let Some((owner_account_id,)) = sqlx::query_as::<_, (String,)>(
+            "SELECT account_id FROM spark_accounts WHERE pubkey = $1",
+        )
+        .bind(&registration.pubkey)
+        .fetch_optional(&mut *tx)
+        .await?
+            && owner_account_id != account_id
+        {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&account_id)
+        .bind(&registration.identifier.domain)
+        .bind(&registration.identifier.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT(account_id) DO UPDATE
+             SET provider = excluded.provider
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&account_id)
+        .bind(AccountProvider::Spark.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT(account_id) DO UPDATE
+             SET pubkey = excluded.pubkey
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&account_id)
+        .bind(&registration.pubkey)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)
+             ON CONFLICT(account_id, domain, identifier) DO UPDATE
+             SET identifier_kind = excluded.identifier_kind
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&account_id)
+        .bind(&registration.identifier.domain)
+        .bind(&registration.identifier.identifier)
+        .bind(registration.identifier.identifier_kind.as_str())
+        .bind(&registration.identifier.description)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO users (domain, pubkey, name, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(domain, pubkey) DO UPDATE
+             SET name = excluded.name
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&registration.identifier.domain)
+        .bind(&registration.pubkey)
+        .bind(&registration.identifier.identifier)
+        .bind(&registration.identifier.description)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn create_blink_account(
+        &self,
+        account: &NewBlinkAccount,
+    ) -> Result<(), LnurlRepositoryError> {
+        let account_id = account
+            .account_id
+            .clone()
+            .unwrap_or_else(|| generate_account_id(AccountProvider::Blink));
+        let now = now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        if let Some((provider,)) =
+            sqlx::query_as::<_, (String,)>("SELECT provider FROM accounts WHERE account_id = $1")
+                .bind(&account_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Blink {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+
+            let existing = sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet
+                 FROM blink_accounts
+                 WHERE account_id = $1",
+            )
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet)) = existing
+            else {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            };
+            if blink_account_id != account.blink_account_id
+                || btc_wallet_id != account.btc_wallet_id
+                || usd_wallet_id != account.usd_wallet_id
+                || default_wallet != account.default_wallet.as_str()
+            {
+                return Err(LnurlRepositoryError::InvalidOwnership);
+            }
+            return Err(LnurlRepositoryError::BlinkAccountExists);
+        }
+
+        if sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM blink_accounts WHERE blink_account_id = $1",
+        )
+        .bind(&account.blink_account_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0
+        {
+            return Err(LnurlRepositoryError::BlinkAccountExists);
+        }
+
+        for identifier in &account.identifiers {
+            if sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM account_identifiers WHERE domain = $1 AND identifier = $2",
+            )
+            .bind(&identifier.domain)
+            .bind(&identifier.identifier)
+            .fetch_one(&mut *tx)
+            .await?
+                > 0
+            {
+                return Err(LnurlRepositoryError::IdentifierConflict);
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+             VALUES ($1, $2, $3, $3)",
+        )
+        .bind(&account_id)
+        .bind(AccountProvider::Blink.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO blink_accounts (account_id, blink_account_id, btc_wallet_id, usd_wallet_id, default_wallet, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+        )
+        .bind(&account_id)
+        .bind(&account.blink_account_id)
+        .bind(&account.btc_wallet_id)
+        .bind(&account.usd_wallet_id)
+        .bind(account.default_wallet.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        for identifier in &account.identifiers {
+            sqlx::query(
+                "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            )
+            .bind(&account_id)
+            .bind(&identifier.domain)
+            .bind(&identifier.identifier)
+            .bind(identifier.identifier_kind.as_str())
+            .bind(&identifier.description)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn delete_spark_registration(
+        &self,
+        domain: &str,
+        pubkey: &str,
+        identifier: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        let account_id: Option<String> =
+            sqlx::query_scalar("SELECT account_id FROM spark_accounts WHERE pubkey = $1")
+                .bind(pubkey)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let Some(account_id) = account_id else {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        };
+
+        let delete_result = sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1 AND domain = $2 AND identifier = $3",
+        )
+        .bind(&account_id)
+        .bind(domain)
+        .bind(identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        if delete_result.rows_affected() == 0 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
+            .bind(domain)
+            .bind(pubkey)
+            .bind(identifier)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn transfer_identifier(
+        &self,
+        transfer: &IdentifierTransfer,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        let source_account_id: Option<String> = sqlx::query_scalar(
+            "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if source_account_id.as_deref() != Some(transfer.source_account_id.as_str()) {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        let source_pubkey: Option<String> = sqlx::query_scalar(
+            "SELECT s.pubkey
+             FROM accounts a
+             JOIN spark_accounts s ON s.account_id = a.account_id
+             WHERE a.account_id = $1 AND a.provider = 'spark'",
+        )
+        .bind(&transfer.source_account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source_pubkey) = source_pubkey else {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        };
+
+        let destination_account = sqlx::query_as::<_, (String, String)>(
+            "SELECT s.account_id, a.provider
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
+        )
+        .bind(&transfer.destination_spark_pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let destination_account_id = if let Some((account_id, provider)) = destination_account {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Spark {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+            account_id
+        } else {
+            let account_id = generate_account_id(AccountProvider::Spark);
+            sqlx::query(
+                "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(AccountProvider::Spark.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(&transfer.destination_spark_pubkey)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            account_id
+        };
+
+        let update_result = sqlx::query(
+            "UPDATE account_identifiers
+             SET account_id = $3
+             ,   description = $4
+             ,   updated_at = $5
+             WHERE domain = $1 AND identifier = $2 AND account_id = $6",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .bind(&destination_account_id)
+        .bind(&transfer.description)
+        .bind(now)
+        .bind(&transfer.source_account_id)
+        .execute(&mut *tx)
+        .await?;
+        if update_result.rows_affected() != 1 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
+            .bind(&transfer.domain)
+            .bind(&source_pubkey)
+            .bind(&transfer.identifier)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO users (domain, pubkey, name, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(domain, pubkey) DO UPDATE
+             SET name = excluded.name
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.destination_spark_pubkey)
+        .bind(&transfer.identifier)
+        .bind(&transfer.description)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn transfer_blink_identifier_to_spark(
+        &self,
+        transfer: &BlinkToSparkIdentifierTransfer,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        let source_account_id: Option<String> = sqlx::query_scalar(
+            "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if source_account_id.as_deref() != Some(transfer.source_account_id.as_str()) {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        let source_is_blink: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM accounts a
+                 JOIN blink_accounts b ON b.account_id = a.account_id
+                 WHERE a.account_id = $1 AND a.provider = 'blink'
+             )",
+        )
+        .bind(&transfer.source_account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !source_is_blink {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
+
+        let destination_account = sqlx::query_as::<_, (String, String)>(
+            "SELECT s.account_id, a.provider
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             WHERE s.pubkey = $1",
+        )
+        .bind(&transfer.destination_spark_pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let destination_account_id = if let Some((account_id, provider)) = destination_account {
+            if AccountProvider::from_database_value(&provider)? != AccountProvider::Spark {
+                return Err(LnurlRepositoryError::InvalidProvider);
+            }
+            account_id
+        } else {
+            let account_id = generate_account_id(AccountProvider::Spark);
+            sqlx::query(
+                "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(AccountProvider::Spark.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(&account_id)
+            .bind(&transfer.destination_spark_pubkey)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            account_id
+        };
+
+        let update_result = sqlx::query(
+            "UPDATE account_identifiers
+             SET account_id = $3
+             ,   description = $4
+             ,   updated_at = $5
+             WHERE domain = $1 AND identifier = $2 AND account_id = $6",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .bind(&destination_account_id)
+        .bind(&transfer.description)
+        .bind(now)
+        .bind(&transfer.source_account_id)
+        .execute(&mut *tx)
+        .await?;
+        if update_result.rows_affected() != 1 {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+
+        sqlx::query(
+            "DELETE FROM account_identifiers
+             WHERE account_id = $1
+             AND domain = $2
+             AND identifier_kind = 'username'
+             AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO users (domain, pubkey, name, description, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(domain, pubkey) DO UPDATE
+             SET name = excluded.name
+             ,   description = excluded.description
+             ,   updated_at = excluded.updated_at",
+        )
+        .bind(&transfer.domain)
+        .bind(&transfer.destination_spark_pubkey)
+        .bind(&transfer.identifier)
+        .bind(&transfer.description)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
         Ok(())
     }
 
@@ -152,9 +850,17 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn upsert_zap(&self, zap: &Zap) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "REPLACE INTO zaps (payment_hash, zap_request, zap_event
-            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO zaps (payment_hash, zap_request, zap_event
+            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key, account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT(payment_hash) DO UPDATE
+            SET zap_request = excluded.zap_request
+            ,   zap_event = excluded.zap_event
+            ,   user_pubkey = excluded.user_pubkey
+            ,   invoice_expiry = excluded.invoice_expiry
+            ,   updated_at = excluded.updated_at
+            ,   is_user_nostr_key = excluded.is_user_nostr_key
+            ,   account_id = COALESCE(excluded.account_id, zaps.account_id)",
         )
         .bind(&zap.payment_hash)
         .bind(&zap.zap_request)
@@ -163,6 +869,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(zap.invoice_expiry)
         .bind(zap.updated_at)
         .bind(zap.is_user_nostr_key)
+        .bind(zap.account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -174,7 +881,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
     ) -> Result<Option<Zap>, LnurlRepositoryError> {
         let maybe_zap = sqlx::query(
             "SELECT payment_hash, zap_request, zap_event
-            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key
+            , user_pubkey, invoice_expiry, updated_at, is_user_nostr_key, account_id
                 FROM zaps
                 WHERE payment_hash = $1",
         )
@@ -190,6 +897,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                 invoice_expiry: row.try_get(4)?,
                 updated_at: row.try_get(5)?,
                 is_user_nostr_key: row.try_get(6)?,
+                account_id: row.try_get(7)?,
             })
         })
         .transpose()?;
@@ -201,17 +909,19 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         comment: &LnurlSenderComment,
     ) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO sender_comments (payment_hash, user_pubkey, sender_comment, updated_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(payment_hash) DO UPDATE
-             SET user_pubkey = excluded.user_pubkey
-             ,   sender_comment = excluded.sender_comment
-             ,   updated_at = excluded.updated_at",
+            "INSERT INTO sender_comments (payment_hash, user_pubkey, sender_comment, updated_at, account_id)
+             VALUES ($1, $2, $3, $4, $5)
+              ON CONFLICT(payment_hash) DO UPDATE
+              SET user_pubkey = excluded.user_pubkey
+              ,   sender_comment = excluded.sender_comment
+              ,   updated_at = excluded.updated_at
+              ,   account_id = COALESCE(excluded.account_id, sender_comments.account_id)",
         )
         .bind(&comment.payment_hash)
         .bind(&comment.user_pubkey)
         .bind(&comment.comment)
         .bind(comment.updated_at)
+        .bind(comment.account_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -232,7 +942,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      z.zap_event
              ,      MAX(COALESCE(z.updated_at, 0), COALESCE(sc.updated_at, 0), COALESCE(i.updated_at, 0)) AS updated_at
              ,      i.preimage
-             FROM (
+             ,      COALESCE(i.account_id, z.account_id, sc.account_id) AS account_id
+              FROM (
                  SELECT payment_hash FROM invoices WHERE user_pubkey = $1 AND updated_at > $4
                  UNION
                  SELECT payment_hash FROM zaps WHERE user_pubkey = $1 AND updated_at > $4
@@ -256,6 +967,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .map(|row| {
                 Ok(ListMetadataMetadata {
                     payment_hash: row.try_get(0)?,
+                    account_id: row.try_get(6)?,
                     sender_comment: row.try_get(1)?,
                     nostr_zap_request: row.try_get(2)?,
                     nostr_zap_receipt: row.try_get(3)?,
@@ -326,26 +1038,41 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
     async fn upsert_invoice(&self, invoice: &Invoice) -> Result<(), LnurlRepositoryError> {
         sqlx::query(
-            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT(payment_hash) DO UPDATE SET
                 user_pubkey = excluded.user_pubkey,
                 invoice = excluded.invoice,
                 preimage = excluded.preimage,
+                expired_at = CASE
+                    WHEN excluded.preimage IS NOT NULL THEN NULL
+                    ELSE COALESCE(excluded.expired_at, invoices.expired_at)
+                END,
                 invoice_expiry = excluded.invoice_expiry,
                 updated_at = excluded.updated_at,
                 domain = excluded.domain,
-                amount_received_sat = excluded.amount_received_sat",
+                amount_received_sat = excluded.amount_received_sat,
+                account_id = COALESCE(excluded.account_id, invoices.account_id),
+                provider = COALESCE(excluded.provider, invoices.provider),
+                wallet_kind = COALESCE(excluded.wallet_kind, invoices.wallet_kind),
+                wallet_id = COALESCE(excluded.wallet_id, invoices.wallet_id),
+                provider_payment_hash = COALESCE(excluded.provider_payment_hash, invoices.provider_payment_hash)",
         )
         .bind(&invoice.payment_hash)
         .bind(&invoice.user_pubkey)
         .bind(&invoice.invoice)
         .bind(&invoice.preimage)
+        .bind(invoice.expired_at)
         .bind(invoice.invoice_expiry)
         .bind(invoice.created_at)
         .bind(invoice.updated_at)
         .bind(&invoice.domain)
         .bind(invoice.amount_received_sat)
+        .bind(invoice.account_id.as_deref())
+        .bind(invoice.provider.map(AccountProvider::as_str))
+        .bind(invoice.wallet_kind.map(WalletKind::as_str))
+        .bind(invoice.wallet_id.as_deref())
+        .bind(invoice.provider_payment_hash.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -366,11 +1093,20 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let mut affected = Vec::new();
         for invoice in invoices {
             let row: Option<(String,)> = sqlx::query_as(
-                "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO invoices (payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, account_id, provider, wallet_kind, wallet_id, provider_payment_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT(payment_hash) DO UPDATE SET
                     preimage = excluded.preimage,
-                    updated_at = excluded.updated_at
+                    expired_at = CASE
+                        WHEN excluded.preimage IS NOT NULL THEN NULL
+                        ELSE COALESCE(excluded.expired_at, invoices.expired_at)
+                    END,
+                    updated_at = excluded.updated_at,
+                    account_id = COALESCE(excluded.account_id, invoices.account_id),
+                    provider = COALESCE(excluded.provider, invoices.provider),
+                    wallet_kind = COALESCE(excluded.wallet_kind, invoices.wallet_kind),
+                    wallet_id = COALESCE(excluded.wallet_id, invoices.wallet_id),
+                    provider_payment_hash = COALESCE(excluded.provider_payment_hash, invoices.provider_payment_hash)
                 WHERE invoices.user_pubkey = excluded.user_pubkey AND invoices.preimage IS NULL
                 RETURNING payment_hash",
             )
@@ -378,9 +1114,15 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .bind(&invoice.user_pubkey)
             .bind(&invoice.invoice)
             .bind(&invoice.preimage)
+            .bind(invoice.expired_at)
             .bind(invoice.invoice_expiry)
             .bind(invoice.created_at)
             .bind(invoice.updated_at)
+            .bind(invoice.account_id.as_deref())
+            .bind(invoice.provider.map(AccountProvider::as_str))
+            .bind(invoice.wallet_kind.map(WalletKind::as_str))
+            .bind(invoice.wallet_id.as_deref())
+            .bind(invoice.provider_payment_hash.as_deref())
             .fetch_optional(&mut *tx)
             .await?;
             if let Some((payment_hash,)) = row {
@@ -398,7 +1140,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         payment_hash: &str,
     ) -> Result<Option<Invoice>, LnurlRepositoryError> {
         let maybe_invoice = sqlx::query(
-            "SELECT payment_hash, user_pubkey, invoice, preimage, invoice_expiry, created_at, updated_at, domain, amount_received_sat
+            "SELECT payment_hash, user_pubkey, invoice, preimage, expired_at, invoice_expiry, created_at, updated_at, domain, amount_received_sat, account_id, provider, wallet_kind, wallet_id, provider_payment_hash
              FROM invoices
              WHERE payment_hash = $1",
         )
@@ -406,20 +1148,53 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
+            let provider = row
+                .try_get::<Option<String>, _>(11)?
+                .map(|provider| AccountProvider::from_database_value(&provider))
+                .transpose()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+            let wallet_kind = row
+                .try_get::<Option<String>, _>(12)?
+                .map(|wallet| WalletKind::from_database_value(&wallet))
+                .transpose()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
             Ok::<_, sqlx::Error>(Invoice {
                 payment_hash: row.try_get(0)?,
                 user_pubkey: row.try_get(1)?,
                 invoice: row.try_get(2)?,
                 preimage: row.try_get(3)?,
-                invoice_expiry: row.try_get(4)?,
-                created_at: row.try_get(5)?,
-                updated_at: row.try_get(6)?,
-                domain: row.try_get(7)?,
-                amount_received_sat: row.try_get(8)?,
+                expired_at: row.try_get(4)?,
+                invoice_expiry: row.try_get(5)?,
+                created_at: row.try_get(6)?,
+                updated_at: row.try_get(7)?,
+                domain: row.try_get(8)?,
+                amount_received_sat: row.try_get(9)?,
+                account_id: row.try_get(10)?,
+                provider,
+                wallet_kind,
+                wallet_id: row.try_get(13)?,
+                provider_payment_hash: row.try_get(14)?,
             })
         })
         .transpose()?;
         Ok(maybe_invoice)
+    }
+
+    async fn mark_invoice_expired(
+        &self,
+        payment_hash: &str,
+        expired_at: i64,
+    ) -> Result<(), LnurlRepositoryError> {
+        sqlx::query(
+            "UPDATE invoices
+             SET expired_at = $1, updated_at = $1
+             WHERE payment_hash = $2 AND preimage IS NULL",
+        )
+        .bind(expired_at)
+        .bind(payment_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn get_zap_and_invoice_by_payment_hash(
@@ -431,18 +1206,25 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,      z.zap_request    AS z_zap_request
              ,      z.zap_event      AS z_zap_event
              ,      z.user_pubkey    AS z_user_pubkey
+             ,      z.account_id     AS z_account_id
              ,      z.invoice_expiry AS z_invoice_expiry
              ,      z.updated_at     AS z_updated_at
              ,      z.is_user_nostr_key AS z_is_user_nostr_key
              ,      i.payment_hash   AS i_payment_hash
              ,      i.user_pubkey    AS i_user_pubkey
+             ,      i.account_id     AS i_account_id
              ,      i.invoice        AS i_invoice
              ,      i.preimage       AS i_preimage
+             ,      i.expired_at     AS i_expired_at
              ,      i.invoice_expiry AS i_invoice_expiry
              ,      i.created_at     AS i_created_at
              ,      i.updated_at     AS i_updated_at
              ,      i.domain         AS i_domain
              ,      i.amount_received_sat AS i_amount_received_sat
+             ,      i.provider       AS i_provider
+             ,      i.wallet_kind    AS i_wallet_kind
+             ,      i.wallet_id      AS i_wallet_id
+             ,      i.provider_payment_hash AS i_provider_payment_hash
              FROM (SELECT $1 AS payment_hash) ph
              LEFT JOIN zaps z ON z.payment_hash = ph.payment_hash
              LEFT JOIN invoices i ON i.payment_hash = ph.payment_hash",
@@ -459,6 +1241,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     zap_request: row.try_get("z_zap_request")?,
                     zap_event: row.try_get("z_zap_event")?,
                     user_pubkey: row.try_get("z_user_pubkey")?,
+                    account_id: row.try_get("z_account_id")?,
                     invoice_expiry: row.try_get("z_invoice_expiry")?,
                     updated_at: row.try_get("z_updated_at")?,
                     is_user_nostr_key: row.try_get("z_is_user_nostr_key")?,
@@ -469,11 +1252,27 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let invoice = row
             .try_get::<Option<String>, _>("i_payment_hash")?
             .map(|ph| {
+                let provider = row
+                    .try_get::<Option<String>, _>("i_provider")?
+                    .map(|provider| AccountProvider::from_database_value(&provider))
+                    .transpose()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let wallet_kind = row
+                    .try_get::<Option<String>, _>("i_wallet_kind")?
+                    .map(|wallet| WalletKind::from_database_value(&wallet))
+                    .transpose()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
                 Ok::<_, sqlx::Error>(Invoice {
                     payment_hash: ph,
                     user_pubkey: row.try_get("i_user_pubkey")?,
+                    account_id: row.try_get("i_account_id")?,
+                    provider,
+                    wallet_kind,
+                    wallet_id: row.try_get("i_wallet_id")?,
+                    provider_payment_hash: row.try_get("i_provider_payment_hash")?,
                     invoice: row.try_get("i_invoice")?,
                     preimage: row.try_get("i_preimage")?,
+                    expired_at: row.try_get("i_expired_at")?,
                     invoice_expiry: row.try_get("i_invoice_expiry")?,
                     created_at: row.try_get("i_created_at")?,
                     updated_at: row.try_get("i_updated_at")?,
@@ -634,11 +1433,24 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .map(|i| format!("${i}"))
             .collect();
         let sql = format!(
-            "SELECT i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
+            "SELECT i.account_id, i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
+                    ai.identifier, ai.domain,
                     u.name, u.domain,
                     sc.sender_comment,
                     i.domain
              FROM invoices i
+             LEFT JOIN account_identifiers ai
+               ON ai.account_id = i.account_id
+              AND ai.domain = i.domain
+              AND ai.identifier = (
+                  SELECT ai2.identifier
+                  FROM account_identifiers ai2
+                  WHERE ai2.account_id = i.account_id
+                    AND ai2.domain = i.domain
+                  ORDER BY CASE ai2.identifier_kind WHEN 'username' THEN 0 ELSE 1 END,
+                           ai2.identifier
+                  LIMIT 1
+              )
              LEFT JOIN users u ON u.pubkey = i.user_pubkey AND u.domain = i.domain
              LEFT JOIN sender_comments sc ON sc.payment_hash = i.payment_hash
              WHERE i.payment_hash IN ({})
@@ -654,21 +1466,31 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let results = rows
             .into_iter()
             .map(|row| {
-                let name: Option<String> = row.try_get(5)?;
-                let user_domain: Option<String> = row.try_get(6)?;
-                let lightning_address = match (name, user_domain) {
-                    (Some(n), Some(d)) => Some(format!("{n}@{d}")),
+                let account_identifier: Option<String> = row.try_get(6)?;
+                let account_identifier_domain: Option<String> = row.try_get(7)?;
+                let user_name: Option<String> = row.try_get(8)?;
+                let user_domain: Option<String> = row.try_get(9)?;
+                let lightning_address = match (
+                    account_identifier,
+                    account_identifier_domain,
+                    user_name,
+                    user_domain,
+                ) {
+                    (Some(n), Some(d), _, _) | (None, None, Some(n), Some(d)) => {
+                        Some(format!("{n}@{d}"))
+                    }
                     _ => None,
                 };
                 Ok::<_, sqlx::Error>(WebhookPayloadData {
-                    payment_hash: row.try_get(0)?,
-                    user_pubkey: row.try_get(1)?,
-                    invoice: row.try_get(2)?,
-                    preimage: row.try_get(3)?,
-                    amount_received_sat: row.try_get(4)?,
+                    account_id: row.try_get(0)?,
+                    payment_hash: row.try_get(1)?,
+                    user_pubkey: row.try_get(2)?,
+                    invoice: row.try_get(3)?,
+                    preimage: row.try_get(4)?,
+                    amount_received_sat: row.try_get(5)?,
                     lightning_address,
-                    sender_comment: row.try_get(7)?,
-                    domain: row.try_get(8)?,
+                    sender_comment: row.try_get(10)?,
+                    domain: row.try_get(11)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -853,5 +1675,426 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(|e| WebhookRepositoryError::General(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod provider_neutral_tests {
+    use super::LnurlRepository;
+    use crate::repository::{
+        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository as _,
+        LnurlRepositoryError, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
+        WalletKind, generate_account_id, shared_tests,
+    };
+
+    async fn setup_test_db() -> LnurlRepository {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(":memory:")
+            .await
+            .unwrap();
+        crate::sqlite::run_migrations(&pool).await.unwrap();
+        LnurlRepository::new(pool)
+    }
+
+    #[tokio::test]
+    async fn identifier_conflict_is_global() {
+        shared_tests::identifier_conflict_is_global(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn spark_registration_dual_writes_provider_neutral_rows() {
+        shared_tests::spark_registration_dual_writes_provider_neutral_rows(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn spark_re_registration_replaces_stale_alias_identifier() {
+        shared_tests::spark_re_registration_replaces_stale_alias_identifier(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn spark_phone_identifier_is_rejected() {
+        shared_tests::spark_phone_identifier_is_rejected(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn blink_account_creation_is_atomic() {
+        shared_tests::blink_account_creation_is_atomic(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn blink_duplicate_account_returns_blink_account_exists() {
+        shared_tests::blink_duplicate_account_returns_blink_account_exists(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn lookup_by_identifier_account_id_and_spark_pubkey_round_trips() {
+        shared_tests::lookup_by_identifier_account_id_and_spark_pubkey_round_trips(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spark_compatibility_registration_resolves_provider_neutral_owner() {
+        shared_tests::spark_compatibility_registration_resolves_provider_neutral_owner(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn blink_account_creation_persists_wallet_fields() {
+        shared_tests::blink_account_creation_persists_wallet_fields(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn global_identifier_conflict_rejects_cross_provider_duplicate() {
+        shared_tests::global_identifier_conflict_rejects_cross_provider_duplicate(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lookup_by_username_and_normalized_phone_matches() {
+        shared_tests::lookup_by_username_and_normalized_phone_matches(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_requires_source_owner() {
+        shared_tests::transfer_identifier_requires_source_owner(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_moves_legacy_recover_ownership() {
+        shared_tests::transfer_identifier_moves_legacy_recover_ownership(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_creates_fresh_destination_spark_account() {
+        shared_tests::transfer_identifier_creates_fresh_destination_spark_account(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_replaces_destination_prior_alias() {
+        shared_tests::transfer_identifier_replaces_destination_prior_alias(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_creates_fresh_destination_spark_account() {
+        shared_tests::transfer_blink_identifier_to_spark_creates_fresh_destination_spark_account(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_requires_blink_source_owner() {
+        shared_tests::transfer_blink_identifier_to_spark_requires_blink_source_owner(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_moves_only_requested_identifier() {
+        shared_tests::transfer_blink_identifier_to_spark_moves_only_requested_identifier(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner() {
+        shared_tests::transfer_blink_identifier_to_spark_preserves_historical_blink_invoice_owner(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn side_effect_records_round_trip_account_id() {
+        shared_tests::side_effect_records_round_trip_account_id(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn invoice_provider_metadata_round_trips() {
+        shared_tests::invoice_provider_metadata_round_trips(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn invoice_ownership_fields_round_trip() {
+        shared_tests::invoice_ownership_fields_round_trip(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn invoice_expired_state_round_trips() {
+        shared_tests::invoice_expired_state_round_trips(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_account_id_round_trips_and_legacy_rows_remain_none() {
+        shared_tests::metadata_account_id_round_trips_and_legacy_rows_remain_none(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn metadata_webhook_join_uses_provider_neutral_owner() {
+        shared_tests::metadata_webhook_join_uses_provider_neutral_owner(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn atomic_transfer_preserves_historical_invoice_owner() {
+        shared_tests::atomic_transfer_preserves_historical_invoice_owner(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delete_spark_registration_preserves_account_with_side_effect_ownership() {
+        shared_tests::delete_spark_registration_preserves_account_with_side_effect_ownership(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_blink_account_rejects_existing_spark_account_id() {
+        shared_tests::create_blink_account_rejects_existing_spark_account_id_with_invalid_provider(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_blink_account_rejects_existing_inconsistent_blink_account_id() {
+        shared_tests::create_blink_account_rejects_existing_inconsistent_blink_account_id_with_invalid_ownership(
+            &setup_test_db().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejected_spark_phone_identifier_leaves_no_partial_rows() {
+        let db = setup_test_db().await;
+        let account_id = generate_account_id(AccountProvider::Spark);
+
+        let result = db
+            .upsert_spark_registration(&NewSparkRegistration {
+                account_id: Some(account_id.clone()),
+                pubkey: "spark_rejected_phone_pubkey".to_string(),
+                identifier: NewAccountIdentifier {
+                    domain: "reject-phone.example.com".to_string(),
+                    identifier: "+573005871212".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "must fail".to_string(),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::InvalidIdentifierKind)
+        ));
+        assert!(db.get_account_by_id(&account_id).await.unwrap().is_none());
+        assert!(
+            db.get_account_by_spark_pubkey("spark_rejected_phone_pubkey")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_blink_account_leaves_new_identifier_unclaimed() {
+        let db = setup_test_db().await;
+        let account = NewBlinkAccount {
+            account_id: Some(generate_account_id(AccountProvider::Blink)),
+            blink_account_id: "blink_atomic_duplicate".to_string(),
+            btc_wallet_id: "blink_atomic_duplicate_btc".to_string(),
+            usd_wallet_id: "blink_atomic_duplicate_usd".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![NewAccountIdentifier {
+                domain: "duplicate-atomic.example.com".to_string(),
+                identifier: "first".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "first".to_string(),
+            }],
+        };
+        db.create_blink_account(&account).await.unwrap();
+
+        let second_account_id = generate_account_id(AccountProvider::Blink);
+        let result = db
+            .create_blink_account(&NewBlinkAccount {
+                account_id: Some(second_account_id.clone()),
+                identifiers: vec![NewAccountIdentifier {
+                    domain: "duplicate-atomic.example.com".to_string(),
+                    identifier: "second".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "second".to_string(),
+                }],
+                ..account
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LnurlRepositoryError::BlinkAccountExists)
+        ));
+        assert!(
+            db.get_account_by_id(&second_account_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.resolve_recipient_by_identifier("duplicate-atomic.example.com", "second")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_identifier_moves_only_requested_identifier() {
+        let db = setup_test_db().await;
+        let source_account_id = generate_account_id(AccountProvider::Spark);
+        let destination_account_id = generate_account_id(AccountProvider::Spark);
+
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(source_account_id.clone()),
+            pubkey: "spark_transfer_source".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "transfer-success.example.com".to_string(),
+                identifier: "moving".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "moves".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, 'username', $4, $5, $5)",
+        )
+        .bind(&source_account_id)
+        .bind("transfer-success.example.com")
+        .bind("stays")
+        .bind("stays")
+        .bind(crate::time::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(destination_account_id.clone()),
+            pubkey: "spark_transfer_destination".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "transfer-success.example.com".to_string(),
+                identifier: "sparkdest".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "destination".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        db.transfer_identifier(&IdentifierTransfer {
+            domain: "transfer-success.example.com".to_string(),
+            identifier: "moving".to_string(),
+            source_account_id: source_account_id.clone(),
+            destination_spark_pubkey: "spark_transfer_destination".to_string(),
+            description: "moved".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let moved = db
+            .resolve_recipient_by_identifier("transfer-success.example.com", "moving")
+            .await
+            .unwrap()
+            .unwrap();
+        let stayed = db
+            .resolve_recipient_by_identifier("transfer-success.example.com", "stays")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(moved.account_id, destination_account_id);
+        assert_eq!(moved.description, "moved");
+        assert_eq!(stayed.account_id, source_account_id);
+    }
+
+    #[tokio::test]
+    async fn targeted_unregister_deletes_only_signed_identifier() {
+        let db = setup_test_db().await;
+        let account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(account_id.clone()),
+            pubkey: "spark_targeted_unregister_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "targeted-unregister.example.com".to_string(),
+                identifier: "primary".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "primary stays".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account_identifiers (account_id, domain, identifier, identifier_kind, description, created_at, updated_at)
+             VALUES ($1, $2, $3, 'username', $4, $5, $5)",
+        )
+        .bind(&account_id)
+        .bind("targeted-unregister.example.com")
+        .bind("secondary")
+        .bind("secondary deleted")
+        .bind(crate::time::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.delete_spark_registration(
+            "targeted-unregister.example.com",
+            "spark_targeted_unregister_pubkey",
+            "secondary",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.resolve_recipient_by_identifier("targeted-unregister.example.com", "secondary")
+                .await
+                .unwrap()
+                .is_none(),
+            "targeted unregister should remove only the signed identifier"
+        );
+        assert!(
+            db.resolve_recipient_by_identifier("targeted-unregister.example.com", "primary")
+                .await
+                .unwrap()
+                .is_some(),
+            "targeted unregister must not remove unrelated identifiers"
+        );
+        assert_eq!(
+            db.get_user_by_pubkey(
+                "targeted-unregister.example.com",
+                "spark_targeted_unregister_pubkey"
+            )
+            .await
+            .unwrap()
+            .expect("legacy recover row for unsigned identifier should remain")
+            .name,
+            "primary"
+        );
     }
 }

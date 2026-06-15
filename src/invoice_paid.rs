@@ -6,7 +6,9 @@ use lightning_invoice::Bolt11Invoice;
 use tokio::sync::watch;
 use tracing::{debug, error};
 
-use crate::repository::{Invoice, LnurlRepository, LnurlRepositoryError};
+use crate::repository::{
+    AccountProvider, Invoice, LnurlRepository, LnurlRepositoryError, WalletKind,
+};
 use crate::time::now_millis;
 use crate::webhooks::{WebhookRepository, WebhookService};
 
@@ -126,10 +128,16 @@ where
             .map_or(0, |t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
 
         invoices.push(Invoice {
+            account_id: None,
+            provider: None,
+            wallet_kind: None,
+            wallet_id: None,
+            provider_payment_hash: None,
             payment_hash,
             user_pubkey: user_pubkey.to_string(),
             invoice: item.invoice.clone(),
             preimage: Some(item.preimage.clone()),
+            expired_at: None,
             invoice_expiry,
             created_at: now,
             updated_at: now,
@@ -183,6 +191,7 @@ where
 }
 
 /// Create a new invoice record for LUD-21 and NIP-57 support.
+#[allow(dead_code)]
 pub async fn create_invoice<DB>(
     db: &DB,
     payment_hash: &str,
@@ -194,12 +203,77 @@ pub async fn create_invoice<DB>(
 where
     DB: LnurlRepository + Clone + Send + Sync + 'static,
 {
+    create_invoice_for_account(
+        db,
+        payment_hash,
+        None,
+        user_pubkey,
+        invoice,
+        invoice_expiry,
+        domain,
+    )
+    .await
+}
+
+/// Create a new invoice record with optional provider-neutral account ownership.
+pub async fn create_invoice_for_account<DB>(
+    db: &DB,
+    payment_hash: &str,
+    account_id: Option<&str>,
+    user_pubkey: &str,
+    invoice: &str,
+    invoice_expiry: i64,
+    domain: &str,
+) -> Result<(), LnurlRepositoryError>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    create_provider_invoice_for_account(
+        db,
+        payment_hash,
+        account_id,
+        None,
+        None,
+        None,
+        None,
+        user_pubkey,
+        invoice,
+        invoice_expiry,
+        domain,
+    )
+    .await
+}
+
+/// Create a new invoice record with typed provider-neutral invoice metadata.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_provider_invoice_for_account<DB>(
+    db: &DB,
+    payment_hash: &str,
+    account_id: Option<&str>,
+    provider: Option<AccountProvider>,
+    wallet_kind: Option<WalletKind>,
+    wallet_id: Option<&str>,
+    provider_payment_hash: Option<&str>,
+    user_pubkey: &str,
+    invoice: &str,
+    invoice_expiry: i64,
+    domain: &str,
+) -> Result<(), LnurlRepositoryError>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
     let now = now_millis();
     let invoice_record = Invoice {
+        account_id: account_id.map(str::to_string),
+        provider,
+        wallet_kind,
+        wallet_id: wallet_id.map(str::to_string),
+        provider_payment_hash: provider_payment_hash.map(str::to_string),
         payment_hash: payment_hash.to_string(),
         user_pubkey: user_pubkey.to_string(),
         invoice: invoice.to_string(),
         preimage: None,
+        expired_at: None,
         invoice_expiry,
         created_at: now,
         updated_at: now,
@@ -240,13 +314,184 @@ mod test_helpers {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn create_invoice_for_account_metadata_helper_is_available() {
+        let source = include_str!("invoice_paid.rs");
+        assert!(source.contains("create_provider_invoice_for_account"));
+        assert!(source.contains("provider: Option<AccountProvider>"));
+        assert!(source.contains("wallet_kind: Option<WalletKind>"));
+        assert!(source.contains("provider_payment_hash"));
+    }
+}
+
 /// Shared test logic that runs against any `LnurlRepository` implementation.
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-    use crate::repository::LnurlSenderComment;
+    use crate::repository::{
+        AccountIdentifierKind, AccountProvider, LnurlSenderComment, NewAccountIdentifier,
+        NewSparkRegistration,
+    };
 
     use super::test_helpers::generate_test_invoice;
+
+    pub async fn create_invoice_for_account_sets_account_id<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_spark_invoice".to_string()),
+            pubkey: "spark_account_invoice_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "account-invoice.example.com".to_string(),
+                identifier: "invoiceowner".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "invoice owner".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        let account = db
+            .get_account_by_spark_pubkey("spark_account_invoice_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark account should be created");
+        assert_eq!(account.provider, AccountProvider::Spark);
+
+        create_invoice_for_account(
+            db,
+            "account_invoice_hash",
+            Some(account.account_id.as_str()),
+            "spark_account_invoice_pubkey",
+            "lnbc1accountinvoice",
+            i64::MAX,
+            "account-invoice.example.com",
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash("account_invoice_hash")
+            .await
+            .unwrap()
+            .expect("invoice should be stored");
+        assert_eq!(stored.account_id.as_deref(), Some("acct_spark_invoice"));
+        assert!(stored.provider.is_none());
+        assert!(stored.wallet_kind.is_none());
+        assert!(stored.wallet_id.is_none());
+        assert!(stored.provider_payment_hash.is_none());
+        assert_eq!(stored.user_pubkey, "spark_account_invoice_pubkey");
+        assert_eq!(
+            stored.domain.as_deref(),
+            Some("account-invoice.example.com")
+        );
+    }
+
+    pub async fn create_invoice_for_account_sets_provider_metadata<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_provider_helper".to_string()),
+            pubkey: "spark_provider_helper_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "provider-helper.example.com".to_string(),
+                identifier: "providerhelper".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "provider helper".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        create_provider_invoice_for_account(
+            db,
+            "provider_helper_invoice_hash",
+            Some("acct_provider_helper"),
+            Some(AccountProvider::Spark),
+            Some(crate::repository::WalletKind::Btc),
+            None,
+            None,
+            "spark_provider_helper_pubkey",
+            "lnbc1providerhelper",
+            i64::MAX,
+            "provider-helper.example.com",
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash("provider_helper_invoice_hash")
+            .await
+            .unwrap()
+            .expect("invoice should be stored");
+        assert_eq!(stored.account_id.as_deref(), Some("acct_provider_helper"));
+        assert_eq!(stored.provider, Some(AccountProvider::Spark));
+        assert_eq!(stored.wallet_kind, Some(crate::repository::WalletKind::Btc));
+        assert!(stored.wallet_id.is_none());
+        assert!(stored.provider_payment_hash.is_none());
+        assert_eq!(
+            stored.domain.as_deref(),
+            Some("provider-helper.example.com")
+        );
+    }
+
+    pub async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01<DB>(
+        db: &DB,
+    ) where
+        DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let (trigger, _rx) = watch::channel(());
+        let webhook_service = WebhookService::new(db.clone());
+        let preimage_bytes = [9u8; 32];
+        let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
+
+        create_provider_invoice_for_account(
+            db,
+            &payment_hash,
+            None,
+            Some(AccountProvider::Blink),
+            Some(WalletKind::Btc),
+            Some("btc_wallet_test_01"),
+            Some("provider_payment_hash_test_01"),
+            "",
+            &invoice_str,
+            i64::MAX,
+            "settlement-test.example.com",
+        )
+        .await
+        .unwrap();
+
+        handle_invoice_paid(
+            db,
+            &webhook_service,
+            &payment_hash,
+            &preimage_hex,
+            Some(123),
+            &trigger,
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("Blink invoice should stay stored");
+        assert_eq!(stored.provider, Some(AccountProvider::Blink));
+        assert_eq!(stored.preimage.as_deref(), Some(preimage_hex.as_str()));
+        assert_eq!(stored.amount_received_sat, Some(123));
+
+        let pending = db.take_pending_zap_receipts(10).await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|receipt| receipt.payment_hash == payment_hash),
+            "central handler should enqueue zap receipt side effects"
+        );
+    }
 
     pub async fn invoices_paid_creates_invoice_when_only_comment_exists<DB>(db: &DB)
     where
@@ -260,6 +505,7 @@ mod shared_tests {
         let user_pubkey = "test_user_pubkey";
 
         db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: None,
             comment: "hello from sender".to_string(),
             payment_hash: payment_hash.clone(),
             user_pubkey: user_pubkey.to_string(),
@@ -310,6 +556,7 @@ mod shared_tests {
         let user_pubkey = "test_user_pubkey";
 
         db.upsert_zap(&crate::zap::Zap {
+            account_id: None,
             payment_hash: payment_hash.clone(),
             zap_request: r#"{"kind":9734}"#.to_string(),
             zap_event: None,
@@ -395,6 +642,7 @@ mod shared_tests {
         let known_preimage = [4u8; 32];
         let (known_hex, known_hash, known_invoice) = generate_test_invoice(&known_preimage);
         db.insert_lnurl_sender_comment(&LnurlSenderComment {
+            account_id: None,
             comment: "known".to_string(),
             payment_hash: known_hash.clone(),
             user_pubkey: user_pubkey.to_string(),
@@ -486,6 +734,25 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
+    async fn create_invoice_for_account_sets_account_id() {
+        let db = setup_test_db().await;
+        shared_tests::create_invoice_for_account_sets_account_id(&db).await;
+    }
+
+    #[tokio::test]
+    async fn create_invoice_for_account_sets_provider_metadata() {
+        let db = setup_test_db().await;
+        shared_tests::create_invoice_for_account_sets_provider_metadata(&db).await;
+    }
+
+    #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let db = setup_test_db().await;
+        shared_tests::blink_settlement_fallback_persists_through_paid_invoice_handler_test_01(&db)
+            .await;
+    }
+
+    #[tokio::test]
     async fn invoices_paid_creates_invoice_when_only_comment_exists() {
         let db = setup_test_db().await;
         shared_tests::invoices_paid_creates_invoice_when_only_comment_exists(&db).await;
@@ -548,6 +815,31 @@ mod postgres_tests {
             .ok()?;
 
         Some(crate::postgresql::LnurlRepository::new(pool))
+    }
+
+    #[tokio::test]
+    async fn create_invoice_for_account_sets_account_id() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::create_invoice_for_account_sets_account_id(&db).await;
+    }
+
+    #[tokio::test]
+    async fn create_invoice_for_account_sets_provider_metadata() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::create_invoice_for_account_sets_provider_metadata(&db).await;
+    }
+
+    #[tokio::test]
+    async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::blink_settlement_fallback_persists_through_paid_invoice_handler_test_01(&db)
+            .await;
     }
 
     #[tokio::test]

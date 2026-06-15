@@ -1,11 +1,21 @@
-use spark::signer::{DefaultSigner, Signer};
-use spark_wallet::Network;
+async fn build_payload_json(
+    username: &str,
+    timestamp: u64,
+) -> Result<serde_json::Value, anyhow::Error> {
+    let payload = spark_client::Client::build_auth_payload(username, timestamp).await?;
 
-async fn sign(signer: &DefaultSigner, message: String) -> Result<String, anyhow::Error> {
-    let signature = signer
-        .sign_message_ecdsa_with_identity_key(message.as_bytes())
-        .await?;
-    Ok(hex::encode(signature.serialize_der()))
+    Ok(serde_json::json!({
+        "pubkey": payload.pubkey,
+        "timestamp": payload.timestamp,
+        "register_signature": payload.register_signature,
+        "recover_signature": payload.recover_signature,
+        "unregister_signature": payload.unregister_signature,
+        "to_pubkey": payload.to_pubkey,
+        "to_register_signature": payload.to_register_signature,
+        "to_recover_signature": payload.to_recover_signature,
+        "transfer_from_signature": payload.transfer_from_signature,
+        "transfer_to_signature": payload.transfer_to_signature,
+    }))
 }
 
 #[tokio::main]
@@ -24,22 +34,44 @@ async fn main() -> Result<(), anyhow::Error> {
                 .as_secs()
         });
 
-    let signer = DefaultSigner::new(&[42u8; 32], Network::Regtest)?;
-    let pubkey = signer.get_identity_public_key().await?.to_string();
-
-    let register_signature = sign(&signer, format!("{username}-{timestamp}")).await?;
-    let recover_signature = sign(&signer, format!("{pubkey}-{timestamp}")).await?;
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "pubkey": pubkey,
-            "timestamp": timestamp,
-            "register_signature": register_signature,
-            "recover_signature": recover_signature,
-            "unregister_signature": register_signature,
-        })
-    );
+    println!("{}", build_payload_json(&username, timestamp).await?);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn auth_payload_includes_deterministic_transfer_signatures() {
+        let payload = build_payload_json("transferuser", 1).await.unwrap();
+
+        assert!(
+            payload["pubkey"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            payload["to_pubkey"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            payload["to_recover_signature"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_ne!(payload["pubkey"], payload["to_pubkey"]);
+        assert!(
+            payload["transfer_from_signature"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            payload["transfer_to_signature"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
 }

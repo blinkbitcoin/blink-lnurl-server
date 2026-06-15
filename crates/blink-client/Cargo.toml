@@ -1,0 +1,14 @@
+[package]
+name = "blink-client"
+edition = "2024"
+version = "0.1.1-dev"
+
+[dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "http2", "charset", "system-proxy", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6.5"
