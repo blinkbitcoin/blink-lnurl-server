@@ -309,8 +309,6 @@ where
     // settings keep connections warm and HTTP/2 multiplexes requests per host.
     let http_client = reqwest::Client::new();
 
-    let webhook_service = webhooks::WebhookService::new(repository.clone());
-
     // Load webhook endpoint configs (domain → {url, secret}) and start
     // a background refresher that keeps them in sync with the database.
     let webhook_config_cache = webhooks::config::start(repository.clone()).await?;
@@ -353,7 +351,6 @@ where
 
     let state = State {
         db: repository,
-        webhook_service,
         spark_client,
         providers,
         internal_auth,

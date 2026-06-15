@@ -10,7 +10,7 @@ use crate::repository::{
     AccountProvider, Invoice, LnurlRepository, LnurlRepositoryError, WalletKind,
 };
 use crate::time::now_millis;
-use crate::webhooks::{WebhookRepository, WebhookService};
+use crate::webhooks::WebhookRepository;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandleInvoicePaidError {
@@ -40,7 +40,6 @@ fn verify_preimage(payment_hash: &str, preimage: &str) -> Result<(), HandleInvoi
 /// Handle an invoice being paid by storing the preimage and queueing for background processing.
 pub async fn handle_invoice_paid<DB>(
     db: &DB,
-    webhook_service: &WebhookService<DB>,
     payment_hash: &str,
     preimage: &str,
     amount_received_sat: Option<i64>,
@@ -75,10 +74,7 @@ where
     // Notify for all payment hashes, not just newly-affected ones, so that
     // webhooks are delivered even if the server crashed after storing preimages
     // but before enqueueing webhooks. Idempotent via ON CONFLICT DO NOTHING.
-    if let Err(e) =
-        crate::webhook_notify::notify_webhooks(db, webhook_service, &[payment_hash.to_string()])
-            .await
-    {
+    if let Err(e) = crate::webhook_notify::notify_webhooks(db, &[payment_hash.to_string()]).await {
         error!("Failed to enqueue webhook for {}: {}", payment_hash, e);
     }
 
@@ -96,7 +92,6 @@ where
 /// have a preimage.
 pub async fn handle_invoices_paid<DB>(
     db: &DB,
-    webhook_service: &WebhookService<DB>,
     items: &[PaidInvoice],
     user_pubkey: &str,
     trigger: &watch::Sender<()>,
@@ -177,9 +172,7 @@ where
     // Notify for all payment hashes, not just newly-affected ones, so that
     // webhooks are delivered even if the server crashed after storing preimages
     // but before enqueueing webhooks. Idempotent via ON CONFLICT DO NOTHING.
-    if let Err(e) =
-        crate::webhook_notify::notify_webhooks(db, webhook_service, &payment_hashes).await
-    {
+    if let Err(e) = crate::webhook_notify::notify_webhooks(db, &payment_hashes).await {
         error!("Failed to enqueue webhooks: {}", e);
     }
 
@@ -444,7 +437,6 @@ mod shared_tests {
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
         let (trigger, _rx) = watch::channel(());
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [9u8; 32];
         let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
 
@@ -464,16 +456,9 @@ mod shared_tests {
         .await
         .unwrap();
 
-        handle_invoice_paid(
-            db,
-            &webhook_service,
-            &payment_hash,
-            &preimage_hex,
-            Some(123),
-            &trigger,
-        )
-        .await
-        .unwrap();
+        handle_invoice_paid(db, &payment_hash, &preimage_hex, Some(123), &trigger)
+            .await
+            .unwrap();
 
         let stored = db
             .get_invoice_by_payment_hash(&payment_hash)
@@ -498,7 +483,6 @@ mod shared_tests {
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
         let (trigger, _rx) = watch::channel(());
-        let webhook_service = WebhookService::new(db.clone());
 
         let preimage_bytes = [1u8; 32];
         let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
@@ -523,7 +507,6 @@ mod shared_tests {
 
         handle_invoices_paid(
             db,
-            &webhook_service,
             &[PaidInvoice {
                 preimage: preimage_hex.clone(),
                 invoice: invoice_str.clone(),
@@ -549,7 +532,6 @@ mod shared_tests {
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
         let (trigger, _rx) = watch::channel(());
-        let webhook_service = WebhookService::new(db.clone());
 
         let preimage_bytes = [2u8; 32];
         let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
@@ -577,7 +559,6 @@ mod shared_tests {
 
         handle_invoices_paid(
             db,
-            &webhook_service,
             &[PaidInvoice {
                 preimage: preimage_hex.clone(),
                 invoice: invoice_str.clone(),
@@ -603,7 +584,6 @@ mod shared_tests {
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
         let (trigger, _rx) = watch::channel(());
-        let webhook_service = WebhookService::new(db.clone());
 
         let preimage_bytes = [3u8; 32];
         let (preimage_hex, payment_hash, invoice_str) = generate_test_invoice(&preimage_bytes);
@@ -611,7 +591,6 @@ mod shared_tests {
 
         handle_invoices_paid(
             db,
-            &webhook_service,
             &[PaidInvoice {
                 preimage: preimage_hex,
                 invoice: invoice_str,
@@ -636,7 +615,6 @@ mod shared_tests {
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
         let (trigger, _rx) = watch::channel(());
-        let webhook_service = WebhookService::new(db.clone());
         let user_pubkey = "test_user_pubkey";
 
         let known_preimage = [4u8; 32];
@@ -656,7 +634,6 @@ mod shared_tests {
 
         handle_invoices_paid(
             db,
-            &webhook_service,
             &[
                 PaidInvoice {
                     preimage: known_hex.clone(),

@@ -493,7 +493,6 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint(
     let (invoice_paid_trigger, _rx) = watch::channel(());
     State {
         db: repo.clone(),
-        webhook_service: crate::webhooks::WebhookService::new(repo),
         spark_client,
         providers,
         internal_auth,

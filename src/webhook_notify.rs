@@ -3,7 +3,7 @@ use tracing::debug;
 
 use crate::repository::{LnurlRepository, LnurlRepositoryError};
 use crate::time::now_millis;
-use crate::webhooks::{NewWebhookDelivery, WebhookRepository, WebhookService};
+use crate::webhooks::{NewWebhookDelivery, WebhookRepository};
 
 /// The JSON payload sent to the webhook URL when a payment is received.
 /// Uses adjacently tagged representation so all payloads share the same
@@ -26,7 +26,6 @@ pub enum WebhookPayload {
 /// for delivery via the webhook service.
 pub async fn notify_webhooks<DB>(
     db: &DB,
-    webhook_service: &WebhookService<DB>,
     payment_hashes: &[String],
 ) -> Result<(), LnurlRepositoryError>
 where
@@ -66,8 +65,7 @@ where
     }
 
     debug!("Notifying {} webhook deliveries", deliveries.len());
-    webhook_service
-        .enqueue(&deliveries)
+    db.insert_webhook_deliveries(&deliveries)
         .await
         .map_err(|e| LnurlRepositoryError::General(e.into()))?;
     Ok(())
@@ -109,13 +107,12 @@ mod shared_tests {
         NewBlinkAccount, WalletKind,
     };
     use crate::time::now_millis;
-    use crate::webhooks::{WebhookRepository, WebhookService};
+    use crate::webhooks::WebhookRepository;
 
     pub async fn enqueue_webhooks_creates_delivery<DB>(db: &DB)
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [10u8; 32];
         let (preimage_hex, payment_hash, invoice_str) =
             super::test_helpers::generate_test_invoice(&preimage_bytes);
@@ -152,13 +149,9 @@ mod shared_tests {
         };
         db.upsert_invoice(&invoice).await.unwrap();
 
-        crate::webhook_notify::notify_webhooks(
-            db,
-            &webhook_service,
-            std::slice::from_ref(&payment_hash),
-        )
-        .await
-        .unwrap();
+        crate::webhook_notify::notify_webhooks(db, std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
 
         let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
         assert_eq!(deliveries.len(), 1);
@@ -183,7 +176,6 @@ mod shared_tests {
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [13u8; 32];
         let (preimage_hex, payment_hash, invoice_str) =
             super::test_helpers::generate_test_invoice(&preimage_bytes);
@@ -238,13 +230,9 @@ mod shared_tests {
         );
         assert_eq!(payloads[0].user_pubkey, "");
 
-        crate::webhook_notify::notify_webhooks(
-            db,
-            &webhook_service,
-            std::slice::from_ref(&payment_hash),
-        )
-        .await
-        .unwrap();
+        crate::webhook_notify::notify_webhooks(db, std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
 
         let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
         assert_eq!(deliveries.len(), 1);
@@ -266,7 +254,6 @@ mod shared_tests {
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [14u8; 32];
         let (preimage_hex, payment_hash, invoice_str) =
             super::test_helpers::generate_test_invoice(&preimage_bytes);
@@ -328,13 +315,9 @@ mod shared_tests {
             Some("alice@multi-identifier-webhook.example.com")
         );
 
-        crate::webhook_notify::notify_webhooks(
-            db,
-            &webhook_service,
-            std::slice::from_ref(&payment_hash),
-        )
-        .await
-        .unwrap();
+        crate::webhook_notify::notify_webhooks(db, std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
 
         let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
         assert_eq!(deliveries.len(), 1);
@@ -349,7 +332,6 @@ mod shared_tests {
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [11u8; 32];
         let (preimage_hex, payment_hash, invoice_str) =
             super::test_helpers::generate_test_invoice(&preimage_bytes);
@@ -374,7 +356,7 @@ mod shared_tests {
         };
         db.upsert_invoice(&invoice).await.unwrap();
 
-        crate::webhook_notify::notify_webhooks(db, &webhook_service, &[payment_hash])
+        crate::webhook_notify::notify_webhooks(db, &[payment_hash])
             .await
             .unwrap();
 
@@ -389,7 +371,6 @@ mod shared_tests {
     where
         DB: LnurlRepository + WebhookRepository + Clone + Send + Sync + 'static,
     {
-        let webhook_service = WebhookService::new(db.clone());
         let preimage_bytes = [12u8; 32];
         let (preimage_hex, payment_hash, invoice_str) =
             super::test_helpers::generate_test_invoice(&preimage_bytes);
@@ -419,20 +400,12 @@ mod shared_tests {
         db.upsert_invoice(&invoice).await.unwrap();
 
         // Enqueue twice — second should be a no-op (ON CONFLICT DO NOTHING)
-        crate::webhook_notify::notify_webhooks(
-            db,
-            &webhook_service,
-            std::slice::from_ref(&payment_hash),
-        )
-        .await
-        .unwrap();
-        crate::webhook_notify::notify_webhooks(
-            db,
-            &webhook_service,
-            std::slice::from_ref(&payment_hash),
-        )
-        .await
-        .unwrap();
+        crate::webhook_notify::notify_webhooks(db, std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
+        crate::webhook_notify::notify_webhooks(db, std::slice::from_ref(&payment_hash))
+            .await
+            .unwrap();
 
         let deliveries = db.take_pending_webhook_deliveries().await.unwrap();
         assert_eq!(

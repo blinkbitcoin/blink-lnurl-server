@@ -1,7 +1,5 @@
 use phonenumber::Mode;
 
-const BLINK_USERNAME_REGEX: &str = r"(?i)^(?![13_]|bc1|lnbc1)(?=.*[a-z])[0-9a-z_]{3,50}$";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletModifier {
     Btc,
@@ -130,12 +128,11 @@ fn is_phone_like(value: &str) -> bool {
 }
 
 fn matches_blink_username_regex(value: &str) -> bool {
-    let _ = BLINK_USERNAME_REGEX;
     let lower = value.to_lowercase();
     let len = lower.chars().count();
 
     // Rust's regex crate intentionally does not support Blink Core's look-around
-    // pattern, so this implements BLINK_USERNAME_REGEX equivalently.
+    // pattern, so this implements the Blink username pattern equivalently.
     if !(3..=50).contains(&len)
         || lower.starts_with('1')
         || lower.starts_with('3')
