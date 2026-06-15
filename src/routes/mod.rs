@@ -3152,7 +3152,7 @@ mod tests {
     }
 
     fn internal_test_token() -> String {
-        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let private_key = include_bytes!("../../tests/fixtures/internal_auth_private.pem");
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("blink-internal-test-key".to_string());
         encode(
@@ -3171,7 +3171,7 @@ mod tests {
     }
 
     fn internal_auth_state() -> Arc<crate::internal_auth::InternalAuthState> {
-        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
+        let jwks = include_str!("../../tests/fixtures/internal_auth_jwks.json");
         Arc::new(
             crate::internal_auth::InternalAuthState::from_jwks_json(
                 jwks,
@@ -3392,7 +3392,7 @@ mod tests {
     }
 
     fn internal_test_token_with_scope(scope: &str) -> String {
-        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let private_key = include_bytes!("../../tests/fixtures/internal_auth_private.pem");
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("blink-internal-test-key".to_string());
         encode(
@@ -3550,7 +3550,7 @@ mod tests {
     // -- Spark management account-backed compatibility ------------------------
 
     fn handler_source(name: &str) -> &'static str {
-        let source = include_str!("routes.rs");
+        let source = include_str!("mod.rs");
         let marker = format!("    pub async fn {name}(");
         let start = source.find(&marker).expect("handler must exist");
         let rest = &source[start..];
@@ -4246,7 +4246,7 @@ mod tests {
 
     #[test]
     fn unsupported_spark_usd_maps_to_existing_lnurl_error_shape() {
-        let routes_source = include_str!("routes.rs");
+        let routes_source = include_str!("mod.rs");
         assert!(
             routes_source.contains("fn map_provider_invoice_error"),
             "routes must own provider error to LNURL JSON mapping"
@@ -4287,7 +4287,7 @@ mod tests {
             "callback must not call the Spark wallet directly"
         );
 
-        let providers_source = include_str!("providers.rs");
+        let providers_source = include_str!("../providers.rs");
         let provider_runtime_source = providers_source
             .split("#[cfg(test)]\nmod tests")
             .next()
@@ -4299,12 +4299,12 @@ mod tests {
 
     #[test]
     fn spark_signature_validation_source_uses_adapter_boundary() {
-        let routes_source = include_str!("routes.rs");
+        let routes_source = include_str!("mod.rs");
         let production_routes = routes_source
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("routes source should have production section");
-        let state_source = include_str!("state.rs");
+        let state_source = include_str!("../state.rs");
 
         assert!(production_routes.contains("Signature::from_der"));
         assert!(production_routes.contains("ACCEPTABLE_TIME_DIFF_SECS"));
@@ -4315,12 +4315,12 @@ mod tests {
 
     #[test]
     fn spark_bootstrap_and_state_source_use_adapter_boundary() {
-        let main_source = include_str!("main.rs");
+        let main_source = include_str!("../main.rs");
         let production_main = main_source
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("main source should have production section");
-        let state_source = include_str!("state.rs");
+        let state_source = include_str!("../state.rs");
 
         assert!(production_main.contains("parse_auth_seed(args.ssp_auth_seed.as_deref())"));
         assert!(production_main.contains("spark_client::ClientConfig::new(args.network"));
@@ -4379,11 +4379,11 @@ mod tests {
 
     #[test]
     fn spark_client_extraction_source_audit_guards_runtime_boundaries() {
-        let main_source = include_str!("main.rs");
-        let state_source = include_str!("state.rs");
-        let providers_source = include_str!("providers.rs");
-        let e2e_auth_source = include_str!("bin/e2e_auth.rs");
-        let routes_source = include_str!("routes.rs");
+        let main_source = include_str!("../main.rs");
+        let state_source = include_str!("../state.rs");
+        let providers_source = include_str!("../providers.rs");
+        let e2e_auth_source = include_str!("../bin/e2e_auth.rs");
+        let routes_source = include_str!("mod.rs");
 
         let production_main = strip_line_comments(
             main_source
@@ -4574,7 +4574,7 @@ mod tests {
 
     #[test]
     fn blink_provider_source_boundaries_remain_route_and_registry_owned() {
-        let routes_source = include_str!("routes.rs");
+        let routes_source = include_str!("mod.rs");
         let route_runtime_source = routes_source
             .split("#[cfg(test)]")
             .next()
@@ -4592,7 +4592,7 @@ mod tests {
             "route provider-error mapping must cover Blink provider failures"
         );
 
-        let providers_source = include_str!("providers.rs");
+        let providers_source = include_str!("../providers.rs");
         assert!(
             providers_source.contains("AccountProvider::Blink => self.blink.as_ref()"),
             "registry must dispatch Blink centrally through ProviderRegistry"
@@ -4911,8 +4911,8 @@ mod tests {
         // creation happy path is locked to /internal/blink/accounts, a scoped
         // RS256 JWT, local deterministic JWKS/key fixtures, route-boundary
         // normalization, and exactly one provider-neutral repository write.
-        let jwks = include_str!("../tests/fixtures/internal_auth_jwks.json");
-        let private_key = include_bytes!("../tests/fixtures/internal_auth_private.pem");
+        let jwks = include_str!("../../tests/fixtures/internal_auth_jwks.json");
+        let private_key = include_bytes!("../../tests/fixtures/internal_auth_private.pem");
         let auth_state = Arc::new(
             crate::internal_auth::InternalAuthState::from_jwks_json(
                 jwks,
@@ -5883,7 +5883,7 @@ mod tests {
 
     #[test]
     fn internal_identifier_lookup_route_shape_is_locked_to_restful_path() {
-        let main_source = include_str!("main.rs");
+        let main_source = include_str!("../main.rs");
         assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
         assert!(!main_source.contains("accounts/by-identifier"));
     }
@@ -5892,7 +5892,7 @@ mod tests {
     fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
         // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
         // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
-        let main_source = include_str!("main.rs");
+        let main_source = include_str!("../main.rs");
         let internal_mount = main_source
             .find(".nest(\"/internal\", internal_router)")
             .expect("internal router must be nested separately");
