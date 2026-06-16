@@ -35,7 +35,7 @@ spark-client = { path = "crates/spark-client" }
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "signal"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 x509-parser = { version = "0.18.0", features = ["verify"] }
