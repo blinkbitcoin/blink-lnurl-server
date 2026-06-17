@@ -26,6 +26,10 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+const DEPLOYMENT_ENV_PRODUCTION: &str = "production";
+const DEPLOYMENT_ENV_STAGING: &str = "staging";
+const DEPLOYMENT_ENV_LOCAL: &str = "local";
+const SUPPORTED_DEPLOYMENT_ENVS: &str = "production, staging, local";
 const STAGING_SPARK_NETWORK: spark_client::Network = spark_client::Network::Regtest;
 
 mod auth;
@@ -265,34 +269,36 @@ fn resolve_runtime_config(
         .filter(|value| !value.is_empty())
     else {
         return Err(anyhow!(
-            "DEPLOYMENT_ENV is required and must be one of: production, staging, local"
+            "DEPLOYMENT_ENV is required and must be one of: {SUPPORTED_DEPLOYMENT_ENVS}"
         ));
     };
 
     let mut config = match deployment_env {
-        "production" => DeploymentRuntimeConfig {
+        DEPLOYMENT_ENV_PRODUCTION => DeploymentRuntimeConfig {
             spark_network: spark_client::Network::Mainnet,
             blink_network: "mainnet",
             blink_graphql_endpoint: blink_client::PRODUCTION_GRAPHQL_ENDPOINT.to_string(),
         },
-        "staging" => DeploymentRuntimeConfig {
+        DEPLOYMENT_ENV_STAGING => DeploymentRuntimeConfig {
             // Spark staging stays on Regtest until Spark signet support is ready.
             spark_network: STAGING_SPARK_NETWORK,
             blink_network: "signet",
             blink_graphql_endpoint: blink_client::STAGING_GRAPHQL_ENDPOINT.to_string(),
         },
-        "local" => DeploymentRuntimeConfig {
+        DEPLOYMENT_ENV_LOCAL => DeploymentRuntimeConfig {
             spark_network: spark_client::Network::Regtest,
             blink_network: "regtest",
             blink_graphql_endpoint: configured_blink_graphql_endpoint
                 .ok_or_else(|| {
-                    anyhow!("LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local")
+                    anyhow!(
+                        "LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV={DEPLOYMENT_ENV_LOCAL}"
+                    )
                 })?
                 .to_string(),
         },
         unsupported => {
             return Err(anyhow!(
-                "unsupported DEPLOYMENT_ENV '{unsupported}'; expected one of: production, staging, local"
+                "unsupported DEPLOYMENT_ENV '{unsupported}'; expected one of: {SUPPORTED_DEPLOYMENT_ENVS}"
             ));
         }
     };
@@ -301,7 +307,7 @@ fn resolve_runtime_config(
         config.spark_network = spark_network;
     }
 
-    if deployment_env != "local"
+    if deployment_env != DEPLOYMENT_ENV_LOCAL
         && let Some(blink_graphql_endpoint) = configured_blink_graphql_endpoint
     {
         config.blink_graphql_endpoint = blink_graphql_endpoint.to_string();
