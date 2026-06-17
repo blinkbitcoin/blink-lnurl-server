@@ -26,6 +26,8 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+const STAGING_SPARK_NETWORK: spark_client::Network = spark_client::Network::Regtest;
+
 mod auth;
 mod domains;
 mod error;
@@ -145,6 +147,13 @@ struct Args {
     pub internal_jwt_audience: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploymentRuntimeConfig {
+    spark_network: spark_client::Network,
+    blink_network: &'static str,
+    blink_graphql_endpoint: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -155,6 +164,10 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let args: Args = figment.merge(Env::prefixed("LNURL_")).extract()?;
+    let runtime_config = resolve_runtime_config(
+        std::env::var("DEPLOYMENT_ENV").ok().as_deref(),
+        &args.blink_graphql_endpoint,
+    )?;
 
     tracing_subscriber::registry()
         .with(EnvFilter::new(&args.log_level))
@@ -183,7 +196,7 @@ async fn main() -> Result<(), anyhow::Error> {
             debug!("skipping postgres database migrations");
         }
         let repository = postgresql::LnurlRepository::new(pool);
-        run_server(args, repository).await?;
+        run_server(args, runtime_config, repository).await?;
     } else {
         // For in-memory databases, limit to 1 connection so all queries share
         // the same database. Each separate connection to `:memory:` creates its
@@ -206,7 +219,7 @@ async fn main() -> Result<(), anyhow::Error> {
             debug!("skipping sqlite database migrations");
         }
         let repository = sqlite::LnurlRepository::new(pool);
-        run_server(args, repository).await?;
+        run_server(args, runtime_config, repository).await?;
     }
 
     Ok(())
@@ -240,15 +253,60 @@ fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
     ))
 }
 
+fn resolve_runtime_config(
+    deployment_env: Option<&str>,
+    configured_blink_graphql_endpoint: &str,
+) -> Result<DeploymentRuntimeConfig, anyhow::Error> {
+    let Some(deployment_env) = deployment_env.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(anyhow!(
+            "DEPLOYMENT_ENV is required and must be one of: production, staging, local"
+        ));
+    };
+
+    match deployment_env {
+        "production" => Ok(DeploymentRuntimeConfig {
+            spark_network: spark_client::Network::Mainnet,
+            blink_network: "mainnet",
+            blink_graphql_endpoint: blink_client::PRODUCTION_GRAPHQL_ENDPOINT.to_string(),
+        }),
+        "staging" => Ok(DeploymentRuntimeConfig {
+            // Spark staging stays on Regtest until Spark signet support is ready.
+            spark_network: STAGING_SPARK_NETWORK,
+            blink_network: "signet",
+            blink_graphql_endpoint: blink_client::STAGING_GRAPHQL_ENDPOINT.to_string(),
+        }),
+        "local" => Ok(DeploymentRuntimeConfig {
+            spark_network: spark_client::Network::Regtest,
+            blink_network: "regtest",
+            blink_graphql_endpoint: configured_blink_graphql_endpoint.to_string(),
+        }),
+        unsupported => Err(anyhow!(
+            "unsupported DEPLOYMENT_ENV '{unsupported}'; expected one of: production, staging, local"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run_server<DB>(args: Args, repository: DB) -> Result<(), anyhow::Error>
+async fn run_server<DB>(
+    args: Args,
+    runtime_config: DeploymentRuntimeConfig,
+    repository: DB,
+) -> Result<(), anyhow::Error>
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
     let blink_webhook_url = build_blink_webhook_url(&args)?;
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
-    let spark_client =
-        spark_client::Client::new(spark_client::ClientConfig::new(args.network, auth_seed)).await?;
+    info!(
+        deployment_env_blink_network = runtime_config.blink_network,
+        blink_graphql_endpoint = runtime_config.blink_graphql_endpoint,
+        "resolved provider runtime configuration from DEPLOYMENT_ENV"
+    );
+    let spark_client = spark_client::Client::new(spark_client::ClientConfig::new(
+        runtime_config.spark_network,
+        auth_seed,
+    ))
+    .await?;
 
     let config_domains: Vec<String> = args
         .domains
@@ -341,7 +399,7 @@ where
     }
 
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
-        args.blink_graphql_endpoint.clone(),
+        runtime_config.blink_graphql_endpoint,
     ));
     let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
         spark_client.clone(),
@@ -561,6 +619,54 @@ mod tests {
             args.blink_graphql_endpoint,
             blink_client::PRODUCTION_GRAPHQL_ENDPOINT
         );
+    }
+
+    #[test]
+    fn deployment_env_production_uses_mainnet_and_production_blink() {
+        let config = resolve_runtime_config(Some("production"), "http://127.0.0.1:4455/graphql")
+            .expect("production config should resolve");
+
+        assert_eq!(config.spark_network, spark_client::Network::Mainnet);
+        assert_eq!(config.blink_network, "mainnet");
+        assert_eq!(
+            config.blink_graphql_endpoint,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn deployment_env_staging_uses_explicit_regtest_and_staging_blink() {
+        let config = resolve_runtime_config(Some("staging"), "http://127.0.0.1:4455/graphql")
+            .expect("staging config should resolve");
+
+        assert_eq!(config.spark_network, spark_client::Network::Regtest);
+        assert_eq!(config.spark_network, STAGING_SPARK_NETWORK);
+        assert_eq!(config.blink_network, "signet");
+        assert_eq!(
+            config.blink_graphql_endpoint,
+            blink_client::STAGING_GRAPHQL_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn deployment_env_local_uses_regtest_and_preserves_local_blink_override() {
+        let config = resolve_runtime_config(Some("local"), "http://127.0.0.1:4455/graphql")
+            .expect("local config should resolve");
+
+        assert_eq!(config.spark_network, spark_client::Network::Regtest);
+        assert_eq!(config.blink_network, "regtest");
+        assert_eq!(config.blink_graphql_endpoint, "http://127.0.0.1:4455/graphql");
+    }
+
+    #[test]
+    fn deployment_env_rejects_missing_or_unknown_values() {
+        let missing = resolve_runtime_config(None, "http://127.0.0.1:4455/graphql")
+            .expect_err("missing DEPLOYMENT_ENV must fail");
+        assert!(missing.to_string().contains("DEPLOYMENT_ENV is required"));
+
+        let unsupported = resolve_runtime_config(Some("qa"), "http://127.0.0.1:4455/graphql")
+            .expect_err("unknown DEPLOYMENT_ENV must fail");
+        assert!(unsupported.to_string().contains("unsupported DEPLOYMENT_ENV 'qa'"));
     }
 
     #[test]
