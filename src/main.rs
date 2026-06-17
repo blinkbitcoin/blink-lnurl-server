@@ -270,6 +270,9 @@ fn resolve_runtime_config(
             "DEPLOYMENT_ENV is required and must be one of: production, staging, local"
         ));
     };
+    let configured_blink_graphql_endpoint = configured_blink_graphql_endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     let mut config = match deployment_env {
         DEPLOYMENT_ENV_PRODUCTION => DeploymentRuntimeConfig {
@@ -712,6 +715,36 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local")
+        );
+    }
+
+    #[test]
+    fn deployment_env_local_rejects_blank_blink_graphql_override() {
+        for blank in ["", "   ", "\t"] {
+            let err = resolve_runtime_config(Some("local"), None, Some(blank))
+                .expect_err("blank local endpoint must be rejected");
+
+            assert!(
+                err.to_string()
+                    .contains("LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local")
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_env_non_local_ignores_blank_blink_graphql_override() {
+        let production = resolve_runtime_config(Some("production"), None, Some("   "))
+            .expect("production config should ignore blank override");
+        assert_eq!(
+            production.blink_graphql_endpoint,
+            blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+        );
+
+        let staging = resolve_runtime_config(Some("staging"), None, Some("\t"))
+            .expect("staging config should ignore blank override");
+        assert_eq!(
+            staging.blink_graphql_endpoint,
+            blink_client::STAGING_GRAPHQL_ENDPOINT
         );
     }
 
