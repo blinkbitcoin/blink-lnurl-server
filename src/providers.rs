@@ -181,6 +181,7 @@ impl SparkProvider {
         })
     }
 
+    #[allow(clippy::unused_async)]
     pub async fn payment_status(
         &self,
         request: PaymentStatusRequest<'_>,
