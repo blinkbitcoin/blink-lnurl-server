@@ -145,6 +145,13 @@ struct Args {
     pub internal_jwt_audience: Option<String>,
 }
 
+#[derive(Debug)]
+struct RuntimeConfig {
+    spark_network: spark_client::Network,
+    blink_network: &'static str,
+    blink_graphql_endpoint: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -155,7 +162,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let args: Args = figment.merge(Env::prefixed("LNURL_")).extract()?;
-    let (spark_network, blink_network, blink_graphql_endpoint) = resolve_runtime_config(
+    let runtime_config = resolve_runtime_config(
         std::env::var("DEPLOYMENT_ENV").ok().as_deref(),
         args.spark_network,
         args.blink_graphql_endpoint.as_deref(),
@@ -190,9 +197,7 @@ async fn main() -> Result<(), anyhow::Error> {
         let repository = postgresql::LnurlRepository::new(pool);
         run_server(
             args,
-            spark_network,
-            blink_network,
-            blink_graphql_endpoint,
+            runtime_config,
             repository,
         )
         .await?;
@@ -220,9 +225,7 @@ async fn main() -> Result<(), anyhow::Error> {
         let repository = sqlite::LnurlRepository::new(pool);
         run_server(
             args,
-            spark_network,
-            blink_network,
-            blink_graphql_endpoint,
+            runtime_config,
             repository,
         )
         .await?;
@@ -263,7 +266,7 @@ fn resolve_runtime_config(
     deployment_env: Option<&str>,
     configured_spark_network: Option<spark_client::Network>,
     configured_blink_graphql_endpoint: Option<&str>,
-) -> Result<(spark_client::Network, &'static str, String), anyhow::Error> {
+) -> Result<RuntimeConfig, anyhow::Error> {
     let Some(deployment_env) = deployment_env
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -316,15 +319,17 @@ fn resolve_runtime_config(
         default_blink_graphql_endpoint
     };
 
-    Ok((spark_network, blink_network, blink_graphql_endpoint))
+    Ok(RuntimeConfig {
+        spark_network,
+        blink_network,
+        blink_graphql_endpoint,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_server<DB>(
     args: Args,
-    spark_network: spark_client::Network,
-    blink_network: &'static str,
-    blink_graphql_endpoint: String,
+    runtime_config: RuntimeConfig,
     repository: DB,
 ) -> Result<(), anyhow::Error>
 where
@@ -333,13 +338,16 @@ where
     let blink_webhook_url = build_blink_webhook_url(&args)?;
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     info!(
-        deployment_env_blink_network = blink_network,
-        blink_graphql_endpoint = blink_graphql_endpoint,
+        deployment_env_blink_network = runtime_config.blink_network,
+        blink_graphql_endpoint = runtime_config.blink_graphql_endpoint,
         "resolved provider runtime configuration from DEPLOYMENT_ENV"
     );
     let spark_client =
-        spark_client::Client::new(spark_client::ClientConfig::new(spark_network, auth_seed))
-            .await?;
+        spark_client::Client::new(spark_client::ClientConfig::new(
+            runtime_config.spark_network,
+            auth_seed,
+        ))
+        .await?;
 
     let config_domains: Vec<String> = args
         .domains
@@ -431,8 +439,9 @@ where
         register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
 
-    let blink_client =
-        blink_client::Client::new(blink_client::ClientConfig::new(blink_graphql_endpoint));
+    let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
+        runtime_config.blink_graphql_endpoint,
+    ));
     let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
         spark_client.clone(),
         blink_client,
@@ -711,16 +720,19 @@ mod tests {
                 expected_blink_graphql_endpoint: blink_client::STAGING_GRAPHQL_ENDPOINT,
             },
         ] {
-            let (spark_network, blink_network, blink_graphql_endpoint) = resolve_runtime_config(
+            let runtime_config = resolve_runtime_config(
                 Some(case.deployment_env),
                 case.configured_spark_network,
                 case.configured_blink_graphql_endpoint,
             )
             .expect("success case should resolve");
 
-            assert_eq!(spark_network, case.expected_spark_network);
-            assert_eq!(blink_network, case.expected_blink_network);
-            assert_eq!(blink_graphql_endpoint, case.expected_blink_graphql_endpoint);
+            assert_eq!(runtime_config.spark_network, case.expected_spark_network);
+            assert_eq!(runtime_config.blink_network, case.expected_blink_network);
+            assert_eq!(
+                runtime_config.blink_graphql_endpoint,
+                case.expected_blink_graphql_endpoint
+            );
         }
     }
 
