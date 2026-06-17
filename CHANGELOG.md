@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.3.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.3.1)
+
+
+### Bug Fixes
+
+- Return LNURL errors for missing public identifiers (#21)
+
 # [blink-lnurl-server release v0.3.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.3.0)
 
 
