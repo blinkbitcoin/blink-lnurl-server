@@ -1,3 +1,40 @@
+# [blink-lnurl-server release v0.3.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.3.0)
+
+
+### Bug Fixes
+
+- Default deployment env to production
+- Validate blink endpoint config
+
+### Documentation
+
+- Update deployment env default
+- Document DEPLOYMENT_ENV runtime mapping
+- Update project documentation (#16)
+
+### Features
+
+- Add provider runtime overrides
+- Derive provider runtime from DEPLOYMENT_ENV
+
+### Refactor
+
+- Make runtime config explicit
+- Simplify deployment runtime config
+- Remove network alias
+- Name deployment env constants
+- Cut provider and webhook indirection (#19)
+
+### Styling
+
+- Apply rustfmt cleanup
+
+### Testing
+
+- Remove source content assertions
+- Update runtime config boundary assertion
+- Harden e2e startup
+
 # [blink-lnurl-server release v0.2.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.2.0)
 
 
