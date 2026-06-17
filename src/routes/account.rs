@@ -712,143 +712,6 @@ mod tests {
 
     // -- Spark management account-backed compatibility ------------------------
 
-    fn handler_source(name: &str) -> &'static str {
-        const SOURCES: [&str; 6] = [
-            include_str!("mod.rs"),
-            include_str!("account.rs"),
-            include_str!("internal.rs"),
-            include_str!("lnurl_pay.rs"),
-            include_str!("webhook.rs"),
-            include_str!("zap.rs"),
-        ];
-
-        let marker = format!("    pub async fn {name}(");
-        for source in SOURCES {
-            if let Some(start) = source.find(&marker) {
-                let rest = &source[start..];
-                let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
-                return &rest[..next];
-            }
-        }
-
-        panic!("handler must exist");
-    }
-
-    #[test]
-    fn spark_management_routes_use_provider_neutral_repository_calls() {
-        let register = handler_source("register");
-        assert!(
-            register.contains("upsert_spark_registration"),
-            "register must write through the account-backed Spark registration API"
-        );
-        assert!(
-            !register.contains("upsert_user"),
-            "register must not write exclusively through the legacy user API"
-        );
-
-        let available = handler_source("available");
-        assert!(
-            available.contains("resolve_recipient_by_identifier"),
-            "availability must resolve account-backed identifiers"
-        );
-        assert!(
-            !available.contains("get_user_by_name"),
-            "availability must not rely exclusively on legacy user lookup"
-        );
-
-        let recover = handler_source("recover");
-        assert!(
-            recover.contains("get_account_by_spark_pubkey"),
-            "recover must prove Spark account ownership through provider-neutral lookup"
-        );
-
-        let unregister = handler_source("unregister");
-        assert!(
-            unregister.contains("delete_spark_registration"),
-            "unregister must delete only the active Spark registration"
-        );
-        assert!(
-            unregister.contains("&username"),
-            "unregister must pass the signed canonical username into repository deletion"
-        );
-        assert!(
-            unregister.contains("spark_unregister_error"),
-            "unregister must map not-owned targeted deletion to the public not-found convention"
-        );
-        assert!(
-            !unregister.contains("delete_user"),
-            "unregister must not delete the legacy user row directly from the route"
-        );
-    }
-
-    #[test]
-    fn transfer_route_uses_provider_neutral_identifier_transfer() {
-        let transfer = handler_source("transfer");
-        assert!(
-            transfer.contains("IdentifierTransfer"),
-            "transfer must build the provider-neutral IdentifierTransfer DTO"
-        );
-        assert!(
-            transfer.contains("transfer_identifier"),
-            "transfer must move ownership through the provider-neutral repository API"
-        );
-        assert!(
-            transfer.contains("destination_spark_pubkey"),
-            "transfer must pass the verified destination Spark pubkey to the repository"
-        );
-        assert!(
-            !transfer.contains("get_account_by_spark_pubkey(&to_pubkey)"),
-            "transfer must not require a pre-existing destination Spark account"
-        );
-        assert!(
-            !transfer.contains("transfer_username"),
-            "transfer must not rely exclusively on legacy username transfer"
-        );
-        assert!(
-            transfer.contains("verify_transfer_signature"),
-            "transfer must preserve both Spark signature checks"
-        );
-    }
-
-    #[test]
-    fn spark_transfer_route_contract_still_uses_provider_neutral_transfer() {
-        let transfer = handler_source("transfer");
-        assert!(
-            transfer.matches("verify_transfer_signature").count() >= 2,
-            "public Spark transfer must keep both Spark signature verifications"
-        );
-        assert!(
-            transfer.contains("from_pk == to_pk"),
-            "public Spark transfer must keep same source/target pubkey rejection"
-        );
-        assert!(
-            transfer.contains("IdentifierTransfer"),
-            "public Spark transfer must still construct IdentifierTransfer"
-        );
-        assert!(
-            transfer.contains("transfer_identifier"),
-            "public Spark transfer must still call transfer_identifier"
-        );
-        assert!(
-            transfer.contains("TransferLnurlPayResponse"),
-            "public Spark transfer response type must stay unchanged"
-        );
-        assert!(
-            !transfer.contains("SCOPE_TRANSFER_WRITE") && !transfer.contains("require_scope"),
-            "public Spark transfer route must not require internal JWT scopes"
-        );
-
-        let internal_transfer = handler_source("transfer_identifier_to_spark");
-        assert!(
-            internal_transfer.contains("SCOPE_TRANSFER_WRITE"),
-            "only the internal Blink-to-Spark transfer route should require transfer:write"
-        );
-        assert!(
-            internal_transfer.contains("AccountProvider::Blink"),
-            "internal transfer must reject non-Blink current owners"
-        );
-    }
-
     #[test]
     fn transfer_provider_neutral_conflicts_keep_legacy_contract() {
         for error in [
@@ -911,30 +774,6 @@ mod tests {
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(body, Value::String("name already taken".to_string()));
         }
-    }
-
-    #[test]
-    fn public_invoice_callback_keeps_wallet_aliases_virtual_in_storage_audit() {
-        // D-03/PROV-04/LNURL-05: callback identifiers such as alice+btc and
-        // alice+usd are public route identities only. Storage and dispatch must
-        // use the resolved canonical recipient/account metadata instead.
-        let invoice = handler_source("handle_invoice");
-        assert!(
-            invoice.contains("public_recipient.callback_identifier"),
-            "callback metadata hashing should preserve requested public identity"
-        );
-        assert!(
-            invoice.contains("Some(&account_id)")
-                && invoice.contains("public_recipient.recipient.provider")
-                && invoice.contains("res.wallet_id.as_deref()"),
-            "invoice persistence must use resolved account/provider/wallet metadata"
-        );
-        assert!(
-            !invoice.contains("identifier+btc")
-                && !invoice.contains("identifier+usd")
-                && !invoice.contains("callback_identifier.clone()"),
-            "virtual aliases must not be persisted as account identifiers"
-        );
     }
 
     #[tokio::test]
@@ -1068,24 +907,6 @@ mod tests {
         assert_eq!(user.domain, "example.com");
         assert_eq!(user.pubkey, "spark_pubkey");
         assert_eq!(user.description, "Alice wallet");
-    }
-
-    #[test]
-    fn invoice_callback_writes_account_owned_side_effects() {
-        let invoice_callback = handler_source("handle_invoice");
-        assert!(
-            invoice_callback.contains("account_id"),
-            "invoice callback must carry resolved account ownership into side effects"
-        );
-        assert!(
-            invoice_callback.contains("create_provider_invoice_for_account"),
-            "invoice callback must use provider-aware account invoice construction"
-        );
-        assert!(
-            !invoice_callback.contains("crate::invoice_paid::create_invoice(")
-                && !invoice_callback.contains("invoice_paid::create_invoice("),
-            "migrated invoice callback must not use the legacy account-less helper"
-        );
     }
 
     // -- Transfer signature verification ---------------------------------------

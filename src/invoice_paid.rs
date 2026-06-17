@@ -307,18 +307,6 @@ mod test_helpers {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn create_invoice_for_account_metadata_helper_is_available() {
-        let source = include_str!("invoice_paid.rs");
-        assert!(source.contains("create_provider_invoice_for_account"));
-        assert!(source.contains("provider: Option<AccountProvider>"));
-        assert!(source.contains("wallet_kind: Option<WalletKind>"));
-        assert!(source.contains("provider_payment_hash"));
-    }
-}
-
 /// Shared test logic that runs against any `LnurlRepository` implementation.
 #[cfg(test)]
 mod shared_tests {

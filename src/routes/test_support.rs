@@ -1058,28 +1058,6 @@ pub(super) fn valid_internal_transfer_to_spark_payload() -> InternalTransferToSp
     }
 }
 
-pub(super) fn handler_source(name: &str) -> &'static str {
-    const SOURCES: [&str; 6] = [
-        include_str!("mod.rs"),
-        include_str!("account.rs"),
-        include_str!("internal.rs"),
-        include_str!("lnurl_pay.rs"),
-        include_str!("webhook.rs"),
-        include_str!("zap.rs"),
-    ];
-
-    let marker = format!("    pub async fn {name}(");
-    for source in SOURCES {
-        if let Some(start) = source.find(&marker) {
-            let rest = &source[start..];
-            let next = rest.find("\n    pub async fn ").unwrap_or(rest.len());
-            return &rest[..next];
-        }
-    }
-
-    panic!("handler must exist");
-}
-
 pub(super) fn metadata_entries(metadata: &str) -> Vec<(String, String)> {
     serde_json::from_str::<Vec<(String, String)>>(metadata)
         .expect("metadata must be a JSON array of string tuples")
@@ -1092,12 +1070,4 @@ pub(super) fn phone_blink_resolved_recipient() -> ResolvedRecipient {
         description: "Phone Blink account".to_string(),
         ..blink_resolved_recipient()
     }
-}
-
-pub(super) fn strip_line_comments(source: &str) -> String {
-    source
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }

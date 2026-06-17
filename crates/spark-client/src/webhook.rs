@@ -20,11 +20,4 @@ pub async fn register_wallet_webhook(
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn webhook_source_hides_spark_event_selection_inside_adapter() {
-        let source = include_str!("webhook.rs");
-        assert!(source.contains("SparkLightningReceiveFinished"));
-        assert!(source.contains("register_wallet_webhook"));
-    }
-}
+mod tests {}

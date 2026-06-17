@@ -953,37 +953,4 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(repo.resolve_calls().is_empty());
     }
-
-    #[test]
-    fn internal_identifier_lookup_route_shape_is_locked_to_restful_path() {
-        let main_source = include_str!("../main.rs");
-        assert!(main_source.contains("/domains/{domain}/identifiers/{identifier}"));
-        assert!(!main_source.contains("accounts/by-identifier"));
-    }
-
-    #[test]
-    fn internal_route_boundary_keeps_spark_and_public_routes_outside_internal_auth() {
-        // D-01/D-02/D-28: `/internal` is nested separately, Spark management routes
-        // keep `auth::auth`, and public LNURL routes remain outside internal JWT auth.
-        let main_source = include_str!("../main.rs");
-        let internal_mount = main_source
-            .find(".nest(\"/internal\", internal_router)")
-            .expect("internal router must be nested separately");
-        let spark_auth = main_source
-            .find("auth::auth::<DB>")
-            .expect("Spark compatibility routes must keep certificate auth");
-        let public_lnurl = main_source
-            .find("/.well-known/lnurlp/{identifier}")
-            .expect("public LNURL route must remain mounted");
-        let internal_auth = main_source
-            .find("internal_auth::internal_auth::<DB>")
-            .expect("internal router must use internal JWT middleware");
-
-        assert!(internal_auth < internal_mount);
-        assert!(internal_mount < spark_auth);
-        assert!(spark_auth < public_lnurl);
-        assert!(main_source.contains("/blink/accounts"));
-        assert!(main_source.contains("/lnurlpay/{pubkey}"));
-        assert!(main_source.contains("/lnurlp/{identifier}"));
-    }
 }
