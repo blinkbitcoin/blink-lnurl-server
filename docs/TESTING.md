@@ -71,7 +71,7 @@ Useful focused commands:
 cargo test --locked lnurl_pay
 cargo test --locked postgres_tests -- --test-threads=1
 cargo test --locked -p blink-client --test client
-bats -t bats/auth_endpoints.bats
+bats -t bats/spark_endpoints.bats
 bats -t bats/lnurl_protocol.bats
 bats -t bats/blink_mocked_e2e.bats
 ```
@@ -92,7 +92,7 @@ For route tests, reuse `src/routes/test_support.rs`; it provides the mock reposi
 
 For externally visible behavior, add or update Bats coverage in `bats/`:
 
-- `bats/auth_endpoints.bats` covers authenticated Spark-compatible management endpoints and internal transfer flows.
+- `bats/spark_endpoints.bats` covers authenticated Spark-compatible management endpoints and internal transfer flows.
 - `bats/lnurl_protocol.bats` covers LNURL discovery, callbacks, verification, zap behavior, and webhook side effects.
 - `bats/blink_mocked_e2e.bats` covers Blink-backed flows through the checked-in GraphQL mock.
 
