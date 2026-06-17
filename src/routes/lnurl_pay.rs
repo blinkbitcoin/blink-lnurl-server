@@ -1302,7 +1302,9 @@ mod tests {
         let state_source = include_str!("../state.rs");
 
         assert!(production_main.contains("parse_auth_seed(args.ssp_auth_seed.as_deref())"));
-        assert!(production_main.contains("spark_client::ClientConfig::new(args.network"));
+        assert!(production_main.contains("resolve_runtime_config("));
+        assert!(production_main.contains("spark_client::ClientConfig::new("));
+        assert!(production_main.contains("runtime_config.spark_network"));
         assert!(production_main.contains("register_webhook(spark_client.clone()"));
         assert!(
             production_main.contains("format!(\"{}://{}/webhook\", args.scheme, webhook_domain)")
