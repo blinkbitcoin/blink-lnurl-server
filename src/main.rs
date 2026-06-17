@@ -195,12 +195,7 @@ async fn main() -> Result<(), anyhow::Error> {
             debug!("skipping postgres database migrations");
         }
         let repository = postgresql::LnurlRepository::new(pool);
-        run_server(
-            args,
-            runtime_config,
-            repository,
-        )
-        .await?;
+        run_server(args, runtime_config, repository).await?;
     } else {
         // For in-memory databases, limit to 1 connection so all queries share
         // the same database. Each separate connection to `:memory:` creates its
@@ -223,12 +218,7 @@ async fn main() -> Result<(), anyhow::Error> {
             debug!("skipping sqlite database migrations");
         }
         let repository = sqlite::LnurlRepository::new(pool);
-        run_server(
-            args,
-            runtime_config,
-            repository,
-        )
-        .await?;
+        run_server(args, runtime_config, repository).await?;
     }
 
     Ok(())
@@ -338,12 +328,11 @@ where
         blink_graphql_endpoint = runtime_config.blink_graphql_endpoint,
         "resolved provider runtime configuration from DEPLOYMENT_ENV"
     );
-    let spark_client =
-        spark_client::Client::new(spark_client::ClientConfig::new(
-            runtime_config.spark_network,
-            auth_seed,
-        ))
-        .await?;
+    let spark_client = spark_client::Client::new(spark_client::ClientConfig::new(
+        runtime_config.spark_network,
+        auth_seed,
+    ))
+    .await?;
 
     let config_domains: Vec<String> = args
         .domains
