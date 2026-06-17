@@ -70,7 +70,7 @@ identifier_spark_pubkey() {
     -c "SELECT s.pubkey FROM account_identifiers ai JOIN spark_accounts s ON s.account_id = ai.account_id WHERE ai.domain = 'localhost:8080' AND ai.identifier = '${identifier}'"
 }
 
-@test "auth: register recover and unregister" {
+@test "spark: register recover and unregister" {
   run username_available "authuser" "localhost:8080"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.available' 'true'
@@ -96,7 +96,7 @@ identifier_spark_pubkey() {
   assert_json_equals "$output" '.available' 'true'
 }
 
-@test "auth: availability and duplicate registration preserve Spark contract (D-13/D-17)" {
+@test "spark: availability and duplicate registration preserve Spark contract" {
   run username_available "dupeuser" "localhost:8080"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.available' 'true'
@@ -119,7 +119,7 @@ identifier_spark_pubkey() {
   [ "$body" = '"name already taken"' ]
 }
 
-@test "auth: Spark transfer remains compatible after cross-provider transfer support" {
+@test "spark: transfer remains compatible after cross-provider transfer support" {
   run register_user "transferuser" "localhost:8080" "Transfer source wallet"
   [ "$status" -eq 0 ]
 
@@ -149,7 +149,7 @@ identifier_spark_pubkey() {
   assert_json_equals "$output" '.description' 'Transfer target wallet'
 }
 
-@test "auth: internal transfer-to-spark requires transfer scope" {
+@test "spark: internal transfer-to-spark requires transfer scope" {
   seed_blink_transfer_fixture "acct_blink_bats_scope" "scopemove" "scopestay" "Scoped Blink wallet"
   destination_pubkey="$(json_get "$(auth_payload "scopemove")" '.to_pubkey')"
   token="$(internal_test_token "accounts:read")"
@@ -163,7 +163,7 @@ identifier_spark_pubkey() {
   [ "$(identifier_owner_provider "scopemove")" = "blink" ]
 }
 
-@test "auth: internal transfer-to-spark moves one Blink identifier to Spark" {
+@test "spark: internal transfer-to-spark moves one Blink identifier to Spark" {
   seed_blink_transfer_fixture "acct_blink_bats_success" "internalmove" "internalstay" "Internal Blink wallet"
   destination_pubkey="$(json_get "$(auth_payload "internalmove")" '.to_pubkey')"
   token="$(internal_test_token "transfer:write")"
@@ -184,7 +184,7 @@ identifier_spark_pubkey() {
   [ "$(identifier_owner_provider "internalstay")" = "blink" ]
 }
 
-@test "auth: transfer replaces destination's previous Spark alias" {
+@test "spark: transfer replaces destination's previous Spark alias" {
   run register_user "transferreplace" "localhost:8080" "Transfer replacement source"
   [ "$status" -eq 0 ]
 
@@ -229,7 +229,7 @@ identifier_spark_pubkey() {
   assert_json_nonempty "$output" '.callback'
 }
 
-@test "auth: re-registration removes stale Spark aliases and preserves recover" {
+@test "spark: re-registration removes stale Spark aliases and preserves recover" {
   run register_user "oldalias" "localhost:8080" "Old alias wallet"
   [ "$status" -eq 0 ]
 
@@ -260,7 +260,7 @@ identifier_spark_pubkey() {
   assert_json_equals "$output" '.description' 'New alias wallet'
 }
 
-@test "auth: unregister deletes only the signed Spark identifier" {
+@test "spark: unregister deletes only the signed Spark identifier" {
   run register_user "deleteone" "localhost:8080" "Delete one wallet"
   [ "$status" -eq 0 ]
 
@@ -286,7 +286,7 @@ identifier_spark_pubkey() {
   [ "$status" -eq 0 ]
 }
 
-@test "auth: transfer rejects invalid signature with stable error shape" {
+@test "spark: transfer rejects invalid signature with stable error shape" {
   register_user "badtransfer" "localhost:8080" "Transfer bad signature wallet" >/dev/null
 
   auth="$(auth_payload "badtransfer")"
@@ -299,14 +299,14 @@ identifier_spark_pubkey() {
   [ "$output" = "400" ]
 }
 
-@test "auth: available rejects invalid username" {
+@test "spark: available rejects invalid username" {
   username="$(printf '%*s' 65 | tr ' ' a)"
 
   run curl -fsS --header "Host: localhost:8080" "${BASE_URL}/lnurlpay/available/${username}"
   [ "$status" -eq 22 ]
 }
 
-@test "auth: register rejects invalid signature" {
+@test "spark: register rejects invalid signature" {
   auth="$(auth_payload "badregister")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -316,7 +316,7 @@ identifier_spark_pubkey() {
   [ "$output" = "400" ]
 }
 
-@test "auth: strict registration validation rejects modifiers numeric and legacy punctuation (D-09/D-16)" {
+@test "spark: strict registration validation rejects modifiers numeric and legacy punctuation" {
   auth="$(auth_payload "validname")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -333,7 +333,7 @@ identifier_spark_pubkey() {
   done
 }
 
-@test "auth: availability rejects phone-like numeric usernames before lookup (D-01/IDEN-05)" {
+@test "spark: availability rejects phone-like numeric usernames before lookup" {
   response="$(http_status_body "GET" "${BASE_URL}/lnurlpay/available/573005871212" "localhost:8080")"
   code="${response##*$'\n'}"
   body="${response%$'\n'*}"
@@ -342,7 +342,7 @@ identifier_spark_pubkey() {
   [ "$body" = '"invalid username"' ]
 }
 
-@test "auth: register rejects stale timestamp" {
+@test "spark: register rejects stale timestamp" {
   auth="$(auth_payload "staleregister" "1")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -353,7 +353,7 @@ identifier_spark_pubkey() {
   [ "$output" = "400" ]
 }
 
-@test "auth: register rejects too-long description" {
+@test "spark: register rejects too-long description" {
   auth="$(auth_payload "longdesc")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -365,7 +365,7 @@ identifier_spark_pubkey() {
   [ "$output" = "400" ]
 }
 
-@test "auth: recover returns 404 for missing registration" {
+@test "spark: recover returns 404 for missing registration" {
   auth="$(auth_payload "missingrecover")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -378,7 +378,7 @@ identifier_spark_pubkey() {
   [ "$output" = "404" ]
 }
 
-@test "auth: recover rejects invalid signature" {
+@test "spark: recover rejects invalid signature" {
   auth="$(auth_payload "badrecover")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
@@ -388,7 +388,7 @@ identifier_spark_pubkey() {
   [ "$output" = "400" ]
 }
 
-@test "auth: unregister rejects mismatched signature" {
+@test "spark: unregister rejects mismatched signature" {
   register_user "unregisteruser" "localhost:8080" "Unregister test wallet" >/dev/null
 
   auth="$(auth_payload "unregisteruser")"

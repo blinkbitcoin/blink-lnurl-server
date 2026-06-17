@@ -129,7 +129,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   [ "${new_owner}" != "spark:acct_blink_lnurl_history" ]
 }
 
-@test "lnurl: btc wallet modifier preserves Spark discovery and callback happy path (D-13/D-15)" {
+@test "lnurl: btc wallet modifier preserves Spark discovery and callback happy path" {
   for alias in "alice+BTC" "alice+btc"; do
     run lnurl_discovery "$alias" "localhost:8080"
     [ "$status" -eq 0 ]
@@ -150,7 +150,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   done
 }
 
-@test "lnurl: usd wallet modifier returns Spark unsupported-wallet LNURL error from discovery or returned callback (D-14/D-15)" {
+@test "lnurl: usd wallet modifier returns Spark unsupported-wallet LNURL error from discovery or returned callback" {
   run lnurl_discovery "alice+usd" "localhost:8080"
   [ "$status" -eq 0 ]
 
@@ -174,7 +174,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   fi
 }
 
-@test "lnurl: unknown and chained wallet modifiers fail before Spark lookup (D-07/D-08/D-12)" {
+@test "lnurl: unknown and chained wallet modifiers fail before Spark lookup" {
   for invalid in "alice+eur" "alice+btc+usd" "alice+btc+btc"; do
     response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/${invalid}" "localhost:8080")"
     code="${response##*$'\n'}"
@@ -194,7 +194,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   done
 }
 
-@test "lnurl: phone-like public identifiers do not fall back to numeric legacy usernames (D-01/IDEN-05)" {
+@test "lnurl: phone-like public identifiers do not fall back to numeric legacy usernames" {
   insert_legacy_user "573005871212" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000001" "Numeric legacy wallet"
   insert_legacy_user "12345" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000002" "Invalid phone legacy wallet"
 
@@ -208,7 +208,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   done
 }
 
-@test "lnurl: legacy non-modifier Spark names still resolve but plus legacy names do not (D-10/D-11/D-12/D-16)" {
+@test "lnurl: legacy non-modifier Spark names still resolve but plus legacy names do not" {
   insert_legacy_user "legacy.name" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000003" "Legacy dotted wallet"
   insert_legacy_user "legacy+eur" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000004" "Legacy plus wallet"
   docker compose exec -T postgres psql -U user -d lnurl \

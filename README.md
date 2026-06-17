@@ -92,7 +92,8 @@ The local stack uses:
 - `LNURL_DOMAINS=localhost:8080,127.0.0.1:8080`.
 - `LNURL_NETWORK=regtest`.
 - `LNURL_SCHEME=http`.
-- `LNURL_WEBHOOK_DOMAIN=localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks.
+
+For Blink invoice callbacks during local runs, `scripts/start-local-stack.sh` defaults the webhook domain to `localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks. Override it with `LNURL_WEBHOOK_DOMAIN` when using a different local host or public tunnel.
 
 Run end-to-end tests:
 
@@ -116,6 +117,7 @@ docker run --rm -p 8080:8080 \
   -e LNURL_AUTO_MIGRATE="true" \
   -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl" \
   -e LNURL_DOMAINS="yourdomain.com" \
+  -e LNURL_WEBHOOK_DOMAIN="yourdomain.com" \
   blink-lnurl-server
 ```
 
@@ -133,11 +135,11 @@ rm ./lnurl-server
 
 ## Configuration
 
-The server is configured in this precedence order:
+The server merges configuration in this order, with later sources overriding earlier ones:
 
-1. Command-line arguments.
-2. Environment variables prefixed with `LNURL_`.
-3. TOML config file.
+1. Command-line argument defaults.
+2. TOML config file.
+3. Environment variables prefixed with `LNURL_`.
 
 Example `lnurl.conf`:
 
@@ -235,3 +237,67 @@ services:
     depends_on:
       - postgres
 ```
+
+## Installation
+
+Install the development toolchain and dependencies with Nix, then build the Rust binaries with Cargo through the project `Makefile`:
+
+```bash
+nix develop -c make build
+```
+
+If you use `direnv`, run `direnv allow` once and then use the same `make` targets without the `nix develop -c` prefix.
+
+## Quick Start
+
+1. Start the local PostgreSQL dependency and LNURL server:
+
+   ```bash
+   nix develop -c make start
+   ```
+
+2. Check that the server is responding:
+
+   ```bash
+   curl -fsS http://localhost:8080/health
+   ```
+
+3. Run the deterministic end-to-end suite against the local stack:
+
+   ```bash
+   nix develop -c make e2e
+   ```
+
+## Usage Examples
+
+Check server health:
+
+```bash
+curl -i http://localhost:8080/health
+```
+
+Expected result: HTTP `200 OK`.
+
+Fetch LNURL-pay metadata for a registered identifier:
+
+```bash
+curl -fsS \
+  --header "Host: localhost:8080" \
+  http://localhost:8080/.well-known/lnurlp/alice
+```
+
+Expected result: a JSON response with `tag: "payRequest"`, `minSendable`, `maxSendable`, `metadata`, `commentAllowed`, and a `callback` such as `http://localhost:8080/lnurlp/alice/invoice`.
+
+Request an invoice from the LNURL callback:
+
+```bash
+curl -fsS \
+  --header "Host: localhost:8080" \
+  'http://localhost:8080/lnurlp/alice/invoice?amount=1000&comment=hello'
+```
+
+Expected result: a JSON response containing `pr`, `verify`, and an empty `routes` array, or an LNURL error response if the identifier is not registered or the amount is out of range.
+
+## License
+
+No license file or Cargo package license metadata is present in this repository.
