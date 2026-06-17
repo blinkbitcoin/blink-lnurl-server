@@ -118,7 +118,6 @@ where
         if let Some(preimage) = &preimage_from_receipt {
             match handle_invoice_paid(
                 &state.db,
-                &state.webhook_service,
                 &payment_hash,
                 preimage,
                 None,

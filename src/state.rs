@@ -5,7 +5,6 @@ use crate::providers::ProviderRegistry;
 
 pub struct State<DB> {
     pub db: DB,
-    pub webhook_service: crate::webhooks::WebhookService<DB>,
     pub spark_client: spark_client::Client,
     pub providers: Arc<ProviderRegistry>,
     pub internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
@@ -29,7 +28,6 @@ where
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
-            webhook_service: self.webhook_service.clone(),
             spark_client: self.spark_client.clone(),
             providers: Arc::clone(&self.providers),
             internal_auth: self.internal_auth.as_ref().map(Arc::clone),

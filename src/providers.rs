@@ -113,20 +113,6 @@ fn select_blink_wallet_id(
     Ok((wallet, wallet_id))
 }
 
-#[async_trait::async_trait]
-pub trait LnurlProvider: Send + Sync {
-    async fn create_invoice(
-        &self,
-        request: CreateInvoiceRequest<'_>,
-    ) -> Result<ProviderInvoice, ProviderError>;
-
-    #[allow(dead_code)]
-    async fn payment_status(
-        &self,
-        request: PaymentStatusRequest<'_>,
-    ) -> Result<ProviderPaymentStatus, ProviderError>;
-}
-
 pub struct SparkProvider {
     client: Option<spark_client::Client>,
 }
@@ -144,9 +130,8 @@ impl SparkProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl LnurlProvider for SparkProvider {
-    async fn create_invoice(
+impl SparkProvider {
+    pub async fn create_invoice(
         &self,
         request: CreateInvoiceRequest<'_>,
     ) -> Result<ProviderInvoice, ProviderError> {
@@ -196,7 +181,8 @@ impl LnurlProvider for SparkProvider {
         })
     }
 
-    async fn payment_status(
+    #[allow(clippy::unused_async)]
+    pub async fn payment_status(
         &self,
         request: PaymentStatusRequest<'_>,
     ) -> Result<ProviderPaymentStatus, ProviderError> {
@@ -207,9 +193,8 @@ impl LnurlProvider for SparkProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl LnurlProvider for BlinkProvider {
-    async fn create_invoice(
+impl BlinkProvider {
+    pub async fn create_invoice(
         &self,
         request: CreateInvoiceRequest<'_>,
     ) -> Result<ProviderInvoice, ProviderError> {
@@ -242,7 +227,7 @@ impl LnurlProvider for BlinkProvider {
         })
     }
 
-    async fn payment_status(
+    pub async fn payment_status(
         &self,
         request: PaymentStatusRequest<'_>,
     ) -> Result<ProviderPaymentStatus, ProviderError> {
@@ -390,10 +375,24 @@ impl ProviderRegistry {
         }
     }
 
-    pub fn provider_for(&self, provider: AccountProvider) -> &dyn LnurlProvider {
+    pub async fn create_invoice(
+        &self,
+        request: CreateInvoiceRequest<'_>,
+    ) -> Result<ProviderInvoice, ProviderError> {
+        match request.recipient.provider {
+            AccountProvider::Spark => self.spark.create_invoice(request).await,
+            AccountProvider::Blink => self.blink.create_invoice(request).await,
+        }
+    }
+
+    pub async fn payment_status(
+        &self,
+        provider: AccountProvider,
+        request: PaymentStatusRequest<'_>,
+    ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
-            AccountProvider::Spark => self.spark.as_ref(),
-            AccountProvider::Blink => self.blink.as_ref(),
+            AccountProvider::Spark => self.spark.payment_status(request).await,
+            AccountProvider::Blink => self.blink.payment_status(request).await,
         }
     }
 }
@@ -427,25 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_routes_spark_and_blink() {
-        let registry = ProviderRegistry {
-            spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
-            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
-                blink_client::ClientConfig::new("http://127.0.0.1/graphql"),
-            ))),
-        };
-
-        assert!(std::ptr::addr_eq(
-            registry.provider_for(AccountProvider::Spark),
-            registry.spark.as_ref() as &dyn LnurlProvider,
-        ));
-        assert!(std::ptr::addr_eq(
-            registry.provider_for(AccountProvider::Blink),
-            registry.blink.as_ref() as &dyn LnurlProvider,
-        ));
-    }
-
-    #[test]
     fn spark_provider_runtime_uses_spark_client_adapter_for_invoice_creation() {
         let providers_source = include_str!("providers.rs");
         let provider_runtime_source = providers_source
@@ -475,32 +455,6 @@ mod tests {
             })
             .await
             .expect_err("Spark must reject USD wallet intent");
-
-        assert!(matches!(
-            err,
-            ProviderError::UnsupportedWallet {
-                provider: AccountProvider::Spark,
-                wallet: WalletKind::Usd,
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn spark_provider_rejects_blink_wallet_modifier_test_01() {
-        let provider = spark_provider_for_unit_tests();
-        let recipient = recipient(AccountProvider::Spark, None);
-
-        let err = provider
-            .create_invoice(CreateInvoiceRequest {
-                recipient: &recipient,
-                wallet: Some(WalletKind::Usd),
-                amount_sat: 1,
-                description_hash: [0; 32],
-                expiry: None,
-                include_spark_address: false,
-            })
-            .await
-            .expect_err("Spark provider must reject Blink-only USD wallet modifiers");
 
         assert!(matches!(
             err,
@@ -667,25 +621,6 @@ mod tests {
         wallet: Option<WalletKind>,
     ) -> CreateInvoiceRequest<'_> {
         blink_invoice_request_with_expiry(recipient, wallet, None)
-    }
-
-    #[test]
-    fn blink_registry_dispatches_to_blink_provider() {
-        let registry = ProviderRegistry {
-            spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
-            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
-                blink_client::ClientConfig::new("http://127.0.0.1/graphql"),
-            ))),
-        };
-
-        assert!(std::ptr::addr_eq(
-            registry.provider_for(AccountProvider::Spark),
-            registry.spark.as_ref() as &dyn LnurlProvider,
-        ));
-        assert!(std::ptr::addr_eq(
-            registry.provider_for(AccountProvider::Blink),
-            registry.blink.as_ref() as &dyn LnurlProvider,
-        ));
     }
 
     #[tokio::test]

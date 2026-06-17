@@ -285,7 +285,6 @@ where
 
         let res = state
             .providers
-            .provider_for(public_recipient.recipient.provider)
             .create_invoice(CreateInvoiceRequest {
                 recipient: &public_recipient.recipient,
                 wallet: public_recipient.wallet,
@@ -521,7 +520,6 @@ where
         // Use the central invoice paid handler
         handle_invoice_paid(
             &state.db,
-            &state.webhook_service,
             &payment_hash_hex,
             &payload.preimage,
             None,
@@ -579,7 +577,6 @@ where
 
         handle_invoices_paid(
             &state.db,
-            &state.webhook_service,
             &payload.invoices,
             &pubkey.to_string(),
             &state.invoice_paid_trigger,
@@ -1255,8 +1252,8 @@ mod tests {
             "callback must resolve account-backed recipients through the public lookup helper"
         );
         assert!(
-            invoice.contains("provider_for"),
-            "callback must select the provider by resolved recipient provider"
+            invoice.contains("providers") && invoice.contains("create_invoice"),
+            "callback must dispatch invoice creation through provider holder"
         );
         assert!(
             invoice.contains("create_invoice"),
@@ -1680,7 +1677,8 @@ mod tests {
 
         let providers_source = include_str!("../providers.rs");
         assert!(
-            providers_source.contains("AccountProvider::Blink => self.blink.as_ref()"),
+            providers_source.contains("AccountProvider::Blink => self.blink.create_invoice")
+                && providers_source.contains("AccountProvider::Blink => self.blink.payment_status"),
             "registry must dispatch Blink centrally through ProviderRegistry"
         );
     }
