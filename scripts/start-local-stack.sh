@@ -89,6 +89,9 @@ fi
 
 if [ -n "${LNURL_BLINK_GRAPHQL_ENDPOINT:-}" ]; then
   BLINK_GRAPHQL_ARGS=(--blink-graphql-endpoint "${LNURL_BLINK_GRAPHQL_ENDPOINT}")
+else
+  echo "LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local" >&2
+  exit 1
 fi
 
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \

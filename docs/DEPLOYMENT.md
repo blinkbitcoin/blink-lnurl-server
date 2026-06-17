@@ -64,7 +64,8 @@ Minimum production-oriented settings usually include:
 | `LNURL_SCHEME` | URL scheme used in generated callback and webhook URLs, normally `https` in production. |
 | `LNURL_WEBHOOK_DOMAIN` | Domain used to build provider callback URLs for `/webhook` and `/webhook/blink`; startup fails without this value. |
 | `LNURL_SSP_AUTH_SEED` | Stable hex-encoded 32-byte Spark SSP authentication seed. |
-| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional local/test override for Blink GraphQL. Production and staging are pinned by `DEPLOYMENT_ENV`; local can point this at a mock or local endpoint. |
+| `LNURL_SPARK_NETWORK` | Optional Spark/LNURL network override when a deployment must differ from the `DEPLOYMENT_ENV` default. |
+| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional Blink GraphQL override when a deployment must differ from the `DEPLOYMENT_ENV` default. |
 | `LNURL_INTERNAL_JWKS_URL` or `LNURL_INTERNAL_JWKS_PATH` | JWKS source for internal Blink Core JWT authentication, when `/internal/...` routes are used. |
 | `LNURL_INTERNAL_JWT_ISSUER` and `LNURL_INTERNAL_JWT_AUDIENCE` | Expected issuer and audience for internal RS256 JWTs. |
 
@@ -74,9 +75,11 @@ Provider mapping is fixed as:
 
 - `production` → Spark/LNURL `mainnet`, Blink production GraphQL.
 - `staging` → Spark/LNURL `regtest`, Blink signet behavior with `https://api.staging.blink.sv/graphql`.
-- `local` → Spark/LNURL `regtest`, Blink local behavior through the existing `LNURL_BLINK_GRAPHQL_ENDPOINT` override path.
+- `local` → Spark/LNURL `regtest`, Blink local behavior through the explicitly configured `LNURL_BLINK_GRAPHQL_ENDPOINT`.
 
 Spark staging stays explicitly mapped to `regtest` for now so the later Spark `regtest -> signet` switch is localized to one startup match arm.
+
+If a deployment needs to diverge from those defaults, set `LNURL_SPARK_NETWORK` and/or `LNURL_BLINK_GRAPHQL_ENDPOINT` explicitly. `LNURL_NETWORK` remains a legacy alias for the Spark override.
 
 Database migrations are embedded for both PostgreSQL and SQLite. Set `LNURL_AUTO_MIGRATE=true` only when the instance should apply migrations during startup; otherwise run migrations through the release/deployment process before starting new instances.
 

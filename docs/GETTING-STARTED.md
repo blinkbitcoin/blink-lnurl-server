@@ -47,6 +47,8 @@ The direct host-run command below requires PostgreSQL to be reachable on `127.0.
 
 ```bash
 docker compose up -d postgres && \
+DEPLOYMENT_ENV=local \
+LNURL_BLINK_GRAPHQL_ENDPOINT=http://<your-local-blink>/graphql \
 LNURL_SSP_AUTH_SEED=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
 cargo run --locked --bin lnurl-server -- \
   --address 127.0.0.1:8080 \
@@ -54,10 +56,11 @@ cargo run --locked --bin lnurl-server -- \
   --db-url postgres://user:password@127.0.0.1:5432/lnurl \
   --domains localhost:8080,127.0.0.1:8080 \
   --log-level info \
-  --network regtest \
   --scheme http \
   --webhook-domain localhost:8080
 ```
+
+Replace `http://<your-local-blink>/graphql` with the Blink local or mock GraphQL endpoint you want this server to use.
 
 In another shell, confirm the server is responding:
 

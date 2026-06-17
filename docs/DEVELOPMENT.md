@@ -35,7 +35,7 @@ Use the Nix development shell for the full local toolchain. `flake.nix` provides
    make start
    ```
 
-   `scripts/start-local-stack.sh` starts PostgreSQL with Docker Compose, builds `target/debug/lnurl-server` if needed, and runs the server on `127.0.0.1:8080` with regtest settings.
+   `scripts/start-local-stack.sh` starts PostgreSQL with Docker Compose, builds `target/debug/lnurl-server` if needed, and runs the server on `127.0.0.1:8080` with regtest settings. Set `LNURL_BLINK_GRAPHQL_ENDPOINT` first when using `DEPLOYMENT_ENV=local`.
 
 There is no `.env.example` file. Local defaults are encoded in `docker-compose.yml`, `docker-compose.override.yml`, and `scripts/start-local-stack.sh`. Do not commit local secrets or private environment files.
 

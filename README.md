@@ -82,7 +82,7 @@ The release binary is written to `target/release/lnurl-server`.
 Start the local Postgres dependency and LNURL server:
 
 ```shell
-nix develop -c make start
+LNURL_BLINK_GRAPHQL_ENDPOINT=http://<your-local-blink>/graphql nix develop -c make start
 ```
 
 The local stack uses:
@@ -101,7 +101,11 @@ The local stack uses:
 
 Spark staging stays explicitly pinned to `regtest` for now so the later Spark `regtest -> signet` switch is a one-line startup mapping change.
 
+Explicit overrides still win when needed: use `LNURL_SPARK_NETWORK` to override Spark/LNURL network defaults and `LNURL_BLINK_GRAPHQL_ENDPOINT` to override the Blink GraphQL URL. `DEPLOYMENT_ENV=local` requires `LNURL_BLINK_GRAPHQL_ENDPOINT` because this repo does not define one fixed local Blink service URL.
+
 For Blink invoice callbacks during local runs, `scripts/start-local-stack.sh` defaults the webhook domain to `localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks. Override it with `LNURL_WEBHOOK_DOMAIN` when using a different local host or public tunnel.
+
+`make start` also expects `LNURL_BLINK_GRAPHQL_ENDPOINT` to point at the Blink local or mock GraphQL endpoint for `DEPLOYMENT_ENV=local`.
 
 Run end-to-end tests:
 
@@ -180,7 +184,7 @@ Important options:
 | `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
 
-`DEPLOYMENT_ENV` is required at startup and accepts only `production`, `staging`, or `local`. `LNURL_NETWORK` is now legacy compatibility config; runtime provider selection comes from `DEPLOYMENT_ENV`. `LNURL_BLINK_GRAPHQL_ENDPOINT` remains useful for local/test overrides.
+`DEPLOYMENT_ENV` is required at startup and accepts only `production`, `staging`, or `local`. It sets the default provider wiring. `LNURL_SPARK_NETWORK` and `LNURL_BLINK_GRAPHQL_ENDPOINT` are optional explicit overrides. `LNURL_NETWORK` remains accepted as a legacy alias for the Spark override.
 
 `LNURL_WEBHOOK_DOMAIN` is required when running the server with Blink invoice support. Blink invoice creation passes a callback URL of `{LNURL_SCHEME}://{LNURL_WEBHOOK_DOMAIN}/webhook/blink` to Blink GraphQL for both BTC and USD invoices. The Blink callback route accepts flat provider payloads at public `POST /webhook/blink`; it is separate from the Spark SSP webhook at `POST /webhook`.
 
@@ -239,6 +243,7 @@ services:
       DEPLOYMENT_ENV: "local"
       LNURL_ADDRESS: "0.0.0.0:8080"
       LNURL_AUTO_MIGRATE: "true"
+      LNURL_BLINK_GRAPHQL_ENDPOINT: "http://your-local-blink/graphql"
       LNURL_DB_URL: "postgres://user:password@postgres:5432/lnurl"
       LNURL_DOMAINS: "localhost:8080,127.0.0.1:8080"
       LNURL_SCHEME: "http"

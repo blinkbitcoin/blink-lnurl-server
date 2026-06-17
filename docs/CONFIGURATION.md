@@ -10,7 +10,7 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEPLOYMENT_ENV` | **Required at startup** | unset | Selects runtime provider mapping: `production ->` Spark/LNURL `mainnet` + Blink production GraphQL, `staging ->` Spark/LNURL `regtest` + Blink signet behavior + staging GraphQL, `local ->` Spark/LNURL `regtest` + Blink local behavior. Spark staging intentionally stays on `regtest` for now. |
+| `DEPLOYMENT_ENV` | **Required at startup** | unset | Selects default runtime provider mapping: `production ->` Spark/LNURL `mainnet` + Blink production GraphQL, `staging ->` Spark/LNURL `regtest` + Blink signet behavior + staging GraphQL, `local ->` Spark/LNURL `regtest` + Blink local behavior through an explicit `LNURL_BLINK_GRAPHQL_ENDPOINT`. Spark staging intentionally stays on `regtest` for now. |
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -18,7 +18,7 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_AUTO_MIGRATE` | Optional | `false` | When `true`, applies embedded PostgreSQL or SQLite migrations at startup. |
 | `LNURL_DB_URL` | Required for persistent deployments | `""` | Database connection string. Values beginning with `postgres` use PostgreSQL; other values use SQLite. |
 | `LNURL_LOG_LEVEL` | Optional | `info` | `tracing_subscriber` env-filter string for application logs. |
-| `LNURL_NETWORK` | Legacy compatibility only | `mainnet` | Startup now derives the Spark/LNURL runtime network from `DEPLOYMENT_ENV`; keep this only while older config files are cleaned up. |
+| `LNURL_SPARK_NETWORK` | Optional | unset | Explicit Spark/LNURL network override. When unset, startup derives the Spark/LNURL runtime network from `DEPLOYMENT_ENV`. |
 | `LNURL_SCHEME` | Optional | `https` | Scheme used when constructing LNURL callback and webhook URLs. |
 | `LNURL_MIN_SENDABLE` | Optional | `1000` | Minimum LNURL payment amount in millisatoshi. |
 | `LNURL_MAX_SENDABLE` | Optional | `4000000000` | Maximum LNURL payment amount in millisatoshi. |
@@ -29,7 +29,8 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_WEBHOOK_DOMAIN` | **Required at startup** | unset | Domain used to build Blink invoice callback URLs at `{scheme}://{webhook_domain}/webhook/blink`; also used for Spark SSP webhook registration at `{scheme}://{webhook_domain}/webhook`. |
 | `LNURL_SSP_AUTH_SEED` | Optional | random seed | Hex-encoded 32-byte seed used for Spark SSP authentication. Invalid or wrong-length values log an error and fall back to a random seed. |
 | `LNURL_WEBHOOK_DELIVERY_TTL_DAYS` | Optional | `90` | Number of days to retain webhook delivery rows before cleanup. |
-| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional | `https://api.blink.sv/graphql` | Blink GraphQL override path. Production and staging are pinned by `DEPLOYMENT_ENV`; local/test flows can still point this at a mock or local endpoint. |
+| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional in `production`/`staging`, required in `local` | unset | Explicit Blink GraphQL endpoint override. When unset, startup uses the `DEPLOYMENT_ENV` default endpoint for production/staging and fails closed for `local`. |
+| `LNURL_NETWORK` | Legacy alias | unset | Legacy alias for `LNURL_SPARK_NETWORK`. |
 | `LNURL_INTERNAL_JWKS_URL` | Optional | unset | URL to fetch Blink Core internal-auth JWKS from at startup. |
 | `LNURL_INTERNAL_JWKS_PATH` | Optional | unset | Local path to read Blink Core internal-auth JWKS from at startup. Takes precedence over `LNURL_INTERNAL_JWKS_URL`. |
 | `LNURL_INTERNAL_JWT_ISSUER` | Optional | unset | Expected issuer for RS256 internal-auth JWTs. Required, with an audience and JWKS source, for `/internal/...` routes to authorize requests. |
@@ -57,7 +58,7 @@ webhook_domain = "localhost:8080"
 ssp_auth_seed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ```
 
-Run that config with `DEPLOYMENT_ENV=local`. If Blink should hit a mock or other local GraphQL service, also set `LNURL_BLINK_GRAPHQL_ENDPOINT`.
+Run that config with `DEPLOYMENT_ENV=local` and set `LNURL_BLINK_GRAPHQL_ENDPOINT` to the Blink local or mock GraphQL URL.
 
 Production-oriented example with internal auth enabled:
 
@@ -104,7 +105,7 @@ Settings that fail closed or fall back instead of stopping the server:
 | `auto_migrate` | `false` | `src/main.rs` |
 | `db_url` | `""` | `src/main.rs` |
 | `log_level` | `info` | `src/main.rs` |
-| `network` | `mainnet` (legacy compatibility) | `src/main.rs` |
+| `spark_network` | unset (derived from `DEPLOYMENT_ENV` unless overridden) | `src/main.rs` |
 | `scheme` | `https` | `src/main.rs` |
 | `min_sendable` | `1000` millisatoshi | `src/main.rs` |
 | `max_sendable` | `4000000000` millisatoshi | `src/main.rs` |
@@ -132,4 +133,4 @@ LNURL_SSP_AUTH_SEED=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 LNURL_WEBHOOK_DOMAIN=localhost:8080
 ```
 
-For production, set `DEPLOYMENT_ENV=production` plus platform secrets or environment variables for at least the database URL, allowed domains, scheme, webhook domain, Spark SSP seed, and internal-auth JWT/JWKS values if `/internal/...` routes are used. For staging, set `DEPLOYMENT_ENV=staging`; Spark still maps to `regtest` there intentionally until the later signet switch.
+For production, set `DEPLOYMENT_ENV=production` plus platform secrets or environment variables for at least the database URL, allowed domains, scheme, webhook domain, Spark SSP seed, and internal-auth JWT/JWKS values if `/internal/...` routes are used. For staging, set `DEPLOYMENT_ENV=staging`; Spark still maps to `regtest` there intentionally until the later signet switch. If you need to force a different Spark network or Blink URL temporarily, set `LNURL_SPARK_NETWORK` and/or `LNURL_BLINK_GRAPHQL_ENDPOINT` explicitly.
