@@ -93,7 +93,7 @@ The local stack uses:
 - `LNURL_NETWORK=regtest`.
 - `LNURL_SCHEME=http`.
 
-For Blink invoice callbacks during local runs, provide `LNURL_WEBHOOK_DOMAIN=localhost:8080` before starting the server so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks. The Bats E2E helper sets this default automatically; direct `make start` and direct `scripts/start-local-stack.sh` runs rely on your shell environment.
+For Blink invoice callbacks during local runs, `scripts/start-local-stack.sh` defaults the webhook domain to `localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks. Override it with `LNURL_WEBHOOK_DOMAIN` when using a different local host or public tunnel.
 
 Run end-to-end tests:
 
@@ -117,6 +117,7 @@ docker run --rm -p 8080:8080 \
   -e LNURL_AUTO_MIGRATE="true" \
   -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl" \
   -e LNURL_DOMAINS="yourdomain.com" \
+  -e LNURL_WEBHOOK_DOMAIN="yourdomain.com" \
   blink-lnurl-server
 ```
 

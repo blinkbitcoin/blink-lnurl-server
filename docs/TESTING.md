@@ -1,4 +1,3 @@
-<!-- generated-by: gsd-doc-writer -->
 # Testing
 
 This project uses Rust's built-in test harness for unit and integration-style tests, Tokio for async tests, Wiremock for mocked Blink GraphQL client tests, and Bats for end-to-end HTTP protocol coverage.
@@ -114,7 +113,7 @@ There is no `cargo-llvm-cov`, `tarpaulin`, `grcov`, or coverage-threshold config
 
 ## CI Integration
 
-No GitHub Actions workflow files are present in this repository. CI is defined through the Concourse/ytt pipeline in `ci/pipeline.yml`.
+CI is defined through both GitHub Actions in `.github/workflows/` and the Concourse/ytt pipeline in `ci/pipeline.yml`.
 
 The `blink-lnurl-server` pipeline group includes these test-related jobs:
 

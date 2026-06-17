@@ -22,6 +22,7 @@ services:
       LNURL_NETWORK: regtest
       LNURL_SCHEME: http
       LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      LNURL_WEBHOOK_DOMAIN: localhost:8080
     depends_on:
       postgres:
         condition: service_healthy

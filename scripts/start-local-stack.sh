@@ -10,6 +10,7 @@ BASE_URL="http://${BIND_ADDR}"
 POSTGRES_PORT="${LNURL_POSTGRES_PORT:-5432}"
 DB_URL="postgres://user:password@127.0.0.1:${POSTGRES_PORT}/lnurl"
 LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl-server}"
+WEBHOOK_DOMAIN="${LNURL_WEBHOOK_DOMAIN:-localhost:8080}"
 RESET_DB="${RESET_DB:-false}"
 BLINK_GRAPHQL_ARGS=()
 
@@ -100,6 +101,7 @@ LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --log-level "info" \
     --network "regtest" \
     --scheme "http" \
+    --webhook-domain "${WEBHOOK_DOMAIN}" \
     >"${LOG_FILE}" 2>&1 &
 
 server_pid=$!

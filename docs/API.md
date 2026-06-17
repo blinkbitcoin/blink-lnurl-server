@@ -1,4 +1,3 @@
-<!-- generated-by: gsd-doc-writer -->
 # API Reference
 
 This service exposes public LNURL-pay and Lightning Address endpoints, Spark-compatible account-management endpoints, Blink internal account endpoints, and payment webhook receivers.

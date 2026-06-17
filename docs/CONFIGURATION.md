@@ -1,4 +1,3 @@
-<!-- generated-by: gsd-doc-writer -->
 # Configuration
 
 Blink LNURL Server is configured from command-line arguments, a TOML config file, and environment variables prefixed with `LNURL_`. The implementation merges values in this order: parsed command-line/default values, then the TOML config file, then `LNURL_` environment variables. The `--config` argument selects the TOML file path before the file is loaded; the default path is `lnurl.conf`.
@@ -70,8 +69,6 @@ internal_jwt_issuer = "https://issuer.example.com/"
 internal_jwt_audience = "lnurl-server"
 ```
 
-<!-- VERIFY: production database hosts, LNURL domains, internal JWKS URLs, issuers, and audiences must match the target deployment -->
-
 ## Required vs optional settings
 
 Settings that can stop the server during startup:
@@ -124,8 +121,7 @@ LNURL_LOG_LEVEL=info
 LNURL_NETWORK=regtest
 LNURL_SCHEME=http
 LNURL_SSP_AUTH_SEED=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+LNURL_WEBHOOK_DOMAIN=localhost:8080
 ```
 
 For production, set platform secrets or environment variables for at least the database URL, allowed domains, scheme, webhook domain, Spark SSP seed, Blink GraphQL endpoint if overriding the default, and internal-auth JWT/JWKS values if `/internal/...` routes are used.
-
-<!-- VERIFY: production secret names and storage locations depend on the deployment platform and are not defined in this repository -->

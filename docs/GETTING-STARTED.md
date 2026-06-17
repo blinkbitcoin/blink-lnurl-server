@@ -1,4 +1,3 @@
-<!-- generated-by: gsd-doc-writer -->
 # Getting Started
 
 This guide gets a local Blink LNURL Server running with PostgreSQL and the Rust development toolchain.
@@ -44,7 +43,7 @@ This guide gets a local Blink LNURL Server running with PostgreSQL and the Rust 
 
 ## First run
 
-The direct host-run command below requires PostgreSQL to be reachable on `127.0.0.1:5432`; the checked-in `docker-compose.yml` does not publish the PostgreSQL port:
+The direct host-run command below requires PostgreSQL to be reachable on `127.0.0.1:5432`; the checked-in `docker-compose.override.yml` publishes `${LNURL_POSTGRES_PORT:-5432}:5432` by default:
 
 ```bash
 docker compose up -d postgres && \
@@ -71,7 +70,7 @@ Expected result: HTTP `200 OK` with an empty response body.
 ## Common setup issues
 
 - **Docker is not running or PostgreSQL is not ready.** `docker compose up -d postgres` starts the `postgres:17` service. If the server cannot connect to `postgres://user:password@127.0.0.1:5432/lnurl`, check `docker compose ps` and wait for the `postgres` health check to pass.
-- **Port `8080` is already in use, or PostgreSQL is not reachable.** Change `--address` for the server. The checked-in `docker-compose.yml` publishes only the server port `8080:8080`; it does not publish PostgreSQL on host port `5432`.
+- **Port `8080` is already in use, or PostgreSQL is not reachable.** Change `--address` for the server. If host port `5432` is already in use, set `LNURL_POSTGRES_PORT` before running Docker Compose and update the `--db-url` port to match.
 - **Startup fails with `LNURL_WEBHOOK_DOMAIN is required to create Blink invoice webhookUrl callbacks`.** Pass `--webhook-domain localhost:8080` or set `LNURL_WEBHOOK_DOMAIN=localhost:8080`. The server uses it to build Blink callbacks at `{scheme}://{webhook_domain}/webhook/blink`.
 - **Nix is unavailable.** Use the tool versions and packages listed in `flake.nix`, then run the same `make` and `cargo` commands without `nix develop`.
 
