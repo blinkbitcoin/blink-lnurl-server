@@ -210,7 +210,10 @@ identifier_spark_pubkey() {
 
   response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/destinationalias" "localhost:8080")"
   code="${response##*$'\n'}"
-  [ "$code" = "404" ]
+  body="${response%$'\n'*}"
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.status' 'ERROR'
+  assert_json_equals "$body" '.reason' "Couldn't find user 'destinationalias'."
 
   transfer_auth="$(auth_payload "transferreplace")"
   timestamp="$(json_get "$transfer_auth" '.timestamp')"
@@ -252,7 +255,10 @@ identifier_spark_pubkey() {
 
   response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/oldalias" "localhost:8080")"
   code="${response##*$'\n'}"
-  [ "$code" = "404" ]
+  body="${response%$'\n'*}"
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.status' 'ERROR'
+  assert_json_equals "$body" '.reason' "Couldn't find user 'oldalias'."
 
   run recover_user "newalias" "localhost:8080"
   [ "$status" -eq 0 ]

@@ -150,7 +150,7 @@ where
         let public_recipient =
             account::resolve_public_recipient(&state, &domain, public_identifier).await?;
         let Some(public_recipient) = public_recipient else {
-            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+            return Err(lnurl_error(&format!("Couldn't find user '{identifier}'.")));
         };
 
         let (allows_nostr, nostr_pubkey) = if let Some(nostr_keys) = state.nostr_keys.as_ref() {
@@ -1129,10 +1129,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_missing_and_invalid_phone_like_identifiers_keep_spark_not_found_shape_d_19()
+    async fn blink_public_discovery_missing_user_returns_lnurl_error_but_invalid_phone_like_identifier_keeps_not_found_shape_d_19()
      {
-        // D-19: missing/invalid Blink-looking public discovery must not leak
-        // Blink-specific provider, account, phone, or existence details.
+        // D-19: valid missing usernames now follow the LNURL error contract,
+        // while invalid phone-like identifiers still keep the generic not-found
+        // shape to avoid implying a valid account lookup target.
         let missing_repo = MockRepository::default();
         let missing_state = internal_route_test_state(missing_repo, None).await;
         let missing = LnurlServer::<MockRepository>::handle_lnurl_pay(
@@ -1143,10 +1144,16 @@ mod tests {
         .await;
 
         let Err((missing_status, Json(missing_body))) = missing else {
-            panic!("missing recipient should keep Spark-compatible not-found shape");
+            panic!("missing recipient should now return an LNURL error body");
         };
-        assert_eq!(missing_status, StatusCode::NOT_FOUND);
-        assert_eq!(missing_body, Value::String(String::new()));
+        assert_eq!(missing_status, StatusCode::OK);
+        assert_eq!(
+            missing_body,
+            json!({
+                "status": "ERROR",
+                "reason": "Couldn't find user 'alice'."
+            })
+        );
 
         let invalid_repo = MockRepository::default();
         let invalid_state = internal_route_test_state(invalid_repo.clone(), None).await;
