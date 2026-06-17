@@ -26,7 +26,7 @@ start:
 
 test-e2e:
 	cargo build --locked --bin lnurl-server --bin e2e_auth --bin blink_graphql_mock --bin e2e_zap_request
-	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} bats -t bats
+	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} bats --abort -t bats
 
 e2e: test-e2e
 

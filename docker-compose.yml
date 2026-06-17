@@ -19,7 +19,7 @@ services:
       LNURL_AUTO_MIGRATE: "true"
       LNURL_DB_URL: postgres://user:password@postgres:5432/lnurl
       LNURL_DOMAINS: localhost:8080,127.0.0.1:8080
-      LNURL_BLINK_GRAPHQL_ENDPOINT: ${LNURL_BLINK_GRAPHQL_ENDPOINT:?set to your local Blink GraphQL URL}
+      LNURL_BLINK_GRAPHQL_ENDPOINT: ${LNURL_BLINK_GRAPHQL_ENDPOINT:-}
       LNURL_LOG_LEVEL: info
       LNURL_SCHEME: http
       LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

@@ -11,6 +11,9 @@ BLINK_GRAPHQL_MOCK_PID_FILE="${STATE_DIR}/blink-graphql-mock.pid"
 BLINK_GRAPHQL_MOCK_LOG_FILE="${STATE_DIR}/blink-graphql-mock.log"
 
 start_stack() {
+  if [ -z "${LNURL_BLINK_GRAPHQL_ENDPOINT:-}" ]; then
+    start_blink_graphql_mock
+  fi
   LNURL_WEBHOOK_DOMAIN="${LNURL_WEBHOOK_DOMAIN:-localhost:8080}" RESET_DB=true "${ROOT_DIR}/scripts/start-local-stack.sh"
 }
 
@@ -79,6 +82,8 @@ stop_stack() {
     fi
     rm -f "${PID_FILE}"
   fi
+
+  stop_blink_graphql_mock
 }
 
 auth_payload() {
