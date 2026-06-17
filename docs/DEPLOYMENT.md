@@ -57,7 +57,7 @@ Minimum production-oriented settings usually include:
 
 | Variable | Purpose |
 |----------|---------|
-| `DEPLOYMENT_ENV` | Required provider selector. Use `production`, `staging`, or `local`; runtime derives Spark/LNURL and Blink settings from this one value. |
+| `DEPLOYMENT_ENV` | Provider selector. Use `production`, `staging`, or `local`; when unset or blank, runtime defaults to `production`. Runtime derives Spark/LNURL and Blink settings from this one value. |
 | `LNURL_ADDRESS` | Bind address for the HTTP server, for example `0.0.0.0:8080`. |
 | `LNURL_DB_URL` | PostgreSQL or SQLite connection string; PostgreSQL URLs start with `postgres`. |
 | `LNURL_DOMAINS` | Comma-separated Lightning Address / LNURL domains accepted by the server. |

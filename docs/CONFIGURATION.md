@@ -6,11 +6,11 @@ Blink LNURL Server is configured from command-line arguments, a TOML config file
 
 No `.env.example` or `.env.sample` file is present. The variables below are derived from the `Args` configuration struct in `src/main.rs` and the local Docker/Makefile setup.
 
-`DEPLOYMENT_ENV` is the required deployment selector for provider runtime wiring. Supported values are `production`, `staging`, and `local`.
+`DEPLOYMENT_ENV` is the deployment selector for provider runtime wiring. Supported values are `production`, `staging`, and `local`. When unset or blank, startup defaults to `production`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEPLOYMENT_ENV` | **Required at startup** | unset | Selects default runtime provider mapping: `production ->` Spark/LNURL `mainnet` + Blink production GraphQL, `staging ->` Spark/LNURL `regtest` + Blink signet behavior + staging GraphQL, `local ->` Spark/LNURL `regtest` + Blink local behavior through an explicit `LNURL_BLINK_GRAPHQL_ENDPOINT`. Spark staging intentionally stays on `regtest` for now. |
+| `DEPLOYMENT_ENV` | Optional | `production` when unset or blank | Selects default runtime provider mapping: `production ->` Spark/LNURL `mainnet` + Blink production GraphQL, `staging ->` Spark/LNURL `regtest` + Blink signet behavior + staging GraphQL, `local ->` Spark/LNURL `regtest` + Blink local behavior through an explicit `LNURL_BLINK_GRAPHQL_ENDPOINT`. Spark staging intentionally stays on `regtest` for now. |
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -74,7 +74,7 @@ internal_jwt_issuer = "https://issuer.example.com/"
 internal_jwt_audience = "lnurl-server"
 ```
 
-Run that config with `DEPLOYMENT_ENV=production`.
+Run that config as-is to use the default `production` mapping, or set `DEPLOYMENT_ENV=production` explicitly.
 
 ## Required vs optional settings
 
@@ -82,7 +82,7 @@ Settings that can stop the server during startup:
 
 - **`webhook_domain` / `LNURL_WEBHOOK_DOMAIN`**: startup returns `LNURL_WEBHOOK_DOMAIN is required to create Blink invoice webhookUrl callbacks` when this is unset.
 - **`db_url` / `LNURL_DB_URL`**: an invalid or unreachable database URL causes pool creation to fail. Use PostgreSQL URLs beginning with `postgres` for PostgreSQL; any other connection string is treated as SQLite.
-- **`DEPLOYMENT_ENV`**: startup fails closed unless the value is exactly `production`, `staging`, or `local`.
+- **`DEPLOYMENT_ENV`**: when set, the value must be exactly `production`, `staging`, or `local`; unset or blank falls back to `production`.
 - **`address` / `LNURL_ADDRESS`**: the configured socket must be valid and bindable.
 - **`ca_cert` / `LNURL_CA_CERT`**: if set, the value must be base64-encoded DER; invalid values fail startup.
 - **`crl_url` / `LNURL_CRL_URL`**: if set, the server fetches it during startup; fetch or response-read failures fail startup.
