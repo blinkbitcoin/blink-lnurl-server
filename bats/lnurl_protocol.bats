@@ -194,18 +194,24 @@ latest_invoice_provider_account_for_spark_pubkey() {
   done
 }
 
-@test "lnurl: phone-like public identifiers do not fall back to numeric legacy usernames" {
+@test "lnurl: valid phone-like identifiers return LNURL error while invalid ones do not fall back to numeric legacy usernames" {
   insert_legacy_user "573005871212" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000001" "Numeric legacy wallet"
   insert_legacy_user "12345" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000002" "Invalid phone legacy wallet"
 
-  for phone_like in "573005871212" "12345"; do
-    response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/${phone_like}" "localhost:8080")"
-    code="${response##*$'\n'}"
-    body="${response%$'\n'*}"
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/573005871212" "localhost:8080")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
 
-    [ "$code" = "404" ]
-    [ "$body" = '""' ]
-  done
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.status' 'ERROR'
+  assert_json_equals "$body" '.reason' "Couldn't find user '573005871212'."
+
+  response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/12345" "localhost:8080")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "404" ]
+  [ "$body" = '""' ]
 }
 
 @test "lnurl: legacy non-modifier Spark names still resolve but plus legacy names do not" {
@@ -266,13 +272,14 @@ latest_invoice_provider_account_for_spark_pubkey() {
   assert_json_absent_or_not_contains "$output" '.pr' 'ln'
 }
 
-@test "lnurl: unknown user returns 404" {
+@test "lnurl: unknown user returns LNURL error" {
   response="$(http_status_body "GET" "${BASE_URL}/.well-known/lnurlp/missing" "localhost:8080")"
   code="${response##*$'\n'}"
   body="${response%$'\n'*}"
 
-  [ "$code" = "404" ]
-  [ "$body" = '""' ]
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.status' 'ERROR'
+  assert_json_equals "$body" '.reason' "Couldn't find user 'missing'."
 }
 
 @test "lnurl: disallowed domain returns 404" {
