@@ -267,14 +267,10 @@ fn resolve_runtime_config(
     configured_spark_network: Option<spark_client::Network>,
     configured_blink_graphql_endpoint: Option<&str>,
 ) -> Result<RuntimeConfig, anyhow::Error> {
-    let Some(deployment_env) = deployment_env
+    let deployment_env = deployment_env
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return Err(anyhow!(
-            "DEPLOYMENT_ENV is required and must be one of: production, staging, local"
-        ));
-    };
+        .unwrap_or("production");
     let configured_blink_graphql_endpoint = configured_blink_graphql_endpoint
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -737,9 +733,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_config_defaults_to_production() {
+        for deployment_env in [None, Some(""), Some("   "), Some("\t")] {
+            let runtime_config = resolve_runtime_config(deployment_env, None, None)
+                .expect("missing deployment env should default to production");
+
+            assert_eq!(runtime_config.spark_network, spark_client::Network::Mainnet);
+            assert_eq!(runtime_config.blink_network, "mainnet");
+            assert_eq!(
+                runtime_config.blink_graphql_endpoint,
+                blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+            );
+        }
+    }
+
+    #[test]
     fn resolve_runtime_config_error_cases() {
         for (deployment_env, configured_blink_graphql_endpoint, expected_error) in [
-            (None, None, "DEPLOYMENT_ENV is required"),
             (Some("qa"), None, "unsupported DEPLOYMENT_ENV 'qa'"),
             (
                 Some("local"),
