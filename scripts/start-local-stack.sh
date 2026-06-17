@@ -92,6 +92,7 @@ if [ -n "${LNURL_BLINK_GRAPHQL_ENDPOINT:-}" ]; then
 fi
 
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+  DEPLOYMENT_ENV="${DEPLOYMENT_ENV:-local}" \
   "${LNURL_BIN}" \
     --address "${BIND_ADDR}" \
     --auto-migrate \
@@ -99,7 +100,6 @@ LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --domains "localhost:8080,127.0.0.1:8080" \
     "${BLINK_GRAPHQL_ARGS[@]}" \
     --log-level "info" \
-    --network "regtest" \
     --scheme "http" \
     --webhook-domain "${WEBHOOK_DOMAIN}" \
     >"${LOG_FILE}" 2>&1 &

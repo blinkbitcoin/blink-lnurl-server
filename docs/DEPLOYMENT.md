@@ -57,18 +57,26 @@ Minimum production-oriented settings usually include:
 
 | Variable | Purpose |
 |----------|---------|
+| `DEPLOYMENT_ENV` | Required provider selector. Use `production`, `staging`, or `local`; runtime derives Spark/LNURL and Blink settings from this one value. |
 | `LNURL_ADDRESS` | Bind address for the HTTP server, for example `0.0.0.0:8080`. |
 | `LNURL_DB_URL` | PostgreSQL or SQLite connection string; PostgreSQL URLs start with `postgres`. |
 | `LNURL_DOMAINS` | Comma-separated Lightning Address / LNURL domains accepted by the server. |
-| `LNURL_NETWORK` | Spark network, such as `mainnet`, `testnet`, or `regtest`. |
 | `LNURL_SCHEME` | URL scheme used in generated callback and webhook URLs, normally `https` in production. |
 | `LNURL_WEBHOOK_DOMAIN` | Domain used to build provider callback URLs for `/webhook` and `/webhook/blink`; startup fails without this value. |
 | `LNURL_SSP_AUTH_SEED` | Stable hex-encoded 32-byte Spark SSP authentication seed. |
-| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Blink GraphQL endpoint; defaults to `https://api.blink.sv/graphql`. |
+| `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional local/test override for Blink GraphQL. Production and staging are pinned by `DEPLOYMENT_ENV`; local can point this at a mock or local endpoint. |
 | `LNURL_INTERNAL_JWKS_URL` or `LNURL_INTERNAL_JWKS_PATH` | JWKS source for internal Blink Core JWT authentication, when `/internal/...` routes are used. |
 | `LNURL_INTERNAL_JWT_ISSUER` and `LNURL_INTERNAL_JWT_AUDIENCE` | Expected issuer and audience for internal RS256 JWTs. |
 
 For managed deployments, set secrets in the deployment platform rather than committing them to the repository.
+
+Provider mapping is fixed as:
+
+- `production` → Spark/LNURL `mainnet`, Blink production GraphQL.
+- `staging` → Spark/LNURL `regtest`, Blink signet behavior with `https://api.staging.blink.sv/graphql`.
+- `local` → Spark/LNURL `regtest`, Blink local behavior through the existing `LNURL_BLINK_GRAPHQL_ENDPOINT` override path.
+
+Spark staging stays explicitly mapped to `regtest` for now so the later Spark `regtest -> signet` switch is localized to one startup match arm.
 
 Database migrations are embedded for both PostgreSQL and SQLite. Set `LNURL_AUTO_MIGRATE=true` only when the instance should apply migrations during startup; otherwise run migrations through the release/deployment process before starting new instances.
 

@@ -88,10 +88,18 @@ nix develop -c make start
 The local stack uses:
 
 - Postgres 17 from `docker-compose.yml`.
+- `DEPLOYMENT_ENV=local`.
 - `LNURL_DB_URL=postgres://user:password@127.0.0.1:5432/lnurl`.
 - `LNURL_DOMAINS=localhost:8080,127.0.0.1:8080`.
-- `LNURL_NETWORK=regtest`.
 - `LNURL_SCHEME=http`.
+
+`DEPLOYMENT_ENV` drives provider runtime selection:
+
+- `production` → Spark/LNURL `mainnet`, Blink production GraphQL.
+- `staging` → Spark/LNURL `regtest`, Blink signet behavior with `https://api.staging.blink.sv/graphql`.
+- `local` → Spark/LNURL `regtest`, Blink local behavior through the configured `LNURL_BLINK_GRAPHQL_ENDPOINT` override path.
+
+Spark staging stays explicitly pinned to `regtest` for now so the later Spark `regtest -> signet` switch is a one-line startup mapping change.
 
 For Blink invoice callbacks during local runs, `scripts/start-local-stack.sh` defaults the webhook domain to `localhost:8080` so Blink invoices receive `http://localhost:8080/webhook/blink` callbacks. Override it with `LNURL_WEBHOOK_DOMAIN` when using a different local host or public tunnel.
 
@@ -113,6 +121,7 @@ Run the source-built image:
 
 ```shell
 docker run --rm -p 8080:8080 \
+  -e DEPLOYMENT_ENV="production" \
   -e LNURL_ADDRESS="0.0.0.0:8080" \
   -e LNURL_AUTO_MIGRATE="true" \
   -e LNURL_DB_URL="postgres://user:password@postgres_host:5432/lnurl" \
@@ -151,9 +160,10 @@ domains = "yourdomain.com"
 log_level = "info"
 max_sendable = 4000000000
 min_sendable = 1000
-network = "mainnet"
 scheme = "https"
 ```
+
+Set `DEPLOYMENT_ENV` in the process environment because runtime provider selection now comes from `production`, `staging`, or `local`.
 
 Important options:
 
@@ -164,12 +174,13 @@ Important options:
 | `--db-url` | PostgreSQL or SQLite connection string | `""` |
 | `--domains` | Comma-separated allowed domains | `localhost:8080` |
 | `--log-level` | `RUST_LOG` style filter | `info` |
-| `--network` | Spark network: `mainnet`, `testnet`, or `regtest` | `mainnet` |
 | `--scheme` | Scheme used in generated LNURL callback URLs | `https` |
 | `--min-sendable` | Minimum payment amount in millisatoshi | `1000` |
 | `--max-sendable` | Maximum payment amount in millisatoshi | `4000000000` |
 | `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
+
+`DEPLOYMENT_ENV` is required at startup and accepts only `production`, `staging`, or `local`. `LNURL_NETWORK` is now legacy compatibility config; runtime provider selection comes from `DEPLOYMENT_ENV`. `LNURL_BLINK_GRAPHQL_ENDPOINT` remains useful for local/test overrides.
 
 `LNURL_WEBHOOK_DOMAIN` is required when running the server with Blink invoice support. Blink invoice creation passes a callback URL of `{LNURL_SCHEME}://{LNURL_WEBHOOK_DOMAIN}/webhook/blink` to Blink GraphQL for both BTC and USD invoices. The Blink callback route accepts flat provider payloads at public `POST /webhook/blink`; it is separate from the Spark SSP webhook at `POST /webhook`.
 
@@ -225,11 +236,11 @@ services:
   lnurl-server:
     build: .
     environment:
+      DEPLOYMENT_ENV: "local"
       LNURL_ADDRESS: "0.0.0.0:8080"
       LNURL_AUTO_MIGRATE: "true"
       LNURL_DB_URL: "postgres://user:password@postgres:5432/lnurl"
       LNURL_DOMAINS: "localhost:8080,127.0.0.1:8080"
-      LNURL_NETWORK: "regtest"
       LNURL_SCHEME: "http"
       LNURL_WEBHOOK_DOMAIN: "localhost:8080"
     ports:
