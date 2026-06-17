@@ -184,7 +184,7 @@ Important options:
 | `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
 
-`DEPLOYMENT_ENV` is required at startup and accepts only `production`, `staging`, or `local`. It sets the default provider wiring. `LNURL_SPARK_NETWORK` and `LNURL_BLINK_GRAPHQL_ENDPOINT` are optional explicit overrides. `LNURL_NETWORK` remains accepted as a legacy alias for the Spark override.
+`DEPLOYMENT_ENV` is required at startup and accepts only `production`, `staging`, or `local`. It sets the default provider wiring. `LNURL_SPARK_NETWORK` and `LNURL_BLINK_GRAPHQL_ENDPOINT` are optional explicit overrides.
 
 `LNURL_WEBHOOK_DOMAIN` is required when running the server with Blink invoice support. Blink invoice creation passes a callback URL of `{LNURL_SCHEME}://{LNURL_WEBHOOK_DOMAIN}/webhook/blink` to Blink GraphQL for both BTC and USD invoices. The Blink callback route accepts flat provider payloads at public `POST /webhook/blink`; it is separate from the Spark SSP webhook at `POST /webhook`.
 

@@ -29,7 +29,6 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 const DEPLOYMENT_ENV_PRODUCTION: &str = "production";
 const DEPLOYMENT_ENV_STAGING: &str = "staging";
 const DEPLOYMENT_ENV_LOCAL: &str = "local";
-const SUPPORTED_DEPLOYMENT_ENVS: &str = "production, staging, local";
 const STAGING_SPARK_NETWORK: spark_client::Network = spark_client::Network::Regtest;
 
 mod auth;
@@ -75,8 +74,7 @@ struct Args {
     pub log_level: String,
 
     /// Optional Spark network override.
-    #[arg(long, visible_alias = "network")]
-    #[serde(alias = "network")]
+    #[arg(long)]
     pub spark_network: Option<spark_client::Network>,
 
     /// Scheme prefix for lnurl urls.
@@ -269,7 +267,7 @@ fn resolve_runtime_config(
         .filter(|value| !value.is_empty())
     else {
         return Err(anyhow!(
-            "DEPLOYMENT_ENV is required and must be one of: {SUPPORTED_DEPLOYMENT_ENVS}"
+            "DEPLOYMENT_ENV is required and must be one of: production, staging, local"
         ));
     };
 
@@ -298,7 +296,7 @@ fn resolve_runtime_config(
         },
         unsupported => {
             return Err(anyhow!(
-                "unsupported DEPLOYMENT_ENV '{unsupported}'; expected one of: {SUPPORTED_DEPLOYMENT_ENVS}"
+                "unsupported DEPLOYMENT_ENV '{unsupported}'; expected one of: production, staging, local"
             ));
         }
     };

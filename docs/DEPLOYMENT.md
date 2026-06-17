@@ -79,7 +79,7 @@ Provider mapping is fixed as:
 
 Spark staging stays explicitly mapped to `regtest` for now so the later Spark `regtest -> signet` switch is localized to one startup match arm.
 
-If a deployment needs to diverge from those defaults, set `LNURL_SPARK_NETWORK` and/or `LNURL_BLINK_GRAPHQL_ENDPOINT` explicitly. `LNURL_NETWORK` remains a legacy alias for the Spark override.
+If a deployment needs to diverge from those defaults, set `LNURL_SPARK_NETWORK` and/or `LNURL_BLINK_GRAPHQL_ENDPOINT` explicitly.
 
 Database migrations are embedded for both PostgreSQL and SQLite. Set `LNURL_AUTO_MIGRATE=true` only when the instance should apply migrations during startup; otherwise run migrations through the release/deployment process before starting new instances.
 

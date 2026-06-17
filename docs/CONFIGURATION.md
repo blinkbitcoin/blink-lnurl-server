@@ -30,7 +30,6 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_SSP_AUTH_SEED` | Optional | random seed | Hex-encoded 32-byte seed used for Spark SSP authentication. Invalid or wrong-length values log an error and fall back to a random seed. |
 | `LNURL_WEBHOOK_DELIVERY_TTL_DAYS` | Optional | `90` | Number of days to retain webhook delivery rows before cleanup. |
 | `LNURL_BLINK_GRAPHQL_ENDPOINT` | Optional in `production`/`staging`, required in `local` | unset | Explicit Blink GraphQL endpoint override. When unset, startup uses the `DEPLOYMENT_ENV` default endpoint for production/staging and fails closed for `local`. |
-| `LNURL_NETWORK` | Legacy alias | unset | Legacy alias for `LNURL_SPARK_NETWORK`. |
 | `LNURL_INTERNAL_JWKS_URL` | Optional | unset | URL to fetch Blink Core internal-auth JWKS from at startup. |
 | `LNURL_INTERNAL_JWKS_PATH` | Optional | unset | Local path to read Blink Core internal-auth JWKS from at startup. Takes precedence over `LNURL_INTERNAL_JWKS_URL`. |
 | `LNURL_INTERNAL_JWT_ISSUER` | Optional | unset | Expected issuer for RS256 internal-auth JWTs. Required, with an audience and JWKS source, for `/internal/...` routes to authorize requests. |
