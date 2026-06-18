@@ -683,6 +683,10 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
             error!("unsupported provider for public LNURL invoice: {provider:?}");
             lnurl_error("internal server error")
         }
+        ProviderError::ProviderDisabled(provider) => {
+            trace!("provider disabled for public LNURL invoice: {provider}");
+            lnurl_error("provider disabled")
+        }
         ProviderError::MissingSparkPubkey
         | ProviderError::InvalidSparkPubkey
         | ProviderError::MissingBlinkDefaultWallet

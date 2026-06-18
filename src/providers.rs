@@ -44,6 +44,8 @@ pub struct ProviderPaymentStatus {
 pub enum ProviderError {
     #[error("unsupported provider: {0:?}")]
     UnsupportedProvider(AccountProvider),
+    #[error("provider disabled: {0}")]
+    ProviderDisabled(&'static str),
     #[error("unsupported wallet {wallet:?} for provider {provider:?}")]
     UnsupportedWallet {
         provider: AccountProvider,
@@ -256,6 +258,8 @@ impl BlinkProvider {
 pub struct ProviderRegistry {
     spark: Arc<SparkProvider>,
     blink: Arc<BlinkProvider>,
+    spark_enabled: bool,
+    blink_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -366,12 +370,46 @@ impl ProviderRegistry {
         blink_client: blink_client::Client,
         blink_webhook_url: impl Into<String>,
     ) -> Self {
+        Self::new_with_blink_webhook_url_and_provider_flags(
+            spark_client,
+            blink_client,
+            blink_webhook_url,
+            true,
+            true,
+        )
+    }
+
+    pub fn new_with_blink_webhook_url_and_provider_flags(
+        spark_client: spark_client::Client,
+        blink_client: blink_client::Client,
+        blink_webhook_url: impl Into<String>,
+        spark_enabled: bool,
+        blink_enabled: bool,
+    ) -> Self {
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
                 blink_client,
                 blink_webhook_url,
             )),
+            spark_enabled,
+            blink_enabled,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(
+        blink_graphql_endpoint: impl Into<String>,
+        spark_enabled: bool,
+        blink_enabled: bool,
+    ) -> Self {
+        Self {
+            spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
+            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
+                blink_client::ClientConfig::new(blink_graphql_endpoint.into()),
+            ))),
+            spark_enabled,
+            blink_enabled,
         }
     }
 
@@ -380,8 +418,14 @@ impl ProviderRegistry {
         request: CreateInvoiceRequest<'_>,
     ) -> Result<ProviderInvoice, ProviderError> {
         match request.recipient.provider {
-            AccountProvider::Spark => self.spark.create_invoice(request).await,
-            AccountProvider::Blink => self.blink.create_invoice(request).await,
+            AccountProvider::Spark if self.spark_enabled => {
+                self.spark.create_invoice(request).await
+            }
+            AccountProvider::Spark => Err(ProviderError::ProviderDisabled("Spark")),
+            AccountProvider::Blink if self.blink_enabled => {
+                self.blink.create_invoice(request).await
+            }
+            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
         }
     }
 
@@ -391,8 +435,14 @@ impl ProviderRegistry {
         request: PaymentStatusRequest<'_>,
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
-            AccountProvider::Spark => self.spark.payment_status(request).await,
-            AccountProvider::Blink => self.blink.payment_status(request).await,
+            AccountProvider::Spark if self.spark_enabled => {
+                self.spark.payment_status(request).await
+            }
+            AccountProvider::Spark => Err(ProviderError::ProviderDisabled("Spark")),
+            AccountProvider::Blink if self.blink_enabled => {
+                self.blink.payment_status(request).await
+            }
+            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
         }
     }
 }
@@ -607,6 +657,92 @@ mod tests {
         wallet: Option<WalletKind>,
     ) -> CreateInvoiceRequest<'_> {
         blink_invoice_request_with_expiry(recipient, wallet, None)
+    }
+
+    #[tokio::test]
+    async fn provider_registry_rejects_disabled_spark_before_dispatch() {
+        let registry = ProviderRegistry::for_tests("http://127.0.0.1/graphql", false, true);
+        let recipient = recipient(AccountProvider::Spark, None);
+
+        let err = registry
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &recipient,
+                wallet: None,
+                amount_sat: 1,
+                description_hash: [0; 32],
+                expiry: None,
+                include_spark_address: false,
+            })
+            .await
+            .expect_err("disabled Spark should reject before Spark provider dispatch");
+
+        assert!(matches!(err, ProviderError::ProviderDisabled("Spark")));
+    }
+
+    #[tokio::test]
+    async fn provider_registry_rejects_disabled_blink_before_dispatch() {
+        let registry = ProviderRegistry::for_tests("http://127.0.0.1/graphql", true, false);
+        let recipient = blink_recipient(Some(WalletKind::Btc));
+
+        let invoice_err = registry
+            .create_invoice(blink_invoice_request(&recipient, None))
+            .await
+            .expect_err("disabled Blink should reject invoice creation before client calls");
+        assert!(matches!(
+            invoice_err,
+            ProviderError::ProviderDisabled("Blink")
+        ));
+
+        let status_err = registry
+            .payment_status(
+                AccountProvider::Blink,
+                PaymentStatusRequest {
+                    payment_hash: "payment_hash",
+                },
+            )
+            .await
+            .expect_err("disabled Blink should reject payment-status before client calls");
+        assert!(matches!(
+            status_err,
+            ProviderError::ProviderDisabled("Blink")
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_registry_enabled_providers_keep_existing_dispatch() {
+        let registry = ProviderRegistry::for_tests("http://127.0.0.1/graphql", true, true);
+        let recipient = recipient(AccountProvider::Spark, None);
+
+        let err = registry
+            .payment_status(
+                AccountProvider::Spark,
+                PaymentStatusRequest {
+                    payment_hash: "payment_hash",
+                },
+            )
+            .await
+            .expect_err("enabled Spark should reach existing Spark payment-status behavior");
+
+        assert!(
+            err.to_string()
+                .contains("DEF-03-SPARK-PAYMENT-STATUS-PHASE-7")
+        );
+
+        let invoice_err = registry
+            .create_invoice(CreateInvoiceRequest {
+                recipient: &recipient,
+                wallet: Some(WalletKind::Usd),
+                amount_sat: 1,
+                description_hash: [0; 32],
+                expiry: None,
+                include_spark_address: false,
+            })
+            .await
+            .expect_err("enabled Spark should reach existing Spark wallet gate");
+        assert!(matches!(
+            invoice_err,
+            ProviderError::UnsupportedWallet { .. }
+        ));
     }
 
     #[tokio::test]
