@@ -660,19 +660,81 @@ fn register_webhook(spark_client: spark_client::Client, webhook_url: String, sec
 mod tests {
     use super::*;
 
+    fn default_args() -> Args {
+        Args::parse_from(["lnurl-server"])
+    }
+
+    struct ProviderToggleEnvGuard;
+
+    impl ProviderToggleEnvGuard {
+        fn set_false() -> Self {
+            unsafe {
+                std::env::set_var("LNURL_SPARK_ENABLED", "false");
+                std::env::set_var("LNURL_BLINK_ENABLED", "false");
+            }
+
+            Self
+        }
+    }
+
+    impl Drop for ProviderToggleEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("LNURL_SPARK_ENABLED");
+                std::env::remove_var("LNURL_BLINK_ENABLED");
+            }
+        }
+    }
+
     #[test]
     fn cli_blink_graphql_endpoint_override_is_optional() {
-        let args = Args::parse_from(["lnurl-server"]);
+        let args = default_args();
 
         assert_eq!(args.blink_graphql_endpoint, None);
     }
 
     #[test]
     fn cli_provider_toggles_default_to_enabled() {
-        let args = Args::parse_from(["lnurl-server"]);
+        let args = default_args();
 
         assert!(args.spark_enabled);
         assert!(args.blink_enabled);
+    }
+
+    #[test]
+    fn config_file_provider_toggles_parse_false() {
+        let args = default_args();
+
+        let args: Args = Figment::new()
+            .merge(Serialized::defaults(args))
+            .merge(Toml::string(
+                r#"
+                spark_enabled = false
+                blink_enabled = false
+                "#,
+            ))
+            .extract()
+            .expect("TOML provider toggles should parse");
+
+        assert!(!args.spark_enabled);
+        assert!(!args.blink_enabled);
+    }
+
+    #[test]
+    fn env_provider_toggles_parse_false() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let args = default_args();
+        let _provider_toggle_env = ProviderToggleEnvGuard::set_false();
+
+        let args: Args = Figment::new()
+            .merge(Serialized::defaults(args))
+            .merge(Env::prefixed("LNURL_"))
+            .extract()
+            .expect("env provider toggles should parse");
+
+        assert!(!args.spark_enabled);
+        assert!(!args.blink_enabled);
     }
 
     #[test]

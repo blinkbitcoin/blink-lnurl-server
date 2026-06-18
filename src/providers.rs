@@ -374,6 +374,10 @@ impl ProviderRegistry {
         spark_enabled: bool,
         blink_enabled: bool,
     ) -> Self {
+        assert!(
+            !blink_enabled || blink_webhook_url.is_some(),
+            "Blink provider requires a webhook URL when enabled"
+        );
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
@@ -423,14 +427,8 @@ impl ProviderRegistry {
         request: PaymentStatusRequest<'_>,
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
-            AccountProvider::Spark if self.spark_enabled => {
-                self.spark.payment_status(request).await
-            }
-            AccountProvider::Spark => Err(ProviderError::ProviderDisabled("Spark")),
-            AccountProvider::Blink if self.blink_enabled => {
-                self.blink.payment_status(request).await
-            }
-            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
+            AccountProvider::Spark => self.spark.payment_status(request).await,
+            AccountProvider::Blink => self.blink.payment_status(request).await,
         }
     }
 }
@@ -668,8 +666,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_registry_rejects_disabled_blink_before_dispatch() {
-        let registry = ProviderRegistry::for_tests("http://127.0.0.1/graphql", true, false);
+    async fn provider_registry_rejects_disabled_blink_invoice_creation_but_keeps_status_fallback() {
+        let endpoint = start_blink_status_mock_server().await;
+        let registry = ProviderRegistry::for_tests(endpoint, true, false);
         let recipient = blink_recipient(Some(WalletKind::Btc));
 
         let invoice_err = registry
@@ -681,7 +680,7 @@ mod tests {
             ProviderError::ProviderDisabled("Blink")
         ));
 
-        let status_err = registry
+        let status = registry
             .payment_status(
                 AccountProvider::Blink,
                 PaymentStatusRequest {
@@ -689,11 +688,31 @@ mod tests {
                 },
             )
             .await
-            .expect_err("disabled Blink should reject payment-status before client calls");
-        assert!(matches!(
-            status_err,
-            ProviderError::ProviderDisabled("Blink")
+            .expect("disabled Blink should still allow status reconciliation");
+        assert!(status.settled);
+        assert!(!status.expired);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Blink provider requires a webhook URL when enabled")]
+    async fn provider_registry_requires_webhook_url_when_blink_enabled() {
+        let network = spark_client::Network::Regtest;
+        let auth_seed = [7_u8; 32];
+        let spark_client =
+            spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
+                .await
+                .unwrap();
+        let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
+            "http://127.0.0.1/graphql".to_string(),
         ));
+
+        let _ = ProviderRegistry::new_with_blink_webhook_url(
+            spark_client,
+            blink_client,
+            None,
+            true,
+            true,
+        );
     }
 
     #[tokio::test]

@@ -421,6 +421,31 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use serde_json::{Value, json};
+
+    fn blink_webhook_payload_without_preimage(status: &str, payment_hash: &str) -> Value {
+        let mut payload = blink_webhook_payload(status, payment_hash);
+        payload
+            .as_object_mut()
+            .expect("Blink webhook payload should be a JSON object")
+            .remove("paymentPreimage");
+        payload
+    }
+
+    async fn blink_creation_disabled_state(
+        repo: MockRepository,
+        internal_auth: Option<std::sync::Arc<crate::internal_auth::InternalAuthState>>,
+        blink_endpoint: &str,
+    ) -> State<MockRepository> {
+        internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo,
+            internal_auth,
+            blink_endpoint,
+            true,
+            false,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn blink_webhook_paid_supplied_preimage_uses_central_side_effects() {
         let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
@@ -483,8 +508,7 @@ mod tests {
         )
         .await;
         let app = blink_webhook_app_with_state(state);
-        let mut payload = blink_webhook_payload("PAID", &payment_hash);
-        payload.as_object_mut().unwrap().remove("paymentPreimage");
+        let payload = blink_webhook_payload_without_preimage("PAID", &payment_hash);
 
         let (status, body) = post_blink_webhook(app, payload).await;
 
@@ -523,8 +547,7 @@ mod tests {
         )
         .await;
         let app = blink_webhook_app_with_state(state);
-        let mut payload = blink_webhook_payload("PAID", &payment_hash);
-        payload.as_object_mut().unwrap().remove("paymentPreimage");
+        let payload = blink_webhook_payload_without_preimage("PAID", &payment_hash);
 
         let (status, body) = post_blink_webhook(app, payload).await;
 
@@ -544,6 +567,40 @@ mod tests {
                 .contains_key(&payment_hash)
         );
         assert_eq!(repo.webhook_deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blink_webhook_paid_status_fallback_still_works_when_blink_creation_disabled() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) =
+            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
+                .await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkdisabledwebhookfallback",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state =
+            blink_creation_disabled_state(repo.clone(), Some(internal_auth_state()), &endpoint)
+                .await;
+        let app = blink_webhook_app_with_state(state);
+        let payload = blink_webhook_payload_without_preimage("PAID", &payment_hash);
+
+        let (status, body) = post_blink_webhook(app, payload).await;
+
+        assert!(status.is_success());
+        assert_eq!(body, Value::Null);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
     }
 
     #[tokio::test]
@@ -750,8 +807,38 @@ mod tests {
         let state =
             internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
         let app = blink_webhook_app_with_state(state);
-        let mut payload = blink_webhook_payload("EXPIRED", &payment_hash);
-        payload.as_object_mut().unwrap().remove("paymentPreimage");
+        let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
+
+        let (status, body) = post_blink_webhook(app, payload).await;
+
+        assert!(status.is_success());
+        assert_eq!(body, Value::Null);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert!(invoice.expired_at.is_some());
+        assert!(invoice.preimage.is_none());
+    }
+
+    #[tokio::test]
+    async fn blink_webhook_expired_status_fallback_still_works_when_blink_creation_disabled() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let (endpoint, calls, _) = start_blink_status_mock_server("EXPIRED", None, false).await;
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkdisabledexpired",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = blink_creation_disabled_state(repo.clone(), None, &endpoint).await;
+        let app = blink_webhook_app_with_state(state);
+        let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
 
         let (status, body) = post_blink_webhook(app, payload).await;
 
@@ -783,8 +870,7 @@ mod tests {
         let state =
             internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
         let app = blink_webhook_app_with_state(state);
-        let mut payload = blink_webhook_payload("EXPIRED", &payment_hash);
-        payload.as_object_mut().unwrap().remove("paymentPreimage");
+        let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
 
         let (status, body) = post_blink_webhook(app, payload).await;
 
