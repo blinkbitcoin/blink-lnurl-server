@@ -350,7 +350,7 @@ where
         .await
     {
         Ok(status) => status,
-        Err(ProviderError::ProviderDisabled("Blink")) => return Ok(None),
+        Err(ProviderError::ProviderDisabled(AccountProvider::Blink)) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
 
@@ -397,7 +397,7 @@ where
         .await
     {
         Ok(status) => status,
-        Err(ProviderError::ProviderDisabled("Blink")) => return Ok(()),
+        Err(ProviderError::ProviderDisabled(AccountProvider::Blink)) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
 

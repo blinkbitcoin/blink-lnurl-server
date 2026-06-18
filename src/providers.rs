@@ -44,8 +44,8 @@ pub struct ProviderPaymentStatus {
 pub enum ProviderError {
     #[error("unsupported provider: {0:?}")]
     UnsupportedProvider(AccountProvider),
-    #[error("provider disabled: {0}")]
-    ProviderDisabled(&'static str),
+    #[error("provider disabled: {0:?}")]
+    ProviderDisabled(AccountProvider),
     #[error("unsupported wallet {wallet:?} for provider {provider:?}")]
     UnsupportedWallet {
         provider: AccountProvider,
@@ -420,11 +420,11 @@ impl ProviderRegistry {
             AccountProvider::Spark if self.spark_enabled => {
                 self.spark.create_invoice(request).await
             }
-            AccountProvider::Spark => Err(ProviderError::ProviderDisabled("Spark")),
+            AccountProvider::Spark => Err(ProviderError::ProviderDisabled(AccountProvider::Spark)),
             AccountProvider::Blink if self.blink_enabled => {
                 self.blink.create_invoice(request).await
             }
-            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
+            AccountProvider::Blink => Err(ProviderError::ProviderDisabled(AccountProvider::Blink)),
         }
     }
 
@@ -438,7 +438,7 @@ impl ProviderRegistry {
             AccountProvider::Blink if self.blink_status_enabled => {
                 self.blink.payment_status(request).await
             }
-            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
+            AccountProvider::Blink => Err(ProviderError::ProviderDisabled(AccountProvider::Blink)),
         }
     }
 }
@@ -672,7 +672,10 @@ mod tests {
             .await
             .expect_err("disabled Spark should reject before Spark provider dispatch");
 
-        assert!(matches!(err, ProviderError::ProviderDisabled("Spark")));
+        assert!(matches!(
+            err,
+            ProviderError::ProviderDisabled(AccountProvider::Spark)
+        ));
     }
 
     #[tokio::test]
@@ -687,7 +690,7 @@ mod tests {
             .expect_err("disabled Blink should reject invoice creation before client calls");
         assert!(matches!(
             invoice_err,
-            ProviderError::ProviderDisabled("Blink")
+            ProviderError::ProviderDisabled(AccountProvider::Blink)
         ));
 
         let status = registry
@@ -717,7 +720,10 @@ mod tests {
             .await
             .expect_err("missing Blink endpoint should disable status fallback");
 
-        assert!(matches!(err, ProviderError::ProviderDisabled("Blink")));
+        assert!(matches!(
+            err,
+            ProviderError::ProviderDisabled(AccountProvider::Blink)
+        ));
     }
 
     #[tokio::test]

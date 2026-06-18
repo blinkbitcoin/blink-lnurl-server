@@ -710,10 +710,10 @@ mod tests {
         let args: Args = Figment::new()
             .merge(Serialized::defaults(args))
             .merge(Toml::string(
-                r#"
+                r"
                 spark_enabled = false
                 blink_enabled = false
-                "#,
+                ",
             ))
             .extract()
             .expect("TOML provider toggles should parse");

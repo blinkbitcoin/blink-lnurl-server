@@ -684,7 +684,7 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
             lnurl_error("internal server error")
         }
         ProviderError::ProviderDisabled(provider) => {
-            trace!("provider disabled for public LNURL invoice: {provider}");
+            trace!("provider disabled for public LNURL invoice: {provider:?}");
             lnurl_error("provider disabled")
         }
         ProviderError::MissingSparkPubkey
