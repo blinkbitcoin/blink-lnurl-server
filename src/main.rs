@@ -157,7 +157,7 @@ struct Args {
 struct RuntimeConfig {
     spark_network: spark_client::Network,
     blink_network: &'static str,
-    blink_graphql_endpoint: String,
+    blink_graphql_endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -280,27 +280,29 @@ fn resolve_runtime_config(
             "production" => (
                 spark_client::Network::Mainnet,
                 "mainnet",
-                blink_client::PRODUCTION_GRAPHQL_ENDPOINT.to_string(),
+                Some(blink_client::PRODUCTION_GRAPHQL_ENDPOINT.to_string()),
             ),
             "staging" => (
                 // Spark staging stays on Regtest until Spark signet support is ready.
                 spark_client::Network::Regtest,
                 "signet",
-                blink_client::STAGING_GRAPHQL_ENDPOINT.to_string(),
+                Some(blink_client::STAGING_GRAPHQL_ENDPOINT.to_string()),
             ),
             "local" => (
                 spark_client::Network::Regtest,
                 "regtest",
                 if blink_enabled {
-                    configured_blink_graphql_endpoint
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local"
-                            )
-                        })?
-                        .to_string()
+                    Some(
+                        configured_blink_graphql_endpoint
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "LNURL_BLINK_GRAPHQL_ENDPOINT is required when DEPLOYMENT_ENV=local"
+                                )
+                            })?
+                            .to_string(),
+                    )
                 } else {
-                    String::new()
+                    None
                 },
             ),
             unsupported => {
@@ -314,7 +316,7 @@ fn resolve_runtime_config(
     let blink_graphql_endpoint = if deployment_env == "local" {
         default_blink_graphql_endpoint
     } else if let Some(blink_graphql_endpoint) = configured_blink_graphql_endpoint {
-        blink_graphql_endpoint.to_string()
+        Some(blink_graphql_endpoint.to_string())
     } else {
         default_blink_graphql_endpoint
     };
@@ -342,7 +344,10 @@ where
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     info!(
         deployment_env_blink_network = runtime_config.blink_network,
-        blink_graphql_endpoint = runtime_config.blink_graphql_endpoint,
+        blink_graphql_endpoint = runtime_config
+            .blink_graphql_endpoint
+            .as_deref()
+            .unwrap_or(""),
         spark_enabled = args.spark_enabled,
         blink_enabled = args.blink_enabled,
         "resolved provider runtime configuration from DEPLOYMENT_ENV"
@@ -445,11 +450,11 @@ where
         register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
 
-    let blink_status_enabled = !runtime_config.blink_graphql_endpoint.is_empty();
+    let blink_status_enabled = runtime_config.blink_graphql_endpoint.is_some();
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
-        runtime_config.blink_graphql_endpoint,
+        runtime_config.blink_graphql_endpoint.unwrap_or_default(),
     ));
-    let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
+    let providers = Arc::new(ProviderRegistry::new(
         spark_client.clone(),
         blink_client,
         blink_webhook_url,
@@ -732,7 +737,7 @@ mod tests {
             configured_blink_graphql_endpoint: Option<&'static str>,
             expected_spark_network: spark_client::Network,
             expected_blink_network: &'static str,
-            expected_blink_graphql_endpoint: &'static str,
+            expected_blink_graphql_endpoint: Option<&'static str>,
         }
 
         for case in [
@@ -742,7 +747,7 @@ mod tests {
                 configured_blink_graphql_endpoint: None,
                 expected_spark_network: spark_client::Network::Mainnet,
                 expected_blink_network: "mainnet",
-                expected_blink_graphql_endpoint: blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
+                expected_blink_graphql_endpoint: Some(blink_client::PRODUCTION_GRAPHQL_ENDPOINT),
             },
             Case {
                 deployment_env: "staging",
@@ -750,7 +755,7 @@ mod tests {
                 configured_blink_graphql_endpoint: None,
                 expected_spark_network: spark_client::Network::Regtest,
                 expected_blink_network: "signet",
-                expected_blink_graphql_endpoint: blink_client::STAGING_GRAPHQL_ENDPOINT,
+                expected_blink_graphql_endpoint: Some(blink_client::STAGING_GRAPHQL_ENDPOINT),
             },
             Case {
                 deployment_env: "local",
@@ -758,7 +763,7 @@ mod tests {
                 configured_blink_graphql_endpoint: Some("http://127.0.0.1:4455/graphql"),
                 expected_spark_network: spark_client::Network::Regtest,
                 expected_blink_network: "regtest",
-                expected_blink_graphql_endpoint: "http://127.0.0.1:4455/graphql",
+                expected_blink_graphql_endpoint: Some("http://127.0.0.1:4455/graphql"),
             },
             Case {
                 deployment_env: "staging",
@@ -766,7 +771,7 @@ mod tests {
                 configured_blink_graphql_endpoint: Some("http://127.0.0.1:4455/graphql"),
                 expected_spark_network: spark_client::Network::Mainnet,
                 expected_blink_network: "signet",
-                expected_blink_graphql_endpoint: "http://127.0.0.1:4455/graphql",
+                expected_blink_graphql_endpoint: Some("http://127.0.0.1:4455/graphql"),
             },
             Case {
                 deployment_env: "production",
@@ -774,7 +779,7 @@ mod tests {
                 configured_blink_graphql_endpoint: Some("   "),
                 expected_spark_network: spark_client::Network::Mainnet,
                 expected_blink_network: "mainnet",
-                expected_blink_graphql_endpoint: blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
+                expected_blink_graphql_endpoint: Some(blink_client::PRODUCTION_GRAPHQL_ENDPOINT),
             },
             Case {
                 deployment_env: "staging",
@@ -782,7 +787,7 @@ mod tests {
                 configured_blink_graphql_endpoint: Some("\t"),
                 expected_spark_network: spark_client::Network::Regtest,
                 expected_blink_network: "signet",
-                expected_blink_graphql_endpoint: blink_client::STAGING_GRAPHQL_ENDPOINT,
+                expected_blink_graphql_endpoint: Some(blink_client::STAGING_GRAPHQL_ENDPOINT),
             },
         ] {
             let runtime_config = resolve_runtime_config(
@@ -796,7 +801,7 @@ mod tests {
             assert_eq!(runtime_config.spark_network, case.expected_spark_network);
             assert_eq!(runtime_config.blink_network, case.expected_blink_network);
             assert_eq!(
-                runtime_config.blink_graphql_endpoint,
+                runtime_config.blink_graphql_endpoint.as_deref(),
                 case.expected_blink_graphql_endpoint
             );
         }
@@ -811,8 +816,8 @@ mod tests {
             assert_eq!(runtime_config.spark_network, spark_client::Network::Mainnet);
             assert_eq!(runtime_config.blink_network, "mainnet");
             assert_eq!(
-                runtime_config.blink_graphql_endpoint,
-                blink_client::PRODUCTION_GRAPHQL_ENDPOINT
+                runtime_config.blink_graphql_endpoint.as_deref(),
+                Some(blink_client::PRODUCTION_GRAPHQL_ENDPOINT)
             );
         }
     }

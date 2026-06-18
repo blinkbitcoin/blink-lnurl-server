@@ -441,21 +441,6 @@ mod tests {
         payload
     }
 
-    async fn blink_creation_disabled_state(
-        repo: MockRepository,
-        internal_auth: Option<std::sync::Arc<crate::internal_auth::InternalAuthState>>,
-        blink_endpoint: &str,
-    ) -> State<MockRepository> {
-        internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo,
-            internal_auth,
-            blink_endpoint,
-            true,
-            false,
-        )
-        .await
-    }
-
     #[tokio::test]
     async fn blink_webhook_paid_supplied_preimage_uses_central_side_effects() {
         let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
@@ -594,9 +579,14 @@ mod tests {
         ))
         .await
         .unwrap();
-        let state =
-            blink_creation_disabled_state(repo.clone(), Some(internal_auth_state()), &endpoint)
-                .await;
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            Some(internal_auth_state()),
+            &endpoint,
+            true,
+            false,
+        )
+        .await;
         let app = blink_webhook_app_with_state(state);
         let payload = blink_webhook_payload_without_preimage("PAID", &payment_hash);
 
@@ -846,7 +836,14 @@ mod tests {
         ))
         .await
         .unwrap();
-        let state = blink_creation_disabled_state(repo.clone(), None, &endpoint).await;
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            None,
+            &endpoint,
+            true,
+            false,
+        )
+        .await;
         let app = blink_webhook_app_with_state(state);
         let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
 

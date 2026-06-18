@@ -357,19 +357,7 @@ pub fn parse_blink_settlement_notification(
 }
 
 impl ProviderRegistry {
-    #[allow(dead_code)]
-    pub fn new(spark_client: spark_client::Client, blink_client: blink_client::Client) -> Self {
-        Self::new_with_blink_webhook_url(
-            spark_client,
-            blink_client,
-            Some("http://127.0.0.1/webhook/blink".to_string()),
-            true,
-            true,
-            true,
-        )
-    }
-
-    pub fn new_with_blink_webhook_url(
+    pub fn new(
         spark_client: spark_client::Client,
         blink_client: blink_client::Client,
         blink_webhook_url: Option<String>,
