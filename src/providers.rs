@@ -260,7 +260,7 @@ pub struct ProviderRegistry {
     blink: Arc<BlinkProvider>,
     spark_enabled: bool,
     blink_enabled: bool,
-    blink_status_enabled: bool,
+    blink_graphql_endpoint: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -359,12 +359,14 @@ pub fn parse_blink_settlement_notification(
 impl ProviderRegistry {
     pub fn new(
         spark_client: spark_client::Client,
-        blink_client: blink_client::Client,
+        blink_graphql_endpoint: Option<String>,
         blink_webhook_url: Option<String>,
         spark_enabled: bool,
         blink_enabled: bool,
-        blink_status_enabled: bool,
     ) -> Self {
+        let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
+            blink_graphql_endpoint.clone().unwrap_or_default(),
+        ));
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
@@ -373,7 +375,7 @@ impl ProviderRegistry {
             )),
             spark_enabled,
             blink_enabled,
-            blink_status_enabled,
+            blink_graphql_endpoint,
         }
     }
 
@@ -384,15 +386,16 @@ impl ProviderRegistry {
         blink_enabled: bool,
     ) -> Self {
         let blink_graphql_endpoint = blink_graphql_endpoint.into();
-        let blink_status_enabled = !blink_graphql_endpoint.is_empty();
+        let blink_graphql_endpoint =
+            (!blink_graphql_endpoint.is_empty()).then_some(blink_graphql_endpoint);
         Self {
             spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
             blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
-                blink_client::ClientConfig::new(blink_graphql_endpoint),
+                blink_client::ClientConfig::new(blink_graphql_endpoint.clone().unwrap_or_default()),
             ))),
             spark_enabled,
             blink_enabled,
-            blink_status_enabled,
+            blink_graphql_endpoint,
         }
     }
 
@@ -419,7 +422,7 @@ impl ProviderRegistry {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
             AccountProvider::Spark => self.spark.payment_status(request).await,
-            AccountProvider::Blink if self.blink_status_enabled => {
+            AccountProvider::Blink if self.blink_graphql_endpoint.is_some() => {
                 self.blink.payment_status(request).await
             }
             AccountProvider::Blink => Err(ProviderError::ProviderDisabled(AccountProvider::Blink)),

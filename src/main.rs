@@ -450,17 +450,12 @@ where
         register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
 
-    let blink_status_enabled = runtime_config.blink_graphql_endpoint.is_some();
-    let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
-        runtime_config.blink_graphql_endpoint.unwrap_or_default(),
-    ));
     let providers = Arc::new(ProviderRegistry::new(
         spark_client.clone(),
-        blink_client,
+        runtime_config.blink_graphql_endpoint,
         blink_webhook_url,
         args.spark_enabled,
         args.blink_enabled,
-        blink_status_enabled,
     ));
 
     let state = State {

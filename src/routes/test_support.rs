@@ -510,11 +510,10 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_f
             .unwrap();
     let providers = Arc::new(crate::providers::ProviderRegistry::new(
         spark_client.clone(),
-        blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
+        (!blink_endpoint.is_empty()).then_some(blink_endpoint.to_string()),
         blink_webhook_url,
         spark_enabled,
         blink_enabled,
-        !blink_endpoint.is_empty(),
     ));
     let (invoice_paid_trigger, _rx) = watch::channel(());
     State {
