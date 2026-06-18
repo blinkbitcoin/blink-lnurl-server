@@ -445,6 +445,7 @@ where
         register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
 
+    let blink_status_enabled = !runtime_config.blink_graphql_endpoint.is_empty();
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
         runtime_config.blink_graphql_endpoint,
     ));
@@ -454,6 +455,7 @@ where
         blink_webhook_url,
         args.spark_enabled,
         args.blink_enabled,
+        blink_status_enabled,
     ));
 
     let state = State {

@@ -260,6 +260,7 @@ pub struct ProviderRegistry {
     blink: Arc<BlinkProvider>,
     spark_enabled: bool,
     blink_enabled: bool,
+    blink_status_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -364,6 +365,7 @@ impl ProviderRegistry {
             Some("http://127.0.0.1/webhook/blink".to_string()),
             true,
             true,
+            true,
         )
     }
 
@@ -373,6 +375,7 @@ impl ProviderRegistry {
         blink_webhook_url: Option<String>,
         spark_enabled: bool,
         blink_enabled: bool,
+        blink_status_enabled: bool,
     ) -> Self {
         assert!(
             !blink_enabled || blink_webhook_url.is_some(),
@@ -386,6 +389,7 @@ impl ProviderRegistry {
             )),
             spark_enabled,
             blink_enabled,
+            blink_status_enabled,
         }
     }
 
@@ -395,13 +399,16 @@ impl ProviderRegistry {
         spark_enabled: bool,
         blink_enabled: bool,
     ) -> Self {
+        let blink_graphql_endpoint = blink_graphql_endpoint.into();
+        let blink_status_enabled = !blink_graphql_endpoint.is_empty();
         Self {
             spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
             blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
-                blink_client::ClientConfig::new(blink_graphql_endpoint.into()),
+                blink_client::ClientConfig::new(blink_graphql_endpoint),
             ))),
             spark_enabled,
             blink_enabled,
+            blink_status_enabled,
         }
     }
 
@@ -428,7 +435,10 @@ impl ProviderRegistry {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
             AccountProvider::Spark => self.spark.payment_status(request).await,
-            AccountProvider::Blink => self.blink.payment_status(request).await,
+            AccountProvider::Blink if self.blink_status_enabled => {
+                self.blink.payment_status(request).await
+            }
+            AccountProvider::Blink => Err(ProviderError::ProviderDisabled("Blink")),
         }
     }
 }
@@ -694,6 +704,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_registry_reports_disabled_blink_status_when_endpoint_is_missing() {
+        let registry = ProviderRegistry::for_tests("", true, false);
+
+        let err = registry
+            .payment_status(
+                AccountProvider::Blink,
+                PaymentStatusRequest {
+                    payment_hash: "payment_hash",
+                },
+            )
+            .await
+            .expect_err("missing Blink endpoint should disable status fallback");
+
+        assert!(matches!(err, ProviderError::ProviderDisabled("Blink")));
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "Blink provider requires a webhook URL when enabled")]
     async fn provider_registry_requires_webhook_url_when_blink_enabled() {
         let network = spark_client::Network::Regtest;
@@ -710,6 +737,7 @@ mod tests {
             spark_client,
             blink_client,
             None,
+            true,
             true,
             true,
         );

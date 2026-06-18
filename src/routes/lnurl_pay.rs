@@ -951,6 +951,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_blink_missing_status_endpoint_returns_local_state_when_creation_disabled() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinkdisabledlocalverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            None,
+            "",
+            true,
+            false,
+        )
+        .await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], false);
+        assert_eq!(body["preimage"], Value::Null);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert!(invoice.preimage.is_none());
+    }
+
+    #[tokio::test]
     async fn blink_settlement_fallback_persists_through_paid_invoice_handler_test_01() {
         let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
         let (endpoint, calls, _) =
