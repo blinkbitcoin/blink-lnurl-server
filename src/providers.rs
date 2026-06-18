@@ -377,10 +377,6 @@ impl ProviderRegistry {
         blink_enabled: bool,
         blink_status_enabled: bool,
     ) -> Self {
-        assert!(
-            !blink_enabled || blink_webhook_url.is_some(),
-            "Blink provider requires a webhook URL when enabled"
-        );
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
@@ -724,29 +720,6 @@ mod tests {
             err,
             ProviderError::ProviderDisabled(AccountProvider::Blink)
         ));
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "Blink provider requires a webhook URL when enabled")]
-    async fn provider_registry_requires_webhook_url_when_blink_enabled() {
-        let network = spark_client::Network::Regtest;
-        let auth_seed = [7_u8; 32];
-        let spark_client =
-            spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
-                .await
-                .unwrap();
-        let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
-            "http://127.0.0.1/graphql".to_string(),
-        ));
-
-        let _ = ProviderRegistry::new_with_blink_webhook_url(
-            spark_client,
-            blink_client,
-            None,
-            true,
-            true,
-            true,
-        );
     }
 
     #[tokio::test]

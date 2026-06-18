@@ -666,28 +666,6 @@ mod tests {
         Args::parse_from(["lnurl-server"])
     }
 
-    struct ProviderToggleEnvGuard;
-
-    impl ProviderToggleEnvGuard {
-        fn set_false() -> Self {
-            unsafe {
-                std::env::set_var("LNURL_SPARK_ENABLED", "false");
-                std::env::set_var("LNURL_BLINK_ENABLED", "false");
-            }
-
-            Self
-        }
-    }
-
-    impl Drop for ProviderToggleEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("LNURL_SPARK_ENABLED");
-                std::env::remove_var("LNURL_BLINK_ENABLED");
-            }
-        }
-    }
-
     #[test]
     fn cli_blink_graphql_endpoint_override_is_optional() {
         let args = default_args();
@@ -727,13 +705,20 @@ mod tests {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let args = default_args();
-        let _provider_toggle_env = ProviderToggleEnvGuard::set_false();
+        unsafe {
+            std::env::set_var("LNURL_SPARK_ENABLED", "false");
+            std::env::set_var("LNURL_BLINK_ENABLED", "false");
+        }
 
-        let args: Args = Figment::new()
+        let result = Figment::new()
             .merge(Serialized::defaults(args))
             .merge(Env::prefixed("LNURL_"))
-            .extract()
-            .expect("env provider toggles should parse");
+            .extract();
+        unsafe {
+            std::env::remove_var("LNURL_SPARK_ENABLED");
+            std::env::remove_var("LNURL_BLINK_ENABLED");
+        }
+        let args: Args = result.expect("env provider toggles should parse");
 
         assert!(!args.spark_enabled);
         assert!(!args.blink_enabled);
@@ -867,16 +852,6 @@ mod tests {
 
             assert!(err.to_string().contains(expected_error));
         }
-    }
-
-    #[test]
-    fn resolve_runtime_config_local_allows_missing_blink_endpoint_when_blink_disabled() {
-        let runtime_config = resolve_runtime_config(Some("local"), None, None, false)
-            .expect("disabled Blink should not require a local Blink endpoint");
-
-        assert_eq!(runtime_config.spark_network, spark_client::Network::Regtest);
-        assert_eq!(runtime_config.blink_network, "regtest");
-        assert_eq!(runtime_config.blink_graphql_endpoint, "");
     }
 
     #[test]

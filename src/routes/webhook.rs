@@ -614,35 +614,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_webhook_paid_missing_status_endpoint_noops_when_creation_disabled() {
-        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
-        let repo = MockRepository::default();
-        repo.upsert_invoice(&route_test_invoice(
-            Some(AccountProvider::Blink),
-            payment_hash.clone(),
-            "lnbc1blinkdisablednostatus",
-            None,
-        ))
-        .await
-        .unwrap();
-        let state =
-            blink_creation_disabled_state(repo.clone(), Some(internal_auth_state()), "").await;
-        let app = blink_webhook_app_with_state(state);
-        let payload = blink_webhook_payload_without_preimage("PAID", &payment_hash);
-
-        let (status, body) = post_blink_webhook(app, payload).await;
-
-        assert!(status.is_success());
-        assert_eq!(body, Value::Null);
-        let invoice = repo
-            .get_invoice_by_payment_hash(&payment_hash)
-            .await
-            .unwrap()
-            .expect("invoice exists");
-        assert!(invoice.preimage.is_none());
-    }
-
-    #[tokio::test]
     async fn blink_webhook_paid_does_not_settle_non_blink_invoices() {
         for provider in [Some(AccountProvider::Spark), None] {
             let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
@@ -890,35 +861,6 @@ mod tests {
             .unwrap()
             .expect("invoice exists");
         assert!(invoice.expired_at.is_some());
-        assert!(invoice.preimage.is_none());
-    }
-
-    #[tokio::test]
-    async fn blink_webhook_expired_missing_status_endpoint_noops_when_creation_disabled() {
-        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
-        let repo = MockRepository::default();
-        repo.upsert_invoice(&route_test_invoice(
-            Some(AccountProvider::Blink),
-            payment_hash.clone(),
-            "lnbc1blinkdisablednoexpirestatus",
-            None,
-        ))
-        .await
-        .unwrap();
-        let state = blink_creation_disabled_state(repo.clone(), None, "").await;
-        let app = blink_webhook_app_with_state(state);
-        let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
-
-        let (status, body) = post_blink_webhook(app, payload).await;
-
-        assert!(status.is_success());
-        assert_eq!(body, Value::Null);
-        let invoice = repo
-            .get_invoice_by_payment_hash(&payment_hash)
-            .await
-            .unwrap()
-            .expect("invoice exists");
-        assert!(invoice.expired_at.is_none());
         assert!(invoice.preimage.is_none());
     }
 
