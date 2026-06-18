@@ -158,8 +158,6 @@ struct RuntimeConfig {
     spark_network: spark_client::Network,
     blink_network: &'static str,
     blink_graphql_endpoint: String,
-    spark_enabled: bool,
-    blink_enabled: bool,
 }
 
 #[tokio::main]
@@ -176,7 +174,6 @@ async fn main() -> Result<(), anyhow::Error> {
         std::env::var("DEPLOYMENT_ENV").ok().as_deref(),
         args.spark_network,
         args.blink_graphql_endpoint.as_deref(),
-        args.spark_enabled,
         args.blink_enabled,
     )?;
 
@@ -264,19 +261,10 @@ fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
     ))
 }
 
-fn blink_webhook_url_for_provider(args: &Args) -> Result<String, anyhow::Error> {
-    if args.blink_enabled {
-        build_blink_webhook_url(args)
-    } else {
-        Ok("http://127.0.0.1/webhook/blink-disabled".to_string())
-    }
-}
-
 fn resolve_runtime_config(
     deployment_env: Option<&str>,
     configured_spark_network: Option<spark_client::Network>,
     configured_blink_graphql_endpoint: Option<&str>,
-    spark_enabled: bool,
     blink_enabled: bool,
 ) -> Result<RuntimeConfig, anyhow::Error> {
     let deployment_env = deployment_env
@@ -335,8 +323,6 @@ fn resolve_runtime_config(
         spark_network,
         blink_network,
         blink_graphql_endpoint,
-        spark_enabled,
-        blink_enabled,
     })
 }
 
@@ -349,13 +335,16 @@ async fn run_server<DB>(
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
-    let blink_webhook_url = blink_webhook_url_for_provider(&args)?;
+    let blink_webhook_url = args
+        .blink_enabled
+        .then(|| build_blink_webhook_url(&args))
+        .transpose()?;
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     info!(
         deployment_env_blink_network = runtime_config.blink_network,
         blink_graphql_endpoint = runtime_config.blink_graphql_endpoint,
-        spark_enabled = runtime_config.spark_enabled,
-        blink_enabled = runtime_config.blink_enabled,
+        spark_enabled = args.spark_enabled,
+        blink_enabled = args.blink_enabled,
         "resolved provider runtime configuration from DEPLOYMENT_ENV"
     );
     let spark_client = spark_client::Client::new(spark_client::ClientConfig::new(
@@ -449,7 +438,7 @@ where
         .get_or_create_setting("webhook_secret", &default_secret)
         .await?;
 
-    if runtime_config.spark_enabled
+    if args.spark_enabled
         && let Some(webhook_domain) = &args.webhook_domain
     {
         let webhook_url = format!("{}://{}/webhook", args.scheme, webhook_domain);
@@ -459,15 +448,13 @@ where
     let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
         runtime_config.blink_graphql_endpoint,
     ));
-    let providers = Arc::new(
-        ProviderRegistry::new_with_blink_webhook_url_and_provider_flags(
-            spark_client.clone(),
-            blink_client,
-            blink_webhook_url,
-            runtime_config.spark_enabled,
-            runtime_config.blink_enabled,
-        ),
-    );
+    let providers = Arc::new(ProviderRegistry::new_with_blink_webhook_url(
+        spark_client.clone(),
+        blink_client,
+        blink_webhook_url,
+        args.spark_enabled,
+        args.blink_enabled,
+    ));
 
     let state = State {
         db: repository,
@@ -754,7 +741,6 @@ mod tests {
                 case.configured_spark_network,
                 case.configured_blink_graphql_endpoint,
                 true,
-                true,
             )
             .expect("success case should resolve");
 
@@ -770,7 +756,7 @@ mod tests {
     #[test]
     fn resolve_runtime_config_defaults_to_production() {
         for deployment_env in [None, Some(""), Some("   "), Some("\t")] {
-            let runtime_config = resolve_runtime_config(deployment_env, None, None, true, true)
+            let runtime_config = resolve_runtime_config(deployment_env, None, None, true)
                 .expect("missing deployment env should default to production");
 
             assert_eq!(runtime_config.spark_network, spark_client::Network::Mainnet);
@@ -812,7 +798,6 @@ mod tests {
                 None,
                 configured_blink_graphql_endpoint,
                 true,
-                true,
             )
             .expect_err("error case must fail");
 
@@ -822,14 +807,12 @@ mod tests {
 
     #[test]
     fn resolve_runtime_config_local_allows_missing_blink_endpoint_when_blink_disabled() {
-        let runtime_config = resolve_runtime_config(Some("local"), None, None, true, false)
+        let runtime_config = resolve_runtime_config(Some("local"), None, None, false)
             .expect("disabled Blink should not require a local Blink endpoint");
 
         assert_eq!(runtime_config.spark_network, spark_client::Network::Regtest);
         assert_eq!(runtime_config.blink_network, "regtest");
         assert_eq!(runtime_config.blink_graphql_endpoint, "");
-        assert!(runtime_config.spark_enabled);
-        assert!(!runtime_config.blink_enabled);
     }
 
     #[test]
@@ -865,9 +848,12 @@ mod tests {
     fn blink_webhook_url_is_not_required_when_blink_disabled() {
         let args = Args::parse_from(["lnurl-server", "--blink-enabled=false"]);
 
-        let url = blink_webhook_url_for_provider(&args)
+        let url = args
+            .blink_enabled
+            .then(|| build_blink_webhook_url(&args))
+            .transpose()
             .expect("disabled Blink should not require webhook domain");
 
-        assert_eq!(url, "http://127.0.0.1/webhook/blink-disabled");
+        assert_eq!(url, None);
     }
 }
