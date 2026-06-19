@@ -1,3 +1,14 @@
+# [blink-lnurl-server release v0.4.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.4.0)
+
+
+### Features
+
+- Add config toggles for Spark and Blink providers (#22)
+
+### Refactor
+
+- Replace legacy users schema with account-backed spark compatibility (#25)
+
 # [blink-lnurl-server release v0.3.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.3.1)
 
 
