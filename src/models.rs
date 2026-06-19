@@ -8,6 +8,7 @@ pub const INTERNAL_ERROR_IDENTIFIER_CONFLICT: &str = "identifier_conflict";
 pub const INTERNAL_ERROR_INTERNAL_SERVER_ERROR: &str = "internal_server_error";
 pub const INTERNAL_ERROR_INVALID_DOMAIN: &str = "invalid_domain";
 pub const INTERNAL_ERROR_NOT_FOUND: &str = "not_found";
+pub const INTERNAL_ERROR_PROVIDER_DISABLED: &str = "provider_disabled";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateBlinkAccountRequest {

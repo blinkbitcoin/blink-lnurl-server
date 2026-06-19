@@ -29,6 +29,8 @@ use crate::{
 
 use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
 
+const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
+
 impl<DB> LnurlServer<DB>
 where
     DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
@@ -39,6 +41,8 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<RegisterLnurlPayRequest>,
     ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
         let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
@@ -80,6 +84,8 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<TransferLnurlPayRequest>,
     ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
         let username = canonical_spark_username_for_route(&payload.username)?;
         validate_description(&payload.description)?;
 
@@ -149,6 +155,8 @@ where
         Extension(state): Extension<State<DB>>,
         Json(payload): Json<UnregisterLnurlPayRequest>,
     ) -> Result<(), (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
         let username = canonical_spark_username_for_route(&payload.username)?;
         let pubkey = validate(
             &pubkey,
@@ -589,6 +597,21 @@ pub(super) fn spark_registration_error(
     }
 }
 
+fn spark_provider_disabled_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.to_string())),
+    )
+}
+
+fn require_spark_provider_enabled<DB>(state: &State<DB>) -> Result<(), (StatusCode, Json<Value>)> {
+    if state.providers.spark_enabled() {
+        return Ok(());
+    }
+
+    Err(spark_provider_disabled_error())
+}
+
 #[allow(dead_code)]
 pub(super) fn spark_user_from_recipient(
     recipient: ResolvedRecipient,
@@ -633,6 +656,18 @@ mod tests {
     use lightning_invoice::Bolt11Invoice;
     use serde_json::Value;
     use std::str::FromStr;
+
+    fn assert_spark_provider_disabled(result: Result<impl Sized, (StatusCode, Json<Value>)>) {
+        let Err((status, Json(body))) = result else {
+            panic!("disabled Spark must reject request");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.to_string())
+        );
+    }
+
     fn assert_bad_username(result: Result<(), (StatusCode, Json<Value>)>) {
         let Err((status, Json(body))) = result else {
             panic!("expected invalid username error");
@@ -774,6 +809,87 @@ mod tests {
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(body, Value::String("name already taken".to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_when_spark_disabled() {
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            MockRepository::default(),
+            None,
+            "http://127.0.0.1/graphql",
+            false,
+            true,
+        )
+        .await;
+
+        let result = LnurlServer::register(
+            Host("example.com".to_string()),
+            Path("not-a-pubkey".to_string()),
+            Extension(state),
+            Json(RegisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature: "00".to_string(),
+                timestamp: now_u64(),
+                description: "Alice".to_string(),
+            }),
+        )
+        .await;
+
+        assert_spark_provider_disabled(result);
+    }
+
+    #[tokio::test]
+    async fn unregister_rejects_when_spark_disabled() {
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            MockRepository::default(),
+            None,
+            "http://127.0.0.1/graphql",
+            false,
+            true,
+        )
+        .await;
+
+        let result = LnurlServer::unregister(
+            Host("example.com".to_string()),
+            Path("not-a-pubkey".to_string()),
+            Extension(state),
+            Json(UnregisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature: "00".to_string(),
+                timestamp: now_u64(),
+            }),
+        )
+        .await;
+
+        assert_spark_provider_disabled(result);
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_when_spark_disabled() {
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            MockRepository::default(),
+            None,
+            "http://127.0.0.1/graphql",
+            false,
+            true,
+        )
+        .await;
+
+        let result = LnurlServer::transfer(
+            Host("example.com".to_string()),
+            Path("not-a-pubkey".to_string()),
+            Extension(state),
+            Json(TransferLnurlPayRequest {
+                username: "alice".to_string(),
+                description: "Alice".to_string(),
+                from_pubkey: "not-a-pubkey".to_string(),
+                from_signature: "00".to_string(),
+                to_signature: "00".to_string(),
+            }),
+        )
+        .await;
+
+        assert_spark_provider_disabled(result);
     }
 
     #[tokio::test]

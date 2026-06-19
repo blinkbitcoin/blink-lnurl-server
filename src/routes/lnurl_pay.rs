@@ -683,10 +683,6 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
             error!("unsupported provider for public LNURL invoice: {provider:?}");
             lnurl_error("internal server error")
         }
-        ProviderError::ProviderDisabled(provider) => {
-            trace!("provider disabled for public LNURL invoice: {provider:?}");
-            lnurl_error("provider disabled")
-        }
         ProviderError::MissingSparkPubkey
         | ProviderError::InvalidSparkPubkey
         | ProviderError::MissingBlinkDefaultWallet
@@ -910,78 +906,6 @@ mod tests {
             1,
             "verify fallback must enqueue webhook deliveries through handle_invoice_paid"
         );
-    }
-
-    #[tokio::test]
-    async fn verify_blink_status_fallback_still_works_when_blink_creation_disabled() {
-        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
-        let (endpoint, calls, _) =
-            start_blink_status_mock_server("PAID", Some(TEST_PREIMAGE_HEX.to_string()), false)
-                .await;
-        let repo = MockRepository::default();
-        repo.upsert_invoice(&route_test_invoice(
-            Some(AccountProvider::Blink),
-            payment_hash.clone(),
-            "lnbc1blinkdisabledverifyfallback",
-            None,
-        ))
-        .await
-        .unwrap();
-        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo.clone(),
-            None,
-            &endpoint,
-            true,
-            false,
-        )
-        .await;
-
-        let body = call_verify(state, &payment_hash).await;
-
-        assert_eq!(body["status"], "OK");
-        assert_eq!(body["settled"], true);
-        assert_eq!(body["preimage"], TEST_PREIMAGE_HEX);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let invoice = repo
-            .get_invoice_by_payment_hash(&payment_hash)
-            .await
-            .unwrap()
-            .expect("invoice should remain stored");
-        assert_eq!(invoice.preimage.as_deref(), Some(TEST_PREIMAGE_HEX));
-    }
-
-    #[tokio::test]
-    async fn verify_blink_missing_status_endpoint_returns_local_state_when_creation_disabled() {
-        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
-        let repo = MockRepository::default();
-        repo.upsert_invoice(&route_test_invoice(
-            Some(AccountProvider::Blink),
-            payment_hash.clone(),
-            "lnbc1blinkdisabledlocalverify",
-            None,
-        ))
-        .await
-        .unwrap();
-        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo.clone(),
-            None,
-            "",
-            true,
-            false,
-        )
-        .await;
-
-        let body = call_verify(state, &payment_hash).await;
-
-        assert_eq!(body["status"], "OK");
-        assert_eq!(body["settled"], false);
-        assert_eq!(body["preimage"], Value::Null);
-        let invoice = repo
-            .get_invoice_by_payment_hash(&payment_hash)
-            .await
-            .unwrap()
-            .expect("invoice should remain stored");
-        assert!(invoice.preimage.is_none());
     }
 
     #[tokio::test]
@@ -1376,31 +1300,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_invoice_callback_returns_lnurl_error_when_provider_disabled() {
-        let (_payment_hash, bolt11) = generate_route_test_invoice(31);
-        let (endpoint, calls, _bodies) = start_blink_invoice_mock_server(bolt11, false).await;
-        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
-        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo, None, &endpoint, true, false,
-        )
-        .await;
-
-        assert_lnurl_error(
-            get_public_invoice(
-                state,
-                "alice",
-                LnurlPayCallbackParams {
-                    amount: Some(1_000),
-                    ..LnurlPayCallbackParams::default()
-                },
-            )
-            .await,
-            "provider disabled",
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
     async fn public_invoice_callback_blink_wallet_alias_and_expiry_policy_lnurl_04_d_03_d_05_d_06_d_07_d_08_d_09_d_10()
      {
         // LNURL-04/D-03/D-05-D-10: +btc/+usd aliases select Blink wallets and
@@ -1578,14 +1477,13 @@ mod tests {
 
     #[test]
     fn public_lnurl_error_reason_contract_is_explicit_and_plain() {
-        const REASONS: [&str; 7] = [
+        const REASONS: [&str; 6] = [
             "unsupported wallet",
             "expiry too long",
             "missing amount",
             "amount out of range",
             "comment too long",
             "invoice creation failed",
-            "provider disabled",
         ];
 
         for reason in REASONS {

@@ -8,7 +8,7 @@ use crate::{
         CreateBlinkAccountRequest, CreateBlinkAccountResponse, INTERNAL_ERROR_BLINK_ACCOUNT_EXISTS,
         INTERNAL_ERROR_IDENTIFIER_CONFLICT, INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
         INTERNAL_ERROR_INVALID_DOMAIN, INTERNAL_ERROR_INVALID_IDENTIFIER,
-        INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND,
+        INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND, INTERNAL_ERROR_PROVIDER_DISABLED,
         INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
         InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
         InternalTransferToSparkRequest, InternalTransferToSparkResponse,
@@ -36,6 +36,9 @@ where
         crate::internal_auth::require_scope(
             &principal,
             crate::internal_auth::SCOPE_TRANSFER_WRITE,
+        )?;
+        require_internal_provider_enabled(
+            state.providers.spark_enabled() && state.providers.blink_enabled(),
         )?;
 
         let payload: InternalTransferToSparkRequest =
@@ -116,6 +119,7 @@ where
             &principal,
             crate::internal_auth::SCOPE_BLINK_ACCOUNTS_CREATE,
         )?;
+        require_internal_provider_enabled(state.providers.blink_enabled())?;
 
         let domain = validate_internal_domain(&payload.domain)?;
         let blink_account_id = validate_internal_required_string(&payload.blink_account_id)?;
@@ -334,6 +338,23 @@ fn internal_account_creation_error(
     }
 }
 
+fn internal_provider_disabled() -> (StatusCode, Json<InternalErrorResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(InternalErrorResponse::new(INTERNAL_ERROR_PROVIDER_DISABLED)),
+    )
+}
+
+fn require_internal_provider_enabled(
+    enabled: bool,
+) -> Result<(), (StatusCode, Json<InternalErrorResponse>)> {
+    if enabled {
+        return Ok(());
+    }
+
+    Err(internal_provider_disabled())
+}
+
 fn internal_transfer_to_spark_error(
     error: LnurlRepositoryError,
     domain: &str,
@@ -392,6 +413,12 @@ mod tests {
     use super::*;
     use crate::routes::test_support::*;
     use serde_json::{Value, json};
+
+    fn assert_internal_provider_disabled(status: StatusCode, body: &Value) {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, &json!({ "error": INTERNAL_ERROR_PROVIDER_DISABLED }));
+    }
+
     #[tokio::test]
     async fn create_internal_blink_account_happy_path_requires_valid_internal_token() {
         // D-01/D-04/D-08/D-09/D-13/D-14/D-16/D-17/D-19: the internal account
@@ -496,6 +523,24 @@ mod tests {
             account.identifiers[1].identifier_kind,
             AccountIdentifierKind::Phone
         );
+    }
+
+    #[tokio::test]
+    async fn create_internal_blink_account_rejects_when_blink_disabled() {
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            MockRepository::default(),
+            Some(internal_auth_state()),
+            "http://127.0.0.1/graphql",
+            true,
+            false,
+        )
+        .await;
+        let app = internal_account_app_with_state(state);
+
+        let (status, body) =
+            post_internal_blink_account(app, valid_create_blink_account_payload()).await;
+
+        assert_internal_provider_disabled(status, &body);
     }
 
     #[tokio::test]
@@ -674,6 +719,56 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_when_spark_disabled() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            Some(internal_auth_state()),
+            "http://127.0.0.1/graphql",
+            false,
+            true,
+        )
+        .await;
+        let app = internal_transfer_to_spark_app_with_state(state);
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "transfer:write",
+        )
+        .await;
+
+        assert_internal_provider_disabled(status, &body);
+        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_to_spark_rejects_when_blink_disabled() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            Some(internal_auth_state()),
+            "http://127.0.0.1/graphql",
+            true,
+            false,
+        )
+        .await;
+        let app = internal_transfer_to_spark_app_with_state(state);
+
+        let (status, body) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            "transfer:write",
+        )
+        .await;
+
+        assert_internal_provider_disabled(status, &body);
         assert!(repo.resolve_calls().is_empty());
         assert_eq!(repo.blink_to_spark_transfer_count(), 0);
     }
