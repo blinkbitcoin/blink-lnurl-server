@@ -377,7 +377,7 @@ identifier_spark_pubkey() {
   timestamp="$(json_get "$auth" '.timestamp')"
   signature="$(json_get "$auth" '.recover_signature')"
   docker compose exec -T postgres psql -U user -d lnurl \
-    -c "DELETE FROM account_identifiers WHERE account_id IN (SELECT account_id FROM spark_accounts WHERE pubkey = '${pubkey}'); DELETE FROM users WHERE pubkey = '${pubkey}'" >/dev/null
+    -c "DELETE FROM account_identifiers WHERE account_id IN (SELECT account_id FROM spark_accounts WHERE pubkey = '${pubkey}')" >/dev/null
 
   run recover_user_status "localhost:8080" "$signature" "$timestamp" "$pubkey"
   [ "$status" -eq 0 ]

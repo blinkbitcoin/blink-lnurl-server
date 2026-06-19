@@ -217,8 +217,6 @@ latest_invoice_provider_account_for_spark_pubkey() {
 @test "lnurl: legacy non-modifier Spark names still resolve but plus legacy names do not" {
   insert_legacy_user "legacy.name" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000003" "Legacy dotted wallet"
   insert_legacy_user "legacy+eur" "localhost:8080" "020000000000000000000000000000000000000000000000000000000000000004" "Legacy plus wallet"
-  docker compose exec -T postgres psql -U user -d lnurl \
-    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('spark_legacy_dotted', 'spark', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO spark_accounts(account_id, pubkey, created_at, updated_at) VALUES ('spark_legacy_dotted', '020000000000000000000000000000000000000000000000000000000000000003', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) VALUES ('spark_legacy_dotted', 'localhost:8080', 'legacy.name', 'username', 'Legacy dotted wallet', 0, 0) ON CONFLICT (domain, identifier) DO NOTHING" >/dev/null
 
   run lnurl_discovery "legacy.name" "localhost:8080"
   [ "$status" -eq 0 ]

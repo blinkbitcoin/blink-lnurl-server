@@ -453,7 +453,7 @@ pub trait LnurlRepository {
     ) -> Result<String, LnurlRepositoryError>;
 
     /// Get data needed to build webhook payloads for the given payment hashes.
-    /// Joins invoices, users, `sender_comments`, and `domain_webhooks`.
+    /// Joins invoices, account identifiers, `sender_comments`, and `domain_webhooks`.
     /// Returns rows for invoices that have a domain and a preimage.
     async fn get_webhook_payloads(
         &self,
@@ -962,8 +962,8 @@ pub mod shared_tests {
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
-        // CR-02/COMP-01: Spark transfer must update the legacy users row so
-        // recover misses for the old owner and succeeds for the new owner.
+        // CR-02/COMP-01: Spark transfer must update recover ownership so the
+        // old owner misses and the new owner succeeds.
         let source_account_id = generate_account_id(AccountProvider::Spark);
         db.upsert_spark_registration(&NewSparkRegistration {
             account_id: Some(source_account_id.clone()),
@@ -2097,7 +2097,7 @@ pub mod shared_tests {
             .await
             .unwrap()
             .is_none(),
-            "legacy users row should be removed"
+            "legacy recover lookup should miss"
         );
         assert!(
             db.resolve_recipient_by_identifier("delete-preserve.example.com", "heidi")
