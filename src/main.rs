@@ -337,10 +337,11 @@ async fn run_server<DB>(
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
-    let blink_webhook_url = args
-        .blink_enabled
-        .then(|| build_blink_webhook_url(&args))
-        .transpose()?;
+    let blink_webhook_url = if args.blink_enabled {
+        Some(build_blink_webhook_url(&args)?)
+    } else {
+        None
+    };
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     info!(
         deployment_env_blink_network = runtime_config.blink_network,
@@ -452,7 +453,7 @@ where
 
     let providers = Arc::new(ProviderRegistry::new(
         spark_client.clone(),
-        runtime_config.blink_graphql_endpoint,
+        runtime_config.blink_graphql_endpoint.as_deref(),
         blink_webhook_url,
         args.spark_enabled,
         args.blink_enabled,

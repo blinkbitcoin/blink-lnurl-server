@@ -357,17 +357,21 @@ pub fn parse_blink_settlement_notification(
 }
 
 impl ProviderRegistry {
+    fn blink_client(blink_graphql_endpoint: Option<&str>) -> blink_client::Client {
+        blink_client::Client::new(blink_client::ClientConfig::new(
+            blink_graphql_endpoint.unwrap_or_default(),
+        ))
+    }
+
     pub fn new(
         spark_client: spark_client::Client,
-        blink_graphql_endpoint: Option<String>,
+        blink_graphql_endpoint: Option<&str>,
         blink_webhook_url: Option<String>,
         spark_enabled: bool,
         blink_enabled: bool,
     ) -> Self {
         let blink_status_enabled = blink_graphql_endpoint.is_some();
-        let blink_client = blink_client::Client::new(blink_client::ClientConfig::new(
-            blink_graphql_endpoint.unwrap_or_default(),
-        ));
+        let blink_client = Self::blink_client(blink_graphql_endpoint);
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
@@ -391,8 +395,8 @@ impl ProviderRegistry {
             (!blink_graphql_endpoint.is_empty()).then_some(blink_graphql_endpoint);
         Self {
             spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
-            blink: Arc::new(BlinkProvider::new(blink_client::Client::new(
-                blink_client::ClientConfig::new(blink_graphql_endpoint.clone().unwrap_or_default()),
+            blink: Arc::new(BlinkProvider::new(Self::blink_client(
+                blink_graphql_endpoint.as_deref(),
             ))),
             spark_enabled,
             blink_enabled,
