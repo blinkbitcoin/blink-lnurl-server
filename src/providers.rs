@@ -443,6 +443,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_BLINK_WEBHOOK_URL: &str = "https://lnurl.example/webhook/blink";
+
     fn spark_provider_for_unit_tests() -> SparkProvider {
         // These tests exercise provider-owned capability checks that must run before
         // the Spark SDK wallet is dereferenced.
@@ -721,7 +723,7 @@ mod tests {
         let endpoint = start_blink_mock_server(request_body_tx).await;
         let provider = BlinkProvider::new_with_webhook_url(
             blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
-            Some("https://lnurl.example/webhook/blink".to_string()),
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
         );
         let recipient = blink_recipient(Some(WalletKind::Usd));
 
@@ -751,7 +753,7 @@ mod tests {
         );
         assert_eq!(
             btc_body["variables"]["input"]["webhookUrl"],
-            "https://lnurl.example/webhook/blink"
+            TEST_BLINK_WEBHOOK_URL
         );
         assert!(btc_body["variables"]["input"].get("expiresIn").is_none());
 
@@ -781,7 +783,7 @@ mod tests {
         );
         assert_eq!(
             usd_body["variables"]["input"]["webhookUrl"],
-            "https://lnurl.example/webhook/blink"
+            TEST_BLINK_WEBHOOK_URL
         );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
     }
@@ -820,7 +822,7 @@ mod tests {
         let endpoint = start_blink_mock_server(request_body_tx).await;
         let blink_provider = BlinkProvider::new_with_webhook_url(
             blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
-            Some("https://lnurl.example/webhook/blink".to_string()),
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
         );
         let default_btc_recipient = blink_recipient(Some(WalletKind::Btc));
 
