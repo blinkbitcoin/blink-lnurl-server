@@ -8,7 +8,6 @@ WORKDIR /src
 COPY . .
 
 ENV PROTOC_INCLUDE=/usr/include
-ENV SQLX_OFFLINE=true
 
 ARG CARGO_FEATURES=""
 RUN if [ -z "${CARGO_FEATURES}" ]; then \

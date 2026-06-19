@@ -24,7 +24,6 @@ use crate::{
     },
     state::State,
     time::now_u64,
-    user::User,
 };
 
 use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
@@ -213,17 +212,17 @@ where
 
         let user = state
             .db
-            .get_user_by_pubkey(&domain, &pubkey.to_string())
+            .get_spark_username_by_pubkey(&domain, &pubkey.to_string())
             .await
             .map_err(storage_error)?;
 
         match user {
             Some(user) => {
-                let lnurl = format!("lnurlp://{}/lnurlp/{}", &user.domain, user.name);
+                let lnurl = format!("lnurlp://{}/lnurlp/{}", &user.domain, user.username);
                 Ok(Json(RecoverLnurlPayResponse {
                     lnurl,
-                    lightning_address: format!("{}@{}", user.name, &user.domain),
-                    username: user.name,
+                    lightning_address: format!("{}@{}", user.username, &user.domain),
+                    username: user.username,
                     description: user.description,
                 }))
             }
@@ -609,9 +608,9 @@ fn require_spark_provider_enabled<DB>(state: &State<DB>) -> Result<(), (StatusCo
 }
 
 #[allow(dead_code)]
-pub(super) fn spark_user_from_recipient(
+pub(super) fn spark_username_from_recipient(
     recipient: ResolvedRecipient,
-) -> Result<User, LnurlRepositoryError> {
+) -> Result<crate::repository::SparkUsername, LnurlRepositoryError> {
     if recipient.provider != AccountProvider::Spark
         || recipient.identifier_kind != AccountIdentifierKind::Username
     {
@@ -622,10 +621,10 @@ pub(super) fn spark_user_from_recipient(
         return Err(LnurlRepositoryError::InvalidOwnership);
     };
 
-    Ok(User {
+    Ok(crate::repository::SparkUsername {
         domain: recipient.domain,
         pubkey,
-        name: recipient.identifier,
+        username: recipient.identifier,
         description: recipient.description,
     })
 }
@@ -1014,8 +1013,8 @@ mod tests {
             default_wallet: None,
         };
 
-        let user = spark_user_from_recipient(recipient).expect("Spark recipient should adapt");
-        assert_eq!(user.name, "alice");
+        let user = spark_username_from_recipient(recipient).expect("Spark recipient should adapt");
+        assert_eq!(user.username, "alice");
         assert_eq!(user.domain, "example.com");
         assert_eq!(user.pubkey, "spark_pubkey");
         assert_eq!(user.description, "Alice wallet");

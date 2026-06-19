@@ -104,7 +104,7 @@ mod test_helpers {
 mod shared_tests {
     use crate::repository::{
         AccountIdentifierKind, AccountProvider, Invoice, LnurlRepository, NewAccountIdentifier,
-        NewBlinkAccount, WalletKind,
+        NewBlinkAccount, NewSparkRegistration, WalletKind,
     };
     use crate::time::now_millis;
     use crate::webhooks::WebhookRepository;
@@ -120,18 +120,28 @@ mod shared_tests {
         let domain = "enqueue-test.example.com";
 
         db.add_domain(domain).await.unwrap();
-        db.upsert_user(&crate::user::User {
-            name: "alice".to_string(),
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
             pubkey: "enqueue_pubkey".to_string(),
-            domain: domain.to_string(),
-            description: String::new(),
+            identifier: NewAccountIdentifier {
+                domain: domain.to_string(),
+                identifier: "alice".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: String::new(),
+            },
         })
         .await
         .unwrap();
 
+        let account = db
+            .get_account_by_spark_pubkey("enqueue_pubkey")
+            .await
+            .unwrap()
+            .expect("Spark registration should create an account");
+
         let now = now_millis();
         let invoice = Invoice {
-            account_id: None,
+            account_id: Some(account.account_id),
             provider: None,
             wallet_kind: None,
             wallet_id: None,

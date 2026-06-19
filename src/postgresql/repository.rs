@@ -13,7 +13,6 @@ use crate::zap::Zap;
 use crate::{
     repository::LnurlRepositoryError,
     time::{now, now_millis},
-    user::User,
 };
 
 #[derive(Clone)]
@@ -92,34 +91,30 @@ fn map_account(row: &sqlx::postgres::PgRow) -> Result<Account, LnurlRepositoryEr
 #[async_trait::async_trait]
 #[allow(clippy::too_many_lines)]
 impl crate::repository::LnurlRepository for LnurlRepository {
-    async fn delete_user(&self, domain: &str, pubkey: &str) -> Result<(), LnurlRepositoryError> {
-        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2")
-            .bind(domain)
-            .bind(pubkey)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn get_user_by_name(
+    async fn get_spark_username_by_name(
         &self,
         domain: &str,
         name: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<crate::repository::SparkUsername>, LnurlRepositoryError> {
         let maybe_user = sqlx::query(
-            "SELECT pubkey, name, description
-             FROM users
-             WHERE domain = $1 AND name = $2",
+            "SELECT s.pubkey, ai.identifier, ai.description
+             FROM account_identifiers ai
+             JOIN accounts a ON a.account_id = ai.account_id
+             JOIN spark_accounts s ON s.account_id = a.account_id
+             WHERE ai.domain = $1
+               AND ai.identifier = $2
+               AND ai.identifier_kind = 'username'
+               AND a.provider = 'spark'",
         )
         .bind(domain)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
-            Ok::<_, sqlx::Error>(User {
+            Ok::<_, sqlx::Error>(crate::repository::SparkUsername {
                 domain: domain.to_string(),
                 pubkey: row.try_get(0)?,
-                name: row.try_get(1)?,
+                username: row.try_get(1)?,
                 description: row.try_get(2)?,
             })
         })
@@ -127,49 +122,37 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         Ok(maybe_user)
     }
 
-    async fn get_user_by_pubkey(
+    async fn get_spark_username_by_pubkey(
         &self,
         domain: &str,
         pubkey: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<crate::repository::SparkUsername>, LnurlRepositoryError> {
         let maybe_user = sqlx::query(
-            "SELECT pubkey, name, description
-                FROM users
-                WHERE domain = $1 AND pubkey = $2",
+            "SELECT s.pubkey, ai.identifier, ai.description
+             FROM spark_accounts s
+             JOIN accounts a ON a.account_id = s.account_id
+             JOIN account_identifiers ai ON ai.account_id = a.account_id
+             WHERE ai.domain = $1
+               AND s.pubkey = $2
+               AND ai.identifier_kind = 'username'
+               AND a.provider = 'spark'
+             ORDER BY ai.updated_at DESC, ai.identifier ASC
+             LIMIT 1",
         )
         .bind(domain)
         .bind(pubkey)
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
-            Ok::<_, sqlx::Error>(User {
+            Ok::<_, sqlx::Error>(crate::repository::SparkUsername {
                 domain: domain.to_string(),
                 pubkey: row.try_get(0)?,
-                name: row.try_get(1)?,
+                username: row.try_get(1)?,
                 description: row.try_get(2)?,
             })
         })
         .transpose()?;
         Ok(maybe_user)
-    }
-
-    async fn upsert_user(&self, user: &User) -> Result<(), LnurlRepositoryError> {
-        sqlx::query(
-            "INSERT INTO users (domain, pubkey, name, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(domain, pubkey) DO UPDATE
-             SET name = excluded.name
-             ,   description = excluded.description
-             ,   updated_at = excluded.updated_at",
-        )
-        .bind(&user.domain)
-        .bind(&user.pubkey)
-        .bind(&user.name)
-        .bind(&user.description)
-        .bind(crate::time::now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     async fn resolve_recipient_by_identifier(
@@ -351,22 +334,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "INSERT INTO users (domain, pubkey, name, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(domain, pubkey) DO UPDATE
-             SET name = excluded.name
-             ,   description = excluded.description
-             ,   updated_at = excluded.updated_at",
-        )
-        .bind(&registration.identifier.domain)
-        .bind(&registration.pubkey)
-        .bind(&registration.identifier.identifier)
-        .bind(&registration.identifier.description)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
         tx.commit()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
@@ -525,13 +492,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::SourceNotOwner);
         }
 
-        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
-            .bind(domain)
-            .bind(pubkey)
-            .bind(identifier)
-            .execute(&mut *tx)
-            .await?;
-
         tx.commit()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
@@ -570,7 +530,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&transfer.source_account_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(source_pubkey) = source_pubkey else {
+        let Some(_source_pubkey) = source_pubkey else {
             return Err(LnurlRepositoryError::InvalidOwnership);
         };
 
@@ -656,29 +616,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&destination_account_id)
         .bind(&transfer.domain)
         .bind(&transfer.identifier)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("DELETE FROM users WHERE domain = $1 AND pubkey = $2 AND name = $3")
-            .bind(&transfer.domain)
-            .bind(&source_pubkey)
-            .bind(&transfer.identifier)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(
-            "INSERT INTO users (domain, pubkey, name, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(domain, pubkey) DO UPDATE
-             SET name = excluded.name
-             ,   description = excluded.description
-             ,   updated_at = excluded.updated_at",
-        )
-        .bind(&transfer.domain)
-        .bind(&transfer.destination_spark_pubkey)
-        .bind(&transfer.identifier)
-        .bind(&transfer.description)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
@@ -808,71 +745,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&destination_account_id)
         .bind(&transfer.domain)
         .bind(&transfer.identifier)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO users (domain, pubkey, name, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(domain, pubkey) DO UPDATE
-             SET name = excluded.name
-             ,   description = excluded.description
-             ,   updated_at = excluded.updated_at",
-        )
-        .bind(&transfer.domain)
-        .bind(&transfer.destination_spark_pubkey)
-        .bind(&transfer.identifier)
-        .bind(&transfer.description)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
-        Ok(())
-    }
-
-    async fn transfer_username(
-        &self,
-        domain: &str,
-        from_pubkey: &str,
-        to_pubkey: &str,
-        username: &str,
-        description: &str,
-    ) -> Result<(), LnurlRepositoryError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
-
-        let source_name: Option<(String,)> =
-            sqlx::query_as("DELETE FROM users WHERE domain = $1 AND pubkey = $2 RETURNING name")
-                .bind(domain)
-                .bind(from_pubkey)
-                .fetch_optional(&mut *tx)
-                .await?;
-        match source_name {
-            Some((name,)) if name == username => {}
-            // Source pubkey doesn't currently own this username. The tx is
-            // rolled back on drop, so the speculative DELETE is undone.
-            _ => return Err(LnurlRepositoryError::SourceNotOwner),
-        }
-
-        sqlx::query(
-            "INSERT INTO users (domain, pubkey, name, description, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(domain, pubkey) DO UPDATE
-             SET name = excluded.name
-             ,   description = excluded.description
-             ,   updated_at = excluded.updated_at",
-        )
-        .bind(domain)
-        .bind(to_pubkey)
-        .bind(username)
-        .bind(description)
-        .bind(now())
         .execute(&mut *tx)
         .await?;
 
@@ -1464,7 +1336,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let rows = sqlx::query(
             "SELECT i.account_id, i.payment_hash, i.user_pubkey, i.invoice, i.preimage, i.amount_received_sat,
                     ai.identifier, ai.domain,
-                    u.name, u.domain,
                     sc.sender_comment,
                     i.domain
              FROM invoices i
@@ -1480,7 +1351,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                            ai2.identifier
                   LIMIT 1
               )
-             LEFT JOIN users u ON u.pubkey = i.user_pubkey AND u.domain = i.domain
              LEFT JOIN sender_comments sc ON sc.payment_hash = i.payment_hash
              WHERE i.payment_hash = ANY($1)
                AND i.domain IS NOT NULL
@@ -1494,17 +1364,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .map(|row| {
                 let account_identifier: Option<String> = row.try_get(6)?;
                 let account_identifier_domain: Option<String> = row.try_get(7)?;
-                let user_name: Option<String> = row.try_get(8)?;
-                let user_domain: Option<String> = row.try_get(9)?;
-                let lightning_address = match (
-                    account_identifier,
-                    account_identifier_domain,
-                    user_name,
-                    user_domain,
-                ) {
-                    (Some(n), Some(d), _, _) | (None, None, Some(n), Some(d)) => {
-                        Some(format!("{n}@{d}"))
-                    }
+                let lightning_address = match (account_identifier, account_identifier_domain) {
+                    (Some(identifier), Some(domain)) => Some(format!("{identifier}@{domain}")),
                     _ => None,
                 };
                 Ok::<_, sqlx::Error>(WebhookPayloadData {
@@ -1515,8 +1376,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
                     preimage: row.try_get(4)?,
                     amount_received_sat: row.try_get(5)?,
                     lightning_address,
-                    sender_comment: row.try_get(10)?,
-                    domain: row.try_get(11)?,
+                    sender_comment: row.try_get(8)?,
+                    domain: row.try_get(9)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1541,8 +1402,16 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
 
         sqlx::query(
             "INSERT INTO webhook_deliveries (identifier, domain, payload, created_at, next_retry_at)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $4::bigint[])
-             ON CONFLICT (identifier, domain) DO NOTHING",
+             SELECT candidate.identifier, candidate.domain, candidate.payload, candidate.created_at, candidate.next_retry_at
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $4::bigint[])
+                  AS candidate(identifier, domain, payload, created_at, next_retry_at)
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM webhook_deliveries existing
+                 WHERE existing.identifier = candidate.identifier
+                   AND existing.domain = candidate.domain
+             )
+             ON CONFLICT DO NOTHING",
         )
         .bind(&identifiers)
         .bind(&domains)
@@ -1726,7 +1595,6 @@ mod provider_neutral_tests {
         .execute(&pool)
         .await
         .ok()?;
-        sqlx::query("DELETE FROM users").execute(&pool).await.ok()?;
         let db = LnurlRepository::new(pool.clone());
         Some((pool, db))
     }
@@ -2253,14 +2121,14 @@ mod provider_neutral_tests {
             "targeted unregister must not remove unrelated identifiers"
         );
         assert_eq!(
-            db.get_user_by_pubkey(
+            db.get_spark_username_by_pubkey(
                 "pg-targeted-unregister.example.com",
                 "pg_spark_targeted_unregister_pubkey"
             )
             .await
             .unwrap()
             .expect("legacy recover row for unsigned identifier should remain")
-            .name,
+            .username,
             "primary"
         );
     }

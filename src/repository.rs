@@ -7,7 +7,6 @@ use anyhow::anyhow;
 
 use crate::models::ListMetadataMetadata;
 
-use crate::user::User;
 use crate::zap::Zap;
 
 #[derive(Debug, thiserror::Error)]
@@ -223,6 +222,14 @@ fn provider_neutral_not_implemented() -> LnurlRepositoryError {
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkUsername {
+    pub domain: String,
+    pub pubkey: String,
+    pub username: String,
+    pub description: String,
+}
+
 pub struct LnurlSenderComment {
     pub account_id: Option<String>,
     pub comment: String,
@@ -263,18 +270,16 @@ pub struct PendingZapReceipt {
 
 #[async_trait::async_trait]
 pub trait LnurlRepository {
-    async fn delete_user(&self, domain: &str, pubkey: &str) -> Result<(), LnurlRepositoryError>;
-    async fn get_user_by_name(
+    async fn get_spark_username_by_name(
         &self,
         domain: &str,
         name: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError>;
-    async fn get_user_by_pubkey(
+    ) -> Result<Option<SparkUsername>, LnurlRepositoryError>;
+    async fn get_spark_username_by_pubkey(
         &self,
         domain: &str,
         pubkey: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError>;
-    async fn upsert_user(&self, user: &User) -> Result<(), LnurlRepositoryError>;
+    ) -> Result<Option<SparkUsername>, LnurlRepositoryError>;
 
     async fn resolve_recipient_by_identifier(
         &self,
@@ -335,19 +340,6 @@ pub trait LnurlRepository {
     ) -> Result<(), LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
-
-    /// Atomically transfer ownership of `username` in `domain` from `from_pubkey`
-    /// to `to_pubkey`, replacing any existing row for `to_pubkey`.
-    /// Returns [`LnurlRepositoryError::SourceNotOwner`] if `from_pubkey` does not
-    /// currently own `username` in `domain`.
-    async fn transfer_username(
-        &self,
-        domain: &str,
-        from_pubkey: &str,
-        to_pubkey: &str,
-        username: &str,
-        description: &str,
-    ) -> Result<(), LnurlRepositoryError>;
 
     async fn upsert_zap(&self, zap: &Zap) -> Result<(), LnurlRepositoryError>;
     async fn get_zap_by_payment_hash(
@@ -453,7 +445,7 @@ pub trait LnurlRepository {
     ) -> Result<String, LnurlRepositoryError>;
 
     /// Get data needed to build webhook payloads for the given payment hashes.
-    /// Joins invoices, users, `sender_comments`, and `domain_webhooks`.
+    /// Joins invoices, account identifiers, `sender_comments`, and `domain_webhooks`.
     /// Returns rows for invoices that have a domain and a preimage.
     async fn get_webhook_payloads(
         &self,
@@ -784,14 +776,14 @@ pub mod shared_tests {
         assert!(recipient.blink_account_id.is_none());
 
         let legacy_user = db
-            .get_user_by_pubkey(
+            .get_spark_username_by_pubkey(
                 "test02-spark.example.com",
                 "spark_compatibility_owner_pubkey",
             )
             .await
             .unwrap()
             .expect("Spark compatibility recover lookup should still work");
-        assert_eq!(legacy_user.name, "sparkcompat");
+        assert_eq!(legacy_user.username, "sparkcompat");
         assert_eq!(legacy_user.description, "Spark compatibility owner");
     }
 
@@ -962,8 +954,8 @@ pub mod shared_tests {
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
-        // CR-02/COMP-01: Spark transfer must update the legacy users row so
-        // recover misses for the old owner and succeeds for the new owner.
+        // CR-02/COMP-01: Spark transfer must update recover ownership so the
+        // old owner misses and the new owner succeeds.
         let source_account_id = generate_account_id(AccountProvider::Spark);
         db.upsert_spark_registration(&NewSparkRegistration {
             account_id: Some(source_account_id.clone()),
@@ -1001,7 +993,7 @@ pub mod shared_tests {
         .unwrap();
 
         assert!(
-            db.get_user_by_pubkey(
+            db.get_spark_username_by_pubkey(
                 "recover-transfer.example.com",
                 "spark_recover_source_pubkey"
             )
@@ -1011,14 +1003,14 @@ pub mod shared_tests {
             "recover after transfer must miss for the old Spark owner"
         );
         let recovered = db
-            .get_user_by_pubkey(
+            .get_spark_username_by_pubkey(
                 "recover-transfer.example.com",
                 "spark_recover_destination_pubkey",
             )
             .await
             .unwrap()
             .expect("recover after transfer must return the new Spark owner");
-        assert_eq!(recovered.name, "carol");
+        assert_eq!(recovered.username, "carol");
         assert_eq!(recovered.description, "after transfer");
     }
 
@@ -1068,7 +1060,7 @@ pub mod shared_tests {
             Some("spark_fresh_transfer_destination_pubkey")
         );
         assert!(
-            db.get_user_by_pubkey(
+            db.get_spark_username_by_pubkey(
                 "fresh-transfer.example.com",
                 "spark_fresh_transfer_source_pubkey"
             )
@@ -1135,14 +1127,14 @@ pub mod shared_tests {
             Some("spark_replace_alias_destination_pubkey")
         );
         let recovered = db
-            .get_user_by_pubkey(
+            .get_spark_username_by_pubkey(
                 "replace-transfer.example.com",
                 "spark_replace_alias_destination_pubkey",
             )
             .await
             .unwrap()
             .expect("legacy recover should point to transferred identifier");
-        assert_eq!(recovered.name, "newname");
+        assert_eq!(recovered.username, "newname");
         assert_eq!(recovered.description, "replacement transfer");
     }
 
@@ -2090,14 +2082,14 @@ pub mod shared_tests {
         .unwrap();
 
         assert!(
-            db.get_user_by_pubkey(
+            db.get_spark_username_by_pubkey(
                 "delete-preserve.example.com",
                 "spark_delete_preserve_pubkey"
             )
             .await
             .unwrap()
             .is_none(),
-            "legacy users row should be removed"
+            "legacy recover lookup should miss"
         );
         assert!(
             db.resolve_recipient_by_identifier("delete-preserve.example.com", "heidi")
@@ -2424,12 +2416,17 @@ pub mod provider_neutral_schema_tests {
         assert_sqlite_check_contains(pool, "account_identifiers", "'phone'").await;
         assert_sqlite_check_contains(pool, "blink_accounts", "'btc'").await;
         assert_sqlite_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_sqlite_check_contains(pool, "invoices", "'spark'").await;
+        assert_sqlite_check_contains(pool, "invoices", "'blink'").await;
+        assert_sqlite_check_contains(pool, "invoices", "'btc'").await;
+        assert_sqlite_check_contains(pool, "invoices", "'usd'").await;
         assert_sqlite_index_exists(pool, "account_identifiers_domain_identifier_key").await;
         assert_sqlite_index_exists(pool, "spark_accounts_pubkey_key").await;
         assert_sqlite_index_exists(pool, "blink_accounts_blink_account_id_key").await;
         assert_sqlite_index_exists(pool, "idx_invoices_account_id").await;
         assert_sqlite_index_exists(pool, "idx_zaps_account_id").await;
         assert_sqlite_index_exists(pool, "idx_sender_comments_account_id").await;
+        assert_sqlite_index_exists(pool, "idx_webhook_deliveries_one_pending").await;
     }
 
     async fn assert_postgres_schema(pool: &sqlx::PgPool) {
@@ -2461,12 +2458,17 @@ pub mod provider_neutral_schema_tests {
         assert_postgres_check_contains(pool, "account_identifiers", "'phone'").await;
         assert_postgres_check_contains(pool, "blink_accounts", "'btc'").await;
         assert_postgres_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_postgres_check_contains(pool, "invoices", "'spark'").await;
+        assert_postgres_check_contains(pool, "invoices", "'blink'").await;
+        assert_postgres_check_contains(pool, "invoices", "'btc'").await;
+        assert_postgres_check_contains(pool, "invoices", "'usd'").await;
         assert_postgres_index_exists(pool, "account_identifiers_domain_identifier_key").await;
         assert_postgres_index_exists(pool, "spark_accounts_pubkey_key").await;
         assert_postgres_index_exists(pool, "blink_accounts_blink_account_id_key").await;
         assert_postgres_index_exists(pool, "idx_invoices_account_id").await;
         assert_postgres_index_exists(pool, "idx_zaps_account_id").await;
         assert_postgres_index_exists(pool, "idx_sender_comments_account_id").await;
+        assert_postgres_index_exists(pool, "idx_webhook_deliveries_one_pending").await;
     }
 
     fn assert_columns(table: &str, columns: &[String], expected: &[&str]) {

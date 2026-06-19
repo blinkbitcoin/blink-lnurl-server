@@ -622,9 +622,11 @@ insert_legacy_user() {
   local sql_host="${host//\'/\'\'}"
   local sql_pubkey="${pubkey//\'/\'\'}"
   local sql_description="${description//\'/\'\'}"
+  local account_id="legacy_${pubkey}"
+  local sql_account_id="${account_id//\'/\'\'}"
 
   docker compose exec -T postgres psql -U user -d lnurl \
-    -c "INSERT INTO users(domain, pubkey, name, description, updated_at) VALUES ('${sql_host}', '${sql_pubkey}', '${sql_username}', '${sql_description}', 0) ON CONFLICT (domain, pubkey) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at" >/dev/null
+    -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('${sql_account_id}', 'spark', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO spark_accounts(account_id, pubkey, created_at, updated_at) VALUES ('${sql_account_id}', '${sql_pubkey}', 0, 0) ON CONFLICT (account_id) DO UPDATE SET pubkey = EXCLUDED.pubkey, updated_at = EXCLUDED.updated_at; INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) VALUES ('${sql_account_id}', '${sql_host}', '${sql_username}', 'username', '${sql_description}', 0, 0) ON CONFLICT (account_id, domain, identifier) DO UPDATE SET description = EXCLUDED.description, updated_at = EXCLUDED.updated_at" >/dev/null
 }
 
 username_available() {

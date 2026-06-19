@@ -616,10 +616,10 @@ pub(super) fn validate_description(description: &str) -> Result<(), (StatusCode,
 }
 
 #[cfg(test)]
-pub(super) fn get_metadata(domain: &str, user: &crate::user::User) -> String {
+pub(super) fn get_metadata(domain: &str, username: &str, description: &str) -> String {
     json!(vec![
-        vec!["text/plain", &user.description],
-        vec!["text/identifier", &format!("{}@{}", user.name, domain)],
+        vec!["text/plain", description],
+        vec!["text/identifier", &format!("{username}@{domain}")],
     ])
     .to_string()
 }
@@ -721,18 +721,12 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn public_lnurl_discovery_shape_remains_spark_compatible() {
-        let user = User {
-            domain: "localhost:8080".to_string(),
-            pubkey: "02abc123".to_string(),
-            name: "alice".to_string(),
-            description: "Alice wallet".to_string(),
-        };
         let response = PayResponse {
             callback: "http://localhost:8080/lnurlp/alice/invoice".to_string(),
             max_sendable: 1_000_000,
             min_sendable: 1_000,
             tag: Tag::Pay,
-            metadata: get_metadata(&user.domain, &user),
+            metadata: get_metadata("localhost:8080", "alice", "Alice wallet"),
             comment_allowed: Some(MAX_COMMENT_LENGTH as u32),
             allows_nostr: None,
             nostr_pubkey: None,
