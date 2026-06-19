@@ -46,6 +46,7 @@ mod zap;
 
 #[derive(Clone, Parser, Debug, Serialize, Deserialize)]
 #[command(version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Address the lnurl server will listen on.
     #[arg(long, default_value = "0.0.0.0:8080")]
@@ -57,6 +58,10 @@ struct Args {
     /// Automatically apply migrations to the database.
     #[arg(long)]
     pub auto_migrate: bool,
+
+    /// Apply database migrations and exit without starting the server.
+    #[arg(long)]
+    pub migrate_only: bool,
 
     /// Connection string to the postgres database.
     #[arg(long, default_value = "")]
@@ -169,12 +174,9 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let args: Args = figment.merge(Env::prefixed("LNURL_")).extract()?;
-    let runtime_config = resolve_runtime_config(
-        std::env::var("DEPLOYMENT_ENV").ok().as_deref(),
-        args.spark_network,
-        args.blink_graphql_endpoint.as_deref(),
-        args.blink_enabled,
-    )?;
+    let runtime_config =
+        resolve_startup_runtime_config(&args, std::env::var("DEPLOYMENT_ENV").ok().as_deref())?;
+    let should_run_migrations = args.auto_migrate || args.migrate_only;
 
     tracing_subscriber::registry()
         .with(EnvFilter::new(&args.log_level))
@@ -195,15 +197,26 @@ async fn main() -> Result<(), anyhow::Error> {
             .await
             .map_err(|e| anyhow!("failed to create connection pool: {e:?}"))?;
 
-        if args.auto_migrate {
+        if should_run_migrations {
             debug!("running postgres database migrations");
             postgresql::run_migrations(&pool).await?;
             debug!("finished running postgres database migrations");
         } else {
             debug!("skipping postgres database migrations");
         }
+
+        if args.migrate_only {
+            info!("postgres database migrations applied; exiting due to --migrate-only");
+            return Ok(());
+        }
+
         let repository = postgresql::LnurlRepository::new(pool);
-        run_server(args, runtime_config, repository).await?;
+        run_server(
+            args,
+            runtime_config.expect("normal startup must have runtime config"),
+            repository,
+        )
+        .await?;
     } else {
         // For in-memory databases, limit to 1 connection so all queries share
         // the same database. Each separate connection to `:memory:` creates its
@@ -218,18 +231,46 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         .map_err(|e| anyhow!("failed to create connection pool: {e:?}"))?;
 
-        if args.auto_migrate {
+        if should_run_migrations {
             debug!("running sqlite database migrations");
             sqlite::run_migrations(&pool).await?;
             debug!("finished running sqlite database migrations");
         } else {
             debug!("skipping sqlite database migrations");
         }
+
+        if args.migrate_only {
+            info!("sqlite database migrations applied; exiting due to --migrate-only");
+            return Ok(());
+        }
+
         let repository = sqlite::LnurlRepository::new(pool);
-        run_server(args, runtime_config, repository).await?;
+        run_server(
+            args,
+            runtime_config.expect("normal startup must have runtime config"),
+            repository,
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+fn resolve_startup_runtime_config(
+    args: &Args,
+    deployment_env: Option<&str>,
+) -> Result<Option<RuntimeConfig>, anyhow::Error> {
+    if args.migrate_only {
+        return Ok(None);
+    }
+
+    resolve_runtime_config(
+        deployment_env,
+        args.spark_network,
+        args.blink_graphql_endpoint.as_deref(),
+        args.blink_enabled,
+    )
+    .map(Some)
 }
 
 fn parse_auth_seed(hex_str: Option<&str>) -> [u8; 32] {
@@ -668,6 +709,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_migrate_only_defaults_to_disabled() {
+        let args = default_args();
+
+        assert!(!args.migrate_only);
+    }
+
+    #[test]
+    fn cli_migrate_only_flag_parses() {
+        let args = Args::parse_from(["lnurl-server", "--migrate-only"]);
+
+        assert!(args.migrate_only);
+    }
+
+    #[test]
+    fn migrate_only_skips_runtime_config_validation() {
+        let mut args = default_args();
+        args.migrate_only = true;
+
+        let runtime_config = resolve_startup_runtime_config(&args, Some("qa"))
+            .expect("migrate-only should not validate provider runtime config");
+
+        assert!(runtime_config.is_none());
+    }
+
+    #[test]
+    fn normal_startup_validates_runtime_config() {
+        let args = default_args();
+
+        let result = resolve_startup_runtime_config(&args, Some("qa"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn cli_provider_toggles_default_to_enabled() {
         let args = default_args();
 
@@ -685,6 +760,7 @@ mod tests {
                 r"
                 spark_enabled = false
                 blink_enabled = false
+                migrate_only = true
                 ",
             ))
             .extract()
@@ -692,6 +768,7 @@ mod tests {
 
         assert!(!args.spark_enabled);
         assert!(!args.blink_enabled);
+        assert!(args.migrate_only);
     }
 
     #[test]

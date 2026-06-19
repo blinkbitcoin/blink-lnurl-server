@@ -174,7 +174,8 @@ Important options:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--address` | Address the server listens on | `0.0.0.0:8080` |
-| `--auto-migrate` | Automatically apply database migrations | `false` |
+| `--auto-migrate` | Automatically apply database migrations during normal startup | `false` |
+| `--migrate-only` | Apply database migrations and exit without starting the server | `false` |
 | `--db-url` | PostgreSQL or SQLite connection string | `""` |
 | `--domains` | Comma-separated allowed domains | `localhost:8080` |
 | `--log-level` | `RUST_LOG` style filter | `info` |
@@ -201,7 +202,7 @@ The server chooses the database implementation from `db_url`:
 - PostgreSQL: connection strings beginning with `postgres`.
 - SQLite: any other connection string, for example `lnurl.sqlite`.
 
-When `auto_migrate` is enabled, the server applies the embedded SQL migrations on startup.
+When `auto_migrate` is enabled, the server applies the embedded SQL migrations on startup. Use `--migrate-only` to run the same embedded migrations without starting the server.
 
 ## API Endpoints
 
