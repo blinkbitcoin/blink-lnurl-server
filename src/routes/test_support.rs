@@ -480,15 +480,36 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint(
     internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
     blink_endpoint: &str,
 ) -> State<MockRepository> {
+    internal_route_test_state_with_blink_endpoint_and_provider_flags(
+        repo,
+        internal_auth,
+        blink_endpoint,
+        true,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_flags(
+    repo: MockRepository,
+    internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+    blink_endpoint: &str,
+    spark_enabled: bool,
+    blink_enabled: bool,
+) -> State<MockRepository> {
     let network = spark_client::Network::Regtest;
     let auth_seed = [7_u8; 32];
+    let blink_webhook_url = Some("http://127.0.0.1/webhook/blink".to_string());
     let spark_client =
         spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
             .await
             .unwrap();
     let providers = Arc::new(crate::providers::ProviderRegistry::new(
         spark_client.clone(),
-        blink_client::Client::new(blink_client::ClientConfig::new(blink_endpoint)),
+        (!blink_endpoint.is_empty()).then_some(blink_endpoint),
+        blink_webhook_url,
+        spark_enabled,
+        blink_enabled,
     ));
     let (invoice_paid_trigger, _rx) = watch::channel(());
     State {

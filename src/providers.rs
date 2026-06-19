@@ -63,6 +63,8 @@ pub enum ProviderError {
     BlinkInvoiceCreationFailed(#[source] BlinkClientError),
     #[error("Blink payment status unavailable: {0}")]
     BlinkPaymentStatusUnavailable(#[source] BlinkClientError),
+    #[error("Blink status endpoint unavailable")]
+    BlinkStatusEndpointUnavailable,
     #[error("invoice creation failed: {0}")]
     InvoiceCreationFailed(anyhow::Error),
     #[error("payment status unavailable: {0}")]
@@ -71,22 +73,22 @@ pub enum ProviderError {
 
 pub struct BlinkProvider {
     client: blink_client::Client,
-    blink_webhook_url: String,
+    blink_webhook_url: Option<String>,
 }
 
 impl BlinkProvider {
     #[allow(dead_code)]
     pub fn new(client: blink_client::Client) -> Self {
-        Self::new_with_webhook_url(client, "http://127.0.0.1/webhook/blink")
+        Self::new_with_webhook_url(client, Some("http://127.0.0.1/webhook/blink".to_string()))
     }
 
     pub fn new_with_webhook_url(
         client: blink_client::Client,
-        blink_webhook_url: impl Into<String>,
+        blink_webhook_url: Option<String>,
     ) -> Self {
         Self {
             client,
-            blink_webhook_url: blink_webhook_url.into(),
+            blink_webhook_url,
         }
     }
 }
@@ -210,7 +212,7 @@ impl BlinkProvider {
             amount_sat: request.amount_sat,
             description_hash_hex: Some(hex::encode(request.description_hash)),
             expires_in_minutes: request.expiry,
-            webhook_url: Some(self.blink_webhook_url.as_str()),
+            webhook_url: self.blink_webhook_url.as_deref(),
         };
 
         let invoice = match wallet {
@@ -256,6 +258,9 @@ impl BlinkProvider {
 pub struct ProviderRegistry {
     spark: Arc<SparkProvider>,
     blink: Arc<BlinkProvider>,
+    spark_enabled: bool,
+    blink_enabled: bool,
+    blink_status_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -352,26 +357,38 @@ pub fn parse_blink_settlement_notification(
 }
 
 impl ProviderRegistry {
-    #[allow(dead_code)]
-    pub fn new(spark_client: spark_client::Client, blink_client: blink_client::Client) -> Self {
-        Self::new_with_blink_webhook_url(
-            spark_client,
-            blink_client,
-            "http://127.0.0.1/webhook/blink",
-        )
+    pub fn spark_enabled(&self) -> bool {
+        self.spark_enabled
     }
 
-    pub fn new_with_blink_webhook_url(
+    pub fn blink_enabled(&self) -> bool {
+        self.blink_enabled
+    }
+
+    fn blink_client(blink_graphql_endpoint: Option<&str>) -> blink_client::Client {
+        blink_client::Client::new(blink_client::ClientConfig::new(
+            blink_graphql_endpoint.unwrap_or_default(),
+        ))
+    }
+
+    pub fn new(
         spark_client: spark_client::Client,
-        blink_client: blink_client::Client,
-        blink_webhook_url: impl Into<String>,
+        blink_graphql_endpoint: Option<&str>,
+        blink_webhook_url: Option<String>,
+        spark_enabled: bool,
+        blink_enabled: bool,
     ) -> Self {
+        let blink_status_enabled = blink_graphql_endpoint.is_some();
+        let blink_client = Self::blink_client(blink_graphql_endpoint);
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
             blink: Arc::new(BlinkProvider::new_with_webhook_url(
                 blink_client,
                 blink_webhook_url,
             )),
+            spark_enabled,
+            blink_enabled,
+            blink_status_enabled,
         }
     }
 
@@ -392,7 +409,10 @@ impl ProviderRegistry {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
             AccountProvider::Spark => self.spark.payment_status(request).await,
-            AccountProvider::Blink => self.blink.payment_status(request).await,
+            AccountProvider::Blink if self.blink_status_enabled => {
+                self.blink.payment_status(request).await
+            }
+            AccountProvider::Blink => Err(ProviderError::BlinkStatusEndpointUnavailable),
         }
     }
 }
@@ -402,6 +422,8 @@ mod tests {
     use crate::repository::AccountIdentifierKind;
 
     use super::*;
+
+    const TEST_BLINK_WEBHOOK_URL: &str = "https://lnurl.example/webhook/blink";
 
     fn spark_provider_for_unit_tests() -> SparkProvider {
         // These tests exercise provider-owned capability checks that must run before
@@ -644,7 +666,7 @@ mod tests {
         let endpoint = start_blink_mock_server(request_body_tx).await;
         let provider = BlinkProvider::new_with_webhook_url(
             blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
-            "https://lnurl.example/webhook/blink",
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
         );
         let recipient = blink_recipient(Some(WalletKind::Usd));
 
@@ -674,7 +696,7 @@ mod tests {
         );
         assert_eq!(
             btc_body["variables"]["input"]["webhookUrl"],
-            "https://lnurl.example/webhook/blink"
+            TEST_BLINK_WEBHOOK_URL
         );
         assert!(btc_body["variables"]["input"].get("expiresIn").is_none());
 
@@ -704,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             usd_body["variables"]["input"]["webhookUrl"],
-            "https://lnurl.example/webhook/blink"
+            TEST_BLINK_WEBHOOK_URL
         );
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
     }
@@ -743,7 +765,7 @@ mod tests {
         let endpoint = start_blink_mock_server(request_body_tx).await;
         let blink_provider = BlinkProvider::new_with_webhook_url(
             blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
-            "https://lnurl.example/webhook/blink",
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
         );
         let default_btc_recipient = blink_recipient(Some(WalletKind::Btc));
 

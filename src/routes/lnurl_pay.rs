@@ -688,6 +688,7 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
         | ProviderError::MissingBlinkDefaultWallet
         | ProviderError::MissingBlinkBtcWalletId
         | ProviderError::MissingBlinkUsdWalletId
+        | ProviderError::BlinkStatusEndpointUnavailable
         | ProviderError::BlinkPaymentStatusUnavailable(_)
         | ProviderError::PaymentStatusUnavailable(_) => {
             error!("invalid provider invoice state: {error}");
@@ -906,6 +907,40 @@ mod tests {
             1,
             "verify fallback must enqueue webhook deliveries through handle_invoice_paid"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_blink_missing_status_endpoint_returns_local_state() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinklocalverify",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            None,
+            "",
+            true,
+            false,
+        )
+        .await;
+
+        let body = call_verify(state, &payment_hash).await;
+
+        assert_eq!(body["status"], "OK");
+        assert_eq!(body["settled"], false);
+        assert_eq!(body["preimage"], Value::Null);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice should remain stored");
+        assert!(invoice.preimage.is_none());
     }
 
     #[tokio::test]
@@ -1296,6 +1331,40 @@ mod tests {
         assert_ne!(
             stored.user_pubkey, "spark_pubkey_123",
             "Blink must not invent a fake Spark pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_blink_disabled_still_sends_webhook_url() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(31);
+        let (endpoint, calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo, None, &endpoint, true, false,
+        )
+        .await;
+
+        let _ = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("disabled Blink account mutations must not block invoices");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let body = bodies
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("provider body captured");
+        assert_eq!(
+            body["variables"]["input"]["webhookUrl"],
+            "http://127.0.0.1/webhook/blink"
         );
     }
 
