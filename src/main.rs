@@ -72,11 +72,11 @@ struct Args {
     #[arg(long)]
     pub spark_network: Option<spark_client::Network>,
 
-    /// Enable Spark provider dispatch and webhook registration.
+    /// Enable Spark account-management mutations.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub spark_enabled: bool,
 
-    /// Enable Blink provider dispatch and webhook callback URL setup.
+    /// Enable Blink account-management mutations.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub blink_enabled: bool,
 
@@ -337,11 +337,7 @@ async fn run_server<DB>(
 where
     DB: LnurlRepository + webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
-    let blink_webhook_url = if args.blink_enabled {
-        Some(build_blink_webhook_url(&args)?)
-    } else {
-        None
-    };
+    let blink_webhook_url = Some(build_blink_webhook_url(&args)?);
     let auth_seed = parse_auth_seed(args.ssp_auth_seed.as_deref());
     info!(
         deployment_env_blink_network = runtime_config.blink_network,
@@ -444,9 +440,7 @@ where
         .get_or_create_setting("webhook_secret", &default_secret)
         .await?;
 
-    if args.spark_enabled
-        && let Some(webhook_domain) = &args.webhook_domain
-    {
+    if let Some(webhook_domain) = &args.webhook_domain {
         let webhook_url = format!("{}://{}/webhook", args.scheme, webhook_domain);
         register_webhook(spark_client.clone(), webhook_url, webhook_secret.clone());
     }
@@ -882,18 +876,5 @@ mod tests {
             build_blink_webhook_url(&args).expect("configured webhook domain should build URL");
 
         assert_eq!(url, "https://lnurl.example/webhook/blink");
-    }
-
-    #[test]
-    fn blink_webhook_url_is_not_required_when_blink_disabled() {
-        let args = Args::parse_from(["lnurl-server", "--blink-enabled=false"]);
-
-        let url = args
-            .blink_enabled
-            .then(|| build_blink_webhook_url(&args))
-            .transpose()
-            .expect("disabled Blink should not require webhook domain");
-
-        assert_eq!(url, None);
     }
 }

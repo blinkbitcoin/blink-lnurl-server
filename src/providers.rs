@@ -63,6 +63,8 @@ pub enum ProviderError {
     BlinkInvoiceCreationFailed(#[source] BlinkClientError),
     #[error("Blink payment status unavailable: {0}")]
     BlinkPaymentStatusUnavailable(#[source] BlinkClientError),
+    #[error("Blink status endpoint unavailable")]
+    BlinkStatusEndpointUnavailable,
     #[error("invoice creation failed: {0}")]
     InvoiceCreationFailed(anyhow::Error),
     #[error("payment status unavailable: {0}")]
@@ -258,6 +260,7 @@ pub struct ProviderRegistry {
     blink: Arc<BlinkProvider>,
     spark_enabled: bool,
     blink_enabled: bool,
+    blink_status_enabled: bool,
 }
 
 #[allow(dead_code)]
@@ -375,6 +378,7 @@ impl ProviderRegistry {
         spark_enabled: bool,
         blink_enabled: bool,
     ) -> Self {
+        let blink_status_enabled = blink_graphql_endpoint.is_some();
         let blink_client = Self::blink_client(blink_graphql_endpoint);
         Self {
             spark: Arc::new(SparkProvider::new(spark_client)),
@@ -384,6 +388,7 @@ impl ProviderRegistry {
             )),
             spark_enabled,
             blink_enabled,
+            blink_status_enabled,
         }
     }
 
@@ -403,6 +408,7 @@ impl ProviderRegistry {
             ))),
             spark_enabled,
             blink_enabled,
+            blink_status_enabled: blink_graphql_endpoint.is_some(),
         }
     }
 
@@ -423,7 +429,10 @@ impl ProviderRegistry {
     ) -> Result<ProviderPaymentStatus, ProviderError> {
         match provider {
             AccountProvider::Spark => self.spark.payment_status(request).await,
-            AccountProvider::Blink => self.blink.payment_status(request).await,
+            AccountProvider::Blink if self.blink_status_enabled => {
+                self.blink.payment_status(request).await
+            }
+            AccountProvider::Blink => Err(ProviderError::BlinkStatusEndpointUnavailable),
         }
     }
 }

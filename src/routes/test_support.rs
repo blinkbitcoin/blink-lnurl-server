@@ -499,11 +499,7 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_f
 ) -> State<MockRepository> {
     let network = spark_client::Network::Regtest;
     let auth_seed = [7_u8; 32];
-    let blink_webhook_url = if blink_enabled {
-        Some("http://127.0.0.1/webhook/blink".to_string())
-    } else {
-        None
-    };
+    let blink_webhook_url = Some("http://127.0.0.1/webhook/blink".to_string());
     let spark_client =
         spark_client::Client::new(spark_client::ClientConfig::new(network, auth_seed))
             .await

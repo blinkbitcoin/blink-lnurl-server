@@ -341,13 +341,18 @@ where
         return Ok(Some(preimage.to_string()));
     }
 
-    let status = state
+    let status = match state
         .providers
         .payment_status(
             AccountProvider::Blink,
             PaymentStatusRequest { payment_hash },
         )
-        .await?;
+        .await
+    {
+        Ok(status) => status,
+        Err(ProviderError::BlinkStatusEndpointUnavailable) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
 
     if !status.settled {
         return Ok(None);
@@ -383,13 +388,18 @@ where
         return Ok(());
     }
 
-    let status = state
+    let status = match state
         .providers
         .payment_status(
             AccountProvider::Blink,
             PaymentStatusRequest { payment_hash },
         )
-        .await?;
+        .await
+    {
+        Ok(status) => status,
+        Err(ProviderError::BlinkStatusEndpointUnavailable) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
 
     if status.expired {
         state
@@ -771,6 +781,42 @@ mod tests {
             .unwrap()
             .expect("invoice exists");
         assert!(invoice.expired_at.is_some());
+        assert!(invoice.preimage.is_none());
+    }
+
+    #[tokio::test]
+    async fn blink_webhook_expired_missing_status_endpoint_noops() {
+        let payment_hash = compute_payment_hash(TEST_PREIMAGE_HEX);
+        let repo = MockRepository::default();
+        repo.upsert_invoice(&route_test_invoice(
+            Some(AccountProvider::Blink),
+            payment_hash.clone(),
+            "lnbc1blinknoexpirestatus",
+            None,
+        ))
+        .await
+        .unwrap();
+        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+            repo.clone(),
+            None,
+            "",
+            true,
+            false,
+        )
+        .await;
+        let app = blink_webhook_app_with_state(state);
+        let payload = blink_webhook_payload_without_preimage("EXPIRED", &payment_hash);
+
+        let (status, body) = post_blink_webhook(app, payload).await;
+
+        assert!(status.is_success());
+        assert_eq!(body, Value::Null);
+        let invoice = repo
+            .get_invoice_by_payment_hash(&payment_hash)
+            .await
+            .unwrap()
+            .expect("invoice exists");
+        assert!(invoice.expired_at.is_none());
         assert!(invoice.preimage.is_none());
     }
 
