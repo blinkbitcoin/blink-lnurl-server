@@ -1381,7 +1381,12 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
         for d in deliveries {
             sqlx::query(
                 "INSERT INTO webhook_deliveries (identifier, domain, payload, created_at, next_retry_at)
-                 VALUES ($1, $2, $3, $4, $4)
+                 SELECT $1, $2, $3, $4, $4
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                     FROM webhook_deliveries
+                     WHERE identifier = $1 AND domain = $2
+                 )
                  ON CONFLICT DO NOTHING",
             )
             .bind(&d.identifier)

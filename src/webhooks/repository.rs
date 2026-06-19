@@ -188,6 +188,35 @@ pub mod shared_tests {
         let remaining = db.take_pending_webhook_deliveries().await.unwrap();
         assert!(remaining.is_empty());
     }
+
+    pub async fn succeeded_webhook_is_not_reenqueued<DB>(db: &DB)
+    where
+        DB: WebhookRepository + Clone + Send + Sync + 'static,
+    {
+        let now = now_millis();
+        let delivery = NewWebhookDelivery {
+            identifier: "dedupe_after_success".to_string(),
+            domain: "dedupe.example.com".to_string(),
+            payload: r#"{"test":true}"#.to_string(),
+        };
+        db.insert_webhook_deliveries(std::slice::from_ref(&delivery))
+            .await
+            .unwrap();
+
+        let claimed = db.take_pending_webhook_deliveries().await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        db.update_webhook_delivery_success(claimed[0].id, now, "https://dedupe.example.com/hook")
+            .await
+            .unwrap();
+
+        db.insert_webhook_deliveries(&[delivery]).await.unwrap();
+
+        let claimed_again = db.take_pending_webhook_deliveries().await.unwrap();
+        assert!(
+            claimed_again.is_empty(),
+            "successful delivery should not be reenqueued"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +248,12 @@ mod sqlite_tests {
     async fn delete_webhook_deliveries_older_than_removes_old() {
         let db = setup_test_db().await;
         shared_tests::delete_webhook_deliveries_older_than_removes_old(&db).await;
+    }
+
+    #[tokio::test]
+    async fn succeeded_webhook_is_not_reenqueued() {
+        let db = setup_test_db().await;
+        shared_tests::succeeded_webhook_is_not_reenqueued(&db).await;
     }
 }
 
@@ -263,5 +298,13 @@ mod postgres_tests {
             return;
         };
         shared_tests::delete_webhook_deliveries_older_than_removes_old(&db).await;
+    }
+
+    #[tokio::test]
+    async fn succeeded_webhook_is_not_reenqueued() {
+        let Some(db) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::succeeded_webhook_is_not_reenqueued(&db).await;
     }
 }

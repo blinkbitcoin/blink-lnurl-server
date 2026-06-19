@@ -1402,7 +1402,15 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
 
         sqlx::query(
             "INSERT INTO webhook_deliveries (identifier, domain, payload, created_at, next_retry_at)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $4::bigint[])
+             SELECT candidate.identifier, candidate.domain, candidate.payload, candidate.created_at, candidate.next_retry_at
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $4::bigint[])
+                  AS candidate(identifier, domain, payload, created_at, next_retry_at)
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM webhook_deliveries existing
+                 WHERE existing.identifier = candidate.identifier
+                   AND existing.domain = candidate.domain
+             )
              ON CONFLICT DO NOTHING",
         )
         .bind(&identifiers)
