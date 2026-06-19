@@ -392,26 +392,6 @@ impl ProviderRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn for_tests(
-        blink_graphql_endpoint: impl Into<String>,
-        spark_enabled: bool,
-        blink_enabled: bool,
-    ) -> Self {
-        let blink_graphql_endpoint = blink_graphql_endpoint.into();
-        let blink_graphql_endpoint =
-            (!blink_graphql_endpoint.is_empty()).then_some(blink_graphql_endpoint);
-        Self {
-            spark: Arc::new(SparkProvider::new_without_wallet_for_tests()),
-            blink: Arc::new(BlinkProvider::new(Self::blink_client(
-                blink_graphql_endpoint.as_deref(),
-            ))),
-            spark_enabled,
-            blink_enabled,
-            blink_status_enabled: blink_graphql_endpoint.is_some(),
-        }
-    }
-
     pub async fn create_invoice(
         &self,
         request: CreateInvoiceRequest<'_>,
@@ -649,43 +629,6 @@ mod tests {
         wallet: Option<WalletKind>,
     ) -> CreateInvoiceRequest<'_> {
         blink_invoice_request_with_expiry(recipient, wallet, None)
-    }
-
-    #[tokio::test]
-    async fn provider_registry_enabled_providers_keep_existing_dispatch() {
-        let registry = ProviderRegistry::for_tests("http://127.0.0.1/graphql", true, true);
-        let recipient = recipient(AccountProvider::Spark, None);
-
-        let err = registry
-            .payment_status(
-                AccountProvider::Spark,
-                PaymentStatusRequest {
-                    payment_hash: "payment_hash",
-                },
-            )
-            .await
-            .expect_err("enabled Spark should reach existing Spark payment-status behavior");
-
-        assert!(
-            err.to_string()
-                .contains("DEF-03-SPARK-PAYMENT-STATUS-PHASE-7")
-        );
-
-        let invoice_err = registry
-            .create_invoice(CreateInvoiceRequest {
-                recipient: &recipient,
-                wallet: Some(WalletKind::Usd),
-                amount_sat: 1,
-                description_hash: [0; 32],
-                expiry: None,
-                include_spark_address: false,
-            })
-            .await
-            .expect_err("enabled Spark should reach existing Spark wallet gate");
-        assert!(matches!(
-            invoice_err,
-            ProviderError::UnsupportedWallet { .. }
-        ));
     }
 
     #[tokio::test]

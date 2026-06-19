@@ -597,19 +597,15 @@ pub(super) fn spark_registration_error(
     }
 }
 
-fn spark_provider_disabled_error() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.to_string())),
-    )
-}
-
 fn require_spark_provider_enabled<DB>(state: &State<DB>) -> Result<(), (StatusCode, Json<Value>)> {
     if state.providers.spark_enabled() {
         return Ok(());
     }
 
-    Err(spark_provider_disabled_error())
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.to_string())),
+    ))
 }
 
 #[allow(dead_code)]

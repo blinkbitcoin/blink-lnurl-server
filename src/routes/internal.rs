@@ -338,13 +338,6 @@ fn internal_account_creation_error(
     }
 }
 
-fn internal_provider_disabled() -> (StatusCode, Json<InternalErrorResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(InternalErrorResponse::new(INTERNAL_ERROR_PROVIDER_DISABLED)),
-    )
-}
-
 fn require_internal_provider_enabled(
     enabled: bool,
 ) -> Result<(), (StatusCode, Json<InternalErrorResponse>)> {
@@ -352,7 +345,10 @@ fn require_internal_provider_enabled(
         return Ok(());
     }
 
-    Err(internal_provider_disabled())
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(InternalErrorResponse::new(INTERNAL_ERROR_PROVIDER_DISABLED)),
+    ))
 }
 
 fn internal_transfer_to_spark_error(
@@ -724,53 +720,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_transfer_to_spark_rejects_when_spark_disabled() {
-        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
-        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo.clone(),
-            Some(internal_auth_state()),
-            "http://127.0.0.1/graphql",
-            false,
-            true,
-        )
-        .await;
-        let app = internal_transfer_to_spark_app_with_state(state);
+    async fn internal_transfer_to_spark_rejects_when_either_provider_disabled() {
+        for (spark_enabled, blink_enabled) in [(false, true), (true, false)] {
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
+                repo.clone(),
+                Some(internal_auth_state()),
+                "http://127.0.0.1/graphql",
+                spark_enabled,
+                blink_enabled,
+            )
+            .await;
+            let app = internal_transfer_to_spark_app_with_state(state);
 
-        let (status, body) = post_internal_transfer_to_spark(
-            app,
-            valid_internal_transfer_to_spark_payload(),
-            "transfer:write",
-        )
-        .await;
+            let (status, body) = post_internal_transfer_to_spark(
+                app,
+                valid_internal_transfer_to_spark_payload(),
+                "transfer:write",
+            )
+            .await;
 
-        assert_internal_provider_disabled(status, &body);
-        assert!(repo.resolve_calls().is_empty());
-        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn internal_transfer_to_spark_rejects_when_blink_disabled() {
-        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
-        let state = internal_route_test_state_with_blink_endpoint_and_provider_flags(
-            repo.clone(),
-            Some(internal_auth_state()),
-            "http://127.0.0.1/graphql",
-            true,
-            false,
-        )
-        .await;
-        let app = internal_transfer_to_spark_app_with_state(state);
-
-        let (status, body) = post_internal_transfer_to_spark(
-            app,
-            valid_internal_transfer_to_spark_payload(),
-            "transfer:write",
-        )
-        .await;
-
-        assert_internal_provider_disabled(status, &body);
-        assert!(repo.resolve_calls().is_empty());
-        assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+            assert_internal_provider_disabled(status, &body);
+            assert!(repo.resolve_calls().is_empty());
+            assert_eq!(repo.blink_to_spark_transfer_count(), 0);
+        }
     }
 
     #[tokio::test]
