@@ -45,11 +45,13 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
+-- Timestamps stay as unix epoch integers by convention because the Rust layer,
+-- LNURL protocol handling, and cross-backend tests already operate on epoch values.
 CREATE TABLE invoices (
     payment_hash VARCHAR(64) PRIMARY KEY,
     account_id TEXT REFERENCES accounts(account_id),
-    provider VARCHAR(32),
-    wallet_kind VARCHAR(32),
+    provider VARCHAR(32) CONSTRAINT invoices_provider_check CHECK (provider IN ('spark', 'blink')),
+    wallet_kind VARCHAR(32) CONSTRAINT invoices_wallet_kind_check CHECK (wallet_kind IN ('btc', 'usd')),
     wallet_id VARCHAR(255),
     provider_payment_hash VARCHAR(255),
     user_pubkey VARCHAR(66) NOT NULL,
@@ -68,6 +70,8 @@ CREATE INDEX idx_invoices_user_pubkey_updated_at ON invoices(user_pubkey, update
 CREATE INDEX idx_invoices_invoice_expiry ON invoices(invoice_expiry);
 CREATE INDEX idx_invoices_updated_at ON invoices(updated_at);
 
+-- Zap/comment side effects may be written before the invoice row exists, so
+-- payment_hash stays intentionally loose instead of using invoice foreign keys.
 CREATE TABLE zaps (
     payment_hash VARCHAR(64) NOT NULL PRIMARY KEY,
     account_id TEXT REFERENCES accounts(account_id),
@@ -121,9 +125,11 @@ CREATE TABLE webhook_deliveries (
     next_retry_at BIGINT NOT NULL,
     claimed_at BIGINT,
     last_error_status_code INTEGER,
-    last_error_body TEXT,
-    UNIQUE (identifier, domain)
+    last_error_body TEXT
 );
+CREATE UNIQUE INDEX idx_webhook_deliveries_one_pending
+    ON webhook_deliveries (identifier, domain)
+    WHERE succeeded_at IS NULL;
 CREATE INDEX idx_webhook_deliveries_pending
     ON webhook_deliveries (domain, next_retry_at)
     WHERE succeeded_at IS NULL;

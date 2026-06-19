@@ -22,12 +22,12 @@ use crate::providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError
 pub(super) use crate::repository::{
     AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
     Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier,
-    NewBlinkAccount, PendingZapReceipt, ResolvedRecipient, WalletKind, generate_account_id,
+    NewBlinkAccount, PendingZapReceipt, ResolvedRecipient, SparkUsername, WalletKind,
+    generate_account_id,
 };
 pub(super) use crate::routes::lnurl_pay::lnurl_error;
 use crate::state::State;
 use crate::time::now_millis;
-pub(super) use crate::user::User;
 pub(super) use crate::webhooks::NewWebhookDelivery;
 pub(super) use crate::webhooks::repository::WebhookRepositoryError;
 pub(super) use crate::zap::Zap;
@@ -102,25 +102,19 @@ impl MockRepository {
 
 #[async_trait::async_trait]
 impl LnurlRepository for MockRepository {
-    async fn delete_user(&self, _: &str, _: &str) -> Result<(), LnurlRepositoryError> {
-        Ok(())
-    }
-    async fn get_user_by_name(
+    async fn get_spark_username_by_name(
         &self,
         _: &str,
         _: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<SparkUsername>, LnurlRepositoryError> {
         Ok(None)
     }
-    async fn get_user_by_pubkey(
+    async fn get_spark_username_by_pubkey(
         &self,
         _: &str,
         _: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<SparkUsername>, LnurlRepositoryError> {
         Ok(None)
-    }
-    async fn upsert_user(&self, _: &User) -> Result<(), LnurlRepositoryError> {
-        Ok(())
     }
     async fn resolve_recipient_by_identifier(
         &self,
@@ -174,16 +168,6 @@ impl LnurlRepository for MockRepository {
             .lock()
             .unwrap()
             .push(transfer.clone());
-        Ok(())
-    }
-    async fn transfer_username(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<(), LnurlRepositoryError> {
         Ok(())
     }
     async fn upsert_zap(&self, _: &Zap) -> Result<(), LnurlRepositoryError> {

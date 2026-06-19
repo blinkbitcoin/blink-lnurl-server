@@ -49,11 +49,13 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
+-- Timestamps stay as unix epoch integers by convention because the Rust layer,
+-- LNURL protocol handling, and cross-backend tests already operate on epoch values.
 CREATE TABLE invoices (
     payment_hash TEXT PRIMARY KEY,
     account_id TEXT REFERENCES accounts(account_id),
-    provider TEXT,
-    wallet_kind TEXT,
+    provider TEXT CHECK (provider IN ('spark', 'blink')),
+    wallet_kind TEXT CHECK (wallet_kind IN ('btc', 'usd')),
     wallet_id TEXT,
     provider_payment_hash TEXT,
     user_pubkey TEXT NOT NULL,
@@ -72,6 +74,8 @@ CREATE INDEX idx_invoices_user_pubkey_updated_at ON invoices(user_pubkey, update
 CREATE INDEX idx_invoices_invoice_expiry ON invoices(invoice_expiry);
 CREATE INDEX idx_invoices_updated_at ON invoices(updated_at);
 
+-- Zap/comment side effects may be written before the invoice row exists, so
+-- payment_hash stays intentionally loose instead of using invoice foreign keys.
 CREATE TABLE zaps (
     payment_hash TEXT PRIMARY KEY,
     account_id TEXT REFERENCES accounts(account_id),
@@ -80,7 +84,7 @@ CREATE TABLE zaps (
     user_pubkey TEXT NOT NULL,
     invoice_expiry INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    is_user_nostr_key INTEGER NOT NULL DEFAULT FALSE
+    is_user_nostr_key INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_zaps_account_id ON zaps(account_id);
 CREATE INDEX idx_zaps_user_pubkey_updated_at ON zaps(user_pubkey, updated_at);
@@ -114,7 +118,7 @@ CREATE TABLE domain_webhooks (
 );
 
 CREATE TABLE webhook_deliveries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     identifier TEXT NOT NULL,
     domain TEXT NOT NULL,
     url TEXT,
@@ -125,9 +129,11 @@ CREATE TABLE webhook_deliveries (
     next_retry_at INTEGER NOT NULL,
     claimed_at INTEGER,
     last_error_status_code INTEGER,
-    last_error_body TEXT,
-    UNIQUE (identifier, domain)
+    last_error_body TEXT
 );
+CREATE UNIQUE INDEX idx_webhook_deliveries_one_pending
+    ON webhook_deliveries (identifier, domain)
+    WHERE succeeded_at IS NULL;
 CREATE INDEX idx_webhook_deliveries_pending
     ON webhook_deliveries (domain, next_retry_at)
     WHERE succeeded_at IS NULL;

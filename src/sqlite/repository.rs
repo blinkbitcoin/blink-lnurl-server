@@ -13,7 +13,6 @@ use crate::zap::Zap;
 use crate::{
     repository::LnurlRepositoryError,
     time::{now, now_millis},
-    user::User,
 };
 
 #[derive(Clone)]
@@ -92,19 +91,11 @@ fn map_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account, LnurlRepository
 #[async_trait::async_trait]
 #[allow(clippy::too_many_lines)]
 impl crate::repository::LnurlRepository for LnurlRepository {
-    async fn delete_user(&self, domain: &str, pubkey: &str) -> Result<(), LnurlRepositoryError> {
-        if let Some(user) = self.get_user_by_pubkey(domain, pubkey).await? {
-            self.delete_spark_registration(domain, pubkey, &user.name)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn get_user_by_name(
+    async fn get_spark_username_by_name(
         &self,
         domain: &str,
         name: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<crate::repository::SparkUsername>, LnurlRepositoryError> {
         let maybe_user = sqlx::query(
             "SELECT s.pubkey, ai.identifier, ai.description
              FROM account_identifiers ai
@@ -120,10 +111,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
-            Ok::<_, sqlx::Error>(User {
+            Ok::<_, sqlx::Error>(crate::repository::SparkUsername {
                 domain: domain.to_string(),
                 pubkey: row.try_get(0)?,
-                name: row.try_get(1)?,
+                username: row.try_get(1)?,
                 description: row.try_get(2)?,
             })
         })
@@ -131,11 +122,11 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         Ok(maybe_user)
     }
 
-    async fn get_user_by_pubkey(
+    async fn get_spark_username_by_pubkey(
         &self,
         domain: &str,
         pubkey: &str,
-    ) -> Result<Option<User>, LnurlRepositoryError> {
+    ) -> Result<Option<crate::repository::SparkUsername>, LnurlRepositoryError> {
         let maybe_user = sqlx::query(
             "SELECT s.pubkey, ai.identifier, ai.description
              FROM spark_accounts s
@@ -153,29 +144,15 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .fetch_optional(&self.pool)
         .await?
         .map(|row| {
-            Ok::<_, sqlx::Error>(User {
+            Ok::<_, sqlx::Error>(crate::repository::SparkUsername {
                 domain: domain.to_string(),
                 pubkey: row.try_get(0)?,
-                name: row.try_get(1)?,
+                username: row.try_get(1)?,
                 description: row.try_get(2)?,
             })
         })
         .transpose()?;
         Ok(maybe_user)
-    }
-
-    async fn upsert_user(&self, user: &User) -> Result<(), LnurlRepositoryError> {
-        self.upsert_spark_registration(&NewSparkRegistration {
-            account_id: None,
-            pubkey: user.pubkey.clone(),
-            identifier: crate::repository::NewAccountIdentifier {
-                domain: user.domain.clone(),
-                identifier: user.name.clone(),
-                identifier_kind: AccountIdentifierKind::Username,
-                description: user.description.clone(),
-            },
-        })
-        .await
     }
 
     async fn resolve_recipient_by_identifier(
@@ -745,33 +722,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
         Ok(())
-    }
-
-    async fn transfer_username(
-        &self,
-        domain: &str,
-        from_pubkey: &str,
-        to_pubkey: &str,
-        username: &str,
-        description: &str,
-    ) -> Result<(), LnurlRepositoryError> {
-        let source_account = self
-            .get_account_by_spark_pubkey(from_pubkey)
-            .await?
-            .ok_or(LnurlRepositoryError::SourceNotOwner)?;
-        let source_user = self.get_user_by_pubkey(domain, from_pubkey).await?;
-        if source_user.as_ref().map(|user| user.name.as_str()) != Some(username) {
-            return Err(LnurlRepositoryError::SourceNotOwner);
-        }
-
-        self.transfer_identifier(&IdentifierTransfer {
-            domain: domain.to_string(),
-            identifier: username.to_string(),
-            source_account_id: source_account.account_id,
-            destination_spark_pubkey: to_pubkey.to_string(),
-            description: description.to_string(),
-        })
-        .await
     }
 
     async fn upsert_zap(&self, zap: &Zap) -> Result<(), LnurlRepositoryError> {
@@ -1432,7 +1382,7 @@ impl crate::webhooks::WebhookRepository for LnurlRepository {
             sqlx::query(
                 "INSERT INTO webhook_deliveries (identifier, domain, payload, created_at, next_retry_at)
                  VALUES ($1, $2, $3, $4, $4)
-                 ON CONFLICT (identifier, domain) DO NOTHING",
+                 ON CONFLICT DO NOTHING",
             )
             .bind(&d.identifier)
             .bind(&d.domain)
@@ -2001,14 +1951,14 @@ mod provider_neutral_tests {
             "targeted unregister must not remove unrelated identifiers"
         );
         assert_eq!(
-            db.get_user_by_pubkey(
+            db.get_spark_username_by_pubkey(
                 "targeted-unregister.example.com",
                 "spark_targeted_unregister_pubkey"
             )
             .await
             .unwrap()
             .expect("legacy recover row for unsigned identifier should remain")
-            .name,
+            .username,
             "primary"
         );
     }

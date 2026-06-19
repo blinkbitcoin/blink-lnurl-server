@@ -40,7 +40,6 @@ mod routes;
 mod sqlite;
 mod state;
 mod time;
-mod user;
 mod webhook_notify;
 mod webhooks;
 mod zap;
