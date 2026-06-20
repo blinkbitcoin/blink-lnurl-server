@@ -11,7 +11,8 @@ use crate::{
         INTERNAL_ERROR_INVALID_REQUEST, INTERNAL_ERROR_NOT_FOUND, INTERNAL_ERROR_PROVIDER_DISABLED,
         INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
         InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
-        InternalTransferToSparkRequest, InternalTransferToSparkResponse,
+        InternalTransferToSparkRequest, InternalTransferToSparkResponse, UpdateBlinkAccountRequest,
+        UpdateBlinkAccountResponse,
     },
     repository::{
         AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, LnurlRepository,
@@ -193,6 +194,34 @@ where
         }))
     }
 
+    pub async fn update_internal_blink_account(
+        Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
+        Path(blink_account_id): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<UpdateBlinkAccountRequest>,
+    ) -> Result<Json<UpdateBlinkAccountResponse>, (StatusCode, Json<InternalErrorResponse>)> {
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+        )?;
+        require_internal_provider_enabled(state.providers.blink_enabled())?;
+
+        let blink_account_id = validate_internal_required_string(&blink_account_id)?;
+        let default_wallet = parse_internal_default_wallet(&payload.default_wallet)?;
+        let updated = state
+            .db
+            .update_blink_default_wallet(&blink_account_id, default_wallet)
+            .await
+            .map_err(internal_account_update_error)?;
+
+        Ok(Json(UpdateBlinkAccountResponse {
+            account_id: updated.account_id,
+            provider: updated.provider.as_str().to_string(),
+            blink_account_id: updated.blink_account_id,
+            default_wallet: updated.default_wallet.as_str().to_string(),
+        }))
+    }
+
     pub async fn get_internal_identifier(
         Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
         Path((domain, identifier)): Path<(String, String)>,
@@ -331,6 +360,26 @@ fn internal_account_creation_error(
         ),
         error => {
             error!("failed to create internal Blink account: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(InternalErrorResponse::new(
+                    INTERNAL_ERROR_INTERNAL_SERVER_ERROR,
+                )),
+            )
+        }
+    }
+}
+
+fn internal_account_update_error(
+    error: LnurlRepositoryError,
+) -> (StatusCode, Json<InternalErrorResponse>) {
+    match error {
+        LnurlRepositoryError::AccountNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(InternalErrorResponse::new(INTERNAL_ERROR_NOT_FOUND)),
+        ),
+        error => {
+            error!("failed to update internal Blink account: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(InternalErrorResponse::new(
@@ -705,6 +754,110 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
         assert_eq!(repo.created_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_patch_updates_default_wallet() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) = patch_internal_blink_account(
+            app,
+            "blink_account_123",
+            UpdateBlinkAccountRequest {
+                default_wallet: "btc".to_string(),
+            },
+            Some(internal_test_token_with_scope(
+                crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+            )),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["account_id"], "acct_updated_blink");
+        assert_eq!(body["provider"], "blink");
+        assert_eq!(body["blink_account_id"], "blink_account_123");
+        assert_eq!(body["default_wallet"], "btc");
+        assert_eq!(repo.updated_blink_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_patch_rejects_invalid_wallet_before_repository_write() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) = patch_internal_blink_account(
+            app,
+            "blink_account_123",
+            UpdateBlinkAccountRequest {
+                default_wallet: "eur".to_string(),
+            },
+            Some(internal_test_token_with_scope(
+                crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+            )),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(repo.updated_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_patch_requires_update_scope_before_repository_write() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) = patch_internal_blink_account(
+            app,
+            "blink_account_123",
+            UpdateBlinkAccountRequest {
+                default_wallet: "usd".to_string(),
+            },
+            Some(internal_test_token_with_scope("blink:accounts:read")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"error": "forbidden"}));
+        assert_eq!(repo.updated_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_patch_maps_not_found_and_storage_errors() {
+        let repo = MockRepository::default();
+        repo.fail_next_blink_account_update(MockUpdateBlinkAccountError::AccountNotFound);
+        let app = internal_account_app(repo.clone()).await;
+
+        let (status, body) = patch_internal_blink_account(
+            app,
+            "missing_blink_account",
+            UpdateBlinkAccountRequest {
+                default_wallet: "usd".to_string(),
+            },
+            Some(internal_test_token_with_scope(
+                crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_NOT_FOUND}));
+
+        repo.fail_next_blink_account_update(MockUpdateBlinkAccountError::Storage);
+        let app = internal_account_app(repo.clone()).await;
+        let (status, body) = patch_internal_blink_account(
+            app,
+            "blink_account_123",
+            UpdateBlinkAccountRequest {
+                default_wallet: "usd".to_string(),
+            },
+            Some(internal_test_token_with_scope(
+                crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INTERNAL_SERVER_ERROR}));
     }
 
     #[tokio::test]

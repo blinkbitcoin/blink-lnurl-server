@@ -16,14 +16,14 @@ pub(super) use crate::models::{
     INTERNAL_ERROR_WALLET_MODIFIER_NOT_ALLOWED, InternalAccountIdentifierResponse,
     InternalErrorResponse, InternalIdentifierLookupResponse, InternalProviderDetailsResponse,
     InternalTransferToSparkRequest, InternalTransferToSparkResponse, InvoicePaidRequest,
-    InvoicesPaidRequest, ListMetadataMetadata,
+    InvoicesPaidRequest, ListMetadataMetadata, UpdateBlinkAccountRequest,
 };
 use crate::providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError};
 pub(super) use crate::repository::{
     AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
     Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier,
-    NewBlinkAccount, PendingZapReceipt, ResolvedRecipient, SparkUsername, WalletKind,
-    generate_account_id,
+    NewBlinkAccount, PendingZapReceipt, ResolvedRecipient, SparkUsername, UpdatedBlinkAccount,
+    WalletKind, generate_account_id,
 };
 pub(super) use crate::routes::lnurl_pay::lnurl_error;
 use crate::state::State;
@@ -61,6 +61,9 @@ pub(super) struct MockRepository {
     pub(super) created_blink_accounts: std::sync::Arc<Mutex<Vec<NewBlinkAccount>>>,
     pub(super) create_blink_account_error:
         std::sync::Arc<Mutex<Option<MockCreateBlinkAccountError>>>,
+    pub(super) updated_blink_accounts: std::sync::Arc<Mutex<Vec<(String, WalletKind)>>>,
+    pub(super) update_blink_account_error:
+        std::sync::Arc<Mutex<Option<MockUpdateBlinkAccountError>>>,
     pub(super) resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
     pub(super) resolve_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
@@ -73,6 +76,12 @@ pub(super) enum MockCreateBlinkAccountError {
     NameTaken,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum MockUpdateBlinkAccountError {
+    AccountNotFound,
+    Storage,
+}
+
 impl MockRepository {
     pub(super) fn fail_next_blink_account_creation(&self, error: MockCreateBlinkAccountError) {
         *self.create_blink_account_error.lock().unwrap() = Some(error);
@@ -80,6 +89,14 @@ impl MockRepository {
 
     pub(super) fn created_blink_account_count(&self) -> usize {
         self.created_blink_accounts.lock().unwrap().len()
+    }
+
+    pub(super) fn fail_next_blink_account_update(&self, error: MockUpdateBlinkAccountError) {
+        *self.update_blink_account_error.lock().unwrap() = Some(error);
+    }
+
+    pub(super) fn updated_blink_account_count(&self) -> usize {
+        self.updated_blink_accounts.lock().unwrap().len()
     }
 
     pub(super) fn with_resolved_recipient(self, recipient: ResolvedRecipient) -> Self {
@@ -153,6 +170,32 @@ impl LnurlRepository for MockRepository {
             };
         }
         Ok(())
+    }
+    async fn update_blink_default_wallet(
+        &self,
+        blink_account_id: &str,
+        default_wallet: WalletKind,
+    ) -> Result<UpdatedBlinkAccount, LnurlRepositoryError> {
+        self.updated_blink_accounts
+            .lock()
+            .unwrap()
+            .push((blink_account_id.to_string(), default_wallet));
+        if let Some(error) = self.update_blink_account_error.lock().unwrap().take() {
+            return match error {
+                MockUpdateBlinkAccountError::AccountNotFound => {
+                    Err(LnurlRepositoryError::AccountNotFound)
+                }
+                MockUpdateBlinkAccountError::Storage => Err(LnurlRepositoryError::General(
+                    anyhow::anyhow!("forced update failure"),
+                )),
+            };
+        }
+        Ok(UpdatedBlinkAccount {
+            account_id: "acct_updated_blink".to_string(),
+            provider: AccountProvider::Blink,
+            blink_account_id: blink_account_id.to_string(),
+            default_wallet,
+        })
     }
     async fn transfer_identifier(
         &self,
@@ -788,6 +831,10 @@ pub(super) fn internal_account_app_with_state(state: State<MockRepository>) -> R
             "/internal/blink/accounts",
             post(LnurlServer::<MockRepository>::create_internal_blink_account),
         )
+        .route(
+            "/internal/blink/accounts/{blink_account_id}",
+            axum::routing::patch(LnurlServer::<MockRepository>::update_internal_blink_account),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::internal_auth::internal_auth::<MockRepository>,
@@ -943,6 +990,38 @@ pub(super) async fn post_internal_blink_account(
         .uri("/internal/blink/accounts")
         .header("authorization", format!("Bearer {}", internal_test_token()))
         .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&payload).expect("request serializes"),
+        ))
+        .expect("request builds");
+
+    let response = app.oneshot(request).await.expect("route responds");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body reads");
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("response body is JSON")
+    };
+    (status, body)
+}
+
+pub(super) async fn patch_internal_blink_account(
+    app: Router,
+    blink_account_id: &str,
+    payload: UpdateBlinkAccountRequest,
+    token: Option<String>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("PATCH")
+        .uri(format!("/internal/blink/accounts/{blink_account_id}"))
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let request = builder
         .body(axum::body::Body::from(
             serde_json::to_vec(&payload).expect("request serializes"),
         ))

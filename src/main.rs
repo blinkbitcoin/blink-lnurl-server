@@ -7,7 +7,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{Method, StatusCode},
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
 use clap::Parser;
@@ -525,6 +525,10 @@ where
         .route(
             "/blink/accounts",
             post(LnurlServer::<DB>::create_internal_blink_account),
+        )
+        .route(
+            "/blink/accounts/{blink_account_id}",
+            patch(LnurlServer::<DB>::update_internal_blink_account),
         )
         .route(
             "/domains/{domain}/identifiers/{identifier}",

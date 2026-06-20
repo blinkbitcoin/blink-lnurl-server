@@ -34,6 +34,19 @@ pub struct CreateBlinkAccountResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateBlinkAccountRequest {
+    pub default_wallet: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateBlinkAccountResponse {
+    pub account_id: String,
+    pub provider: String,
+    pub blink_account_id: String,
+    pub default_wallet: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InternalAccountIdentifierResponse {
     pub identifier: String,
     pub kind: String,
