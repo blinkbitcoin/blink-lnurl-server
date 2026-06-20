@@ -4,7 +4,8 @@ use sqlx::{Row, SqlitePool};
 use crate::repository::{
     Account, AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
     IdentifierTransfer, Invoice, LnurlSenderComment, NewBlinkAccount, NewSparkRegistration,
-    PendingZapReceipt, ResolvedRecipient, WalletKind, WebhookPayloadData, generate_account_id,
+    PendingZapReceipt, ResolvedRecipient, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -454,6 +455,42 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
         Ok(())
+    }
+
+    async fn update_blink_default_wallet(
+        &self,
+        blink_account_id: &str,
+        default_wallet: WalletKind,
+    ) -> Result<UpdatedBlinkAccount, LnurlRepositoryError> {
+        let row = sqlx::query(
+            "UPDATE blink_accounts
+             SET default_wallet = $1, updated_at = $2
+             WHERE blink_account_id = $3
+               AND EXISTS (
+                 SELECT 1 FROM accounts
+                 WHERE accounts.account_id = blink_accounts.account_id
+                   AND accounts.provider = 'blink'
+               )
+             RETURNING account_id, blink_account_id, default_wallet",
+        )
+        .bind(default_wallet.as_str())
+        .bind(now())
+        .bind(blink_account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(LnurlRepositoryError::AccountNotFound);
+        };
+
+        Ok(UpdatedBlinkAccount {
+            account_id: row.try_get("account_id")?,
+            provider: AccountProvider::Blink,
+            blink_account_id: row.try_get("blink_account_id")?,
+            default_wallet: WalletKind::from_database_value(
+                row.try_get::<String, _>("default_wallet")?.as_str(),
+            )?,
+        })
     }
 
     async fn delete_spark_registration(
@@ -1618,6 +1655,11 @@ mod provider_neutral_tests {
     #[tokio::test]
     async fn blink_account_creation_persists_wallet_fields() {
         shared_tests::blink_account_creation_persists_wallet_fields(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn update_blink_default_wallet() {
+        shared_tests::update_blink_default_wallet(&setup_test_db().await).await;
     }
 
     #[tokio::test]
