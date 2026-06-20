@@ -248,6 +248,26 @@ teardown_file() {
   assert_json_equals "$btc_lookup" '.provider_details.default_wallet' 'btc'
 }
 
+@test "blink: internal patch updates default wallet" {
+  create_blink_account_multi "acct-blinkpatch10" "Patch wallet" "btc" "btc-wallet-blinkpatch10" "usd-wallet-blinkpatch10" "blinkpatch10" >/dev/null
+  response="$(patch_internal_blink_account_status_body "acct-blinkpatch10" '{"default_wallet":"usd"}' "$(internal_test_token "blink:accounts:update")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [ "$code" = "200" ]
+  assert_json_equals "$body" '.provider' 'blink'
+  assert_json_equals "$body" '.blink_account_id' 'acct-blinkpatch10'
+  assert_json_equals "$body" '.default_wallet' 'usd'
+  lookup="$(internal_identifier_lookup "blinkpatch10")"
+  assert_json_equals "$lookup" '.provider_details.default_wallet' 'usd'
+
+  response="$(patch_internal_blink_account_status_body "acct-blinkpatch10" '{"default_wallet":"eur"}' "$(internal_test_token "blink:accounts:update")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'invalid_request'
+}
+
 @test "blink: registration rejects same blink_account_id and Spark-owned identifiers" {
   create_blink_account_multi "acct-reregister10" "Original Blink wallet" "btc" "btc-wallet-reregister10" "usd-wallet-reregister10" "reregister10a" >/dev/null
   same_account_body="$(create_blink_account_body "acct-reregister10" "btc-wallet-reregister10b" "usd-wallet-reregister10b" "btc" "Second Blink wallet" "reregister10b")"
