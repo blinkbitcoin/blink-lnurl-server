@@ -18,10 +18,10 @@ use tracing::debug;
 use crate::{models::InternalErrorResponse, state::State};
 
 pub const SCOPE_BLINK_ACCOUNTS_CREATE: &str = "blink:accounts:create";
-pub const SCOPE_ACCOUNTS_READ: &str = "accounts:read";
+pub const SCOPE_BLINK_ACCOUNTS_READ: &str = "blink:accounts:read";
 #[allow(dead_code)]
-pub const SCOPE_SETTLEMENT_WRITE: &str = "settlement:write";
-pub const SCOPE_TRANSFER_WRITE: &str = "transfer:write";
+pub const SCOPE_BLINK_SETTLEMENTS_WRITE: &str = "blink:settlements:write";
+pub const SCOPE_BLINK_TRANSFERS_WRITE: &str = "blink:transfers:write";
 
 #[derive(Debug, Clone)]
 pub struct InternalAuthState {
@@ -282,38 +282,38 @@ mod tests {
     #[test]
     fn internal_auth_scope_parser_accepts_compatible_d12_claim_shapes() {
         let claims: InternalClaims = serde_json::from_value(serde_json::json!({
-            "scope": "blink:accounts:create accounts:read",
-            "scp": ["settlement:write"],
-            "scopes": "transfer:write"
+            "scope": "blink:accounts:create blink:accounts:read",
+            "scp": ["blink:settlements:write"],
+            "scopes": "blink:transfers:write"
         }))
         .expect("claims parse");
         let scopes = parse_scopes(&claims);
         assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-        assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
-        assert!(scopes.contains(SCOPE_SETTLEMENT_WRITE));
-        assert!(scopes.contains(SCOPE_TRANSFER_WRITE));
+        assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_READ));
+        assert!(scopes.contains(SCOPE_BLINK_SETTLEMENTS_WRITE));
+        assert!(scopes.contains(SCOPE_BLINK_TRANSFERS_WRITE));
     }
 
     #[test]
     fn internal_auth_accepts_scope_string_claim() {
         // D-12: OAuth-style `scope` strings are accepted for scoped authorization.
         let claims: InternalClaims = serde_json::from_value(serde_json::json!({
-            "scope": "blink:accounts:create accounts:read"
+            "scope": "blink:accounts:create blink:accounts:read"
         }))
         .expect("claims parse");
 
         let scopes = parse_scopes(&claims);
 
         assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-        assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
+        assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_READ));
     }
 
     #[test]
     fn internal_auth_accepts_scp_string_or_array_claim() {
         // D-12: `scp` supports whitespace-delimited strings or string arrays.
         for value in [
-            serde_json::json!("blink:accounts:create accounts:read"),
-            serde_json::json!(["blink:accounts:create", "accounts:read"]),
+            serde_json::json!("blink:accounts:create blink:accounts:read"),
+            serde_json::json!(["blink:accounts:create", "blink:accounts:read"]),
         ] {
             let claims: InternalClaims = serde_json::from_value(serde_json::json!({
                 "scp": value
@@ -323,7 +323,7 @@ mod tests {
             let scopes = parse_scopes(&claims);
 
             assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-            assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
+            assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_READ));
         }
     }
 
@@ -331,8 +331,8 @@ mod tests {
     fn internal_auth_accepts_scopes_string_or_array_claim() {
         // D-12: `scopes` supports whitespace-delimited strings or string arrays.
         for value in [
-            serde_json::json!("blink:accounts:create accounts:read"),
-            serde_json::json!(["blink:accounts:create", "accounts:read"]),
+            serde_json::json!("blink:accounts:create blink:accounts:read"),
+            serde_json::json!(["blink:accounts:create", "blink:accounts:read"]),
         ] {
             let claims: InternalClaims = serde_json::from_value(serde_json::json!({
                 "scopes": value
@@ -342,7 +342,7 @@ mod tests {
             let scopes = parse_scopes(&claims);
 
             assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-            assert!(scopes.contains(SCOPE_ACCOUNTS_READ));
+            assert!(scopes.contains(SCOPE_BLINK_ACCOUNTS_READ));
         }
     }
 
@@ -350,13 +350,13 @@ mod tests {
     fn malformed_scope_claims_do_not_grant_authorization() {
         let claims: InternalClaims = serde_json::from_value(serde_json::json!({
             "scope": ["blink:accounts:create"],
-            "scp": ["accounts:read", 5, true],
+            "scp": ["blink:accounts:read", 5, true],
             "scopes": {"admin": true}
         }))
         .expect("claims parse");
         let scopes = parse_scopes(&claims);
         assert!(!scopes.contains(SCOPE_BLINK_ACCOUNTS_CREATE));
-        assert!(!scopes.contains(SCOPE_ACCOUNTS_READ));
+        assert!(!scopes.contains(SCOPE_BLINK_ACCOUNTS_READ));
         assert!(scopes.is_empty());
     }
 
@@ -365,7 +365,7 @@ mod tests {
         // D-09/D-10/D-12: malformed non-string array members cannot grant scopes.
         let claims: InternalClaims = serde_json::from_value(serde_json::json!({
             "scope": ["blink:accounts:create"],
-            "scp": ["accounts:read", 5],
+            "scp": ["blink:accounts:read", 5],
             "scopes": {"admin": true}
         }))
         .expect("claims parse");
@@ -414,11 +414,11 @@ mod tests {
         let state = test_auth_state();
         let missing_kid = test_token_with_header_and_claims(
             &rs256_header(None),
-            &valid_claims(&serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("blink:accounts:read")),
         );
         let unknown_kid = test_token_with_header_and_claims(
             &rs256_header(Some("unknown-kid")),
-            &valid_claims(&serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("blink:accounts:read")),
         );
 
         assert!(matches!(
@@ -439,7 +439,7 @@ mod tests {
         hs_header.kid = Some(TEST_KID.to_string());
         let wrong_alg = encode(
             &hs_header,
-            &valid_claims(&serde_json::json!("accounts:read")),
+            &valid_claims(&serde_json::json!("blink:accounts:read")),
             &EncodingKey::from_secret(b"not-the-internal-secret"),
         )
         .expect("HS256 token signs for negative test");
@@ -468,7 +468,7 @@ mod tests {
                 "aud": TEST_AUDIENCE,
                 "exp": 1_u64,
                 "nbf": 1_u64,
-                "scope": "accounts:read",
+                "scope": "blink:accounts:read",
             }),
             serde_json::json!({
                 "sub": "blink-core-test-service",
@@ -476,7 +476,7 @@ mod tests {
                 "aud": TEST_AUDIENCE,
                 "exp": 4_102_444_800_u64,
                 "nbf": 4_102_444_000_u64,
-                "scope": "accounts:read",
+                "scope": "blink:accounts:read",
             }),
             serde_json::json!({
                 "sub": "blink-core-test-service",
@@ -484,7 +484,7 @@ mod tests {
                 "aud": TEST_AUDIENCE,
                 "exp": 4_102_444_800_u64,
                 "nbf": 1_700_000_000_u64,
-                "scope": "accounts:read",
+                "scope": "blink:accounts:read",
             }),
             serde_json::json!({
                 "sub": "blink-core-test-service",
@@ -492,7 +492,7 @@ mod tests {
                 "aud": "wrong-audience",
                 "exp": 4_102_444_800_u64,
                 "nbf": 1_700_000_000_u64,
-                "scope": "accounts:read",
+                "scope": "blink:accounts:read",
             }),
         ];
 
