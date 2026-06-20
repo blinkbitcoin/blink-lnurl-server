@@ -35,7 +35,7 @@ where
     {
         crate::internal_auth::require_scope(
             &principal,
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
         )?;
         require_internal_provider_enabled(
             state.providers.spark_enabled() && state.providers.blink_enabled(),
@@ -199,7 +199,10 @@ where
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<InternalIdentifierLookupResponse>, (StatusCode, Json<InternalErrorResponse>)>
     {
-        crate::internal_auth::require_scope(&principal, crate::internal_auth::SCOPE_ACCOUNTS_READ)?;
+        crate::internal_auth::require_scope(
+            &principal,
+            crate::internal_auth::SCOPE_BLINK_ACCOUNTS_READ,
+        )?;
 
         let domain = validate_internal_lookup_domain(&domain)?;
         let parsed = parse_public_identifier(&identifier).map_err(|e| {
@@ -442,7 +445,7 @@ mod tests {
                 "aud": "lnurl-server.internal.test",
                 "exp": 4_102_444_800_u64,
                 "nbf": 1_700_000_000_u64,
-                "scope": "blink:accounts:create accounts:read"
+                "scope": "blink:accounts:create blink:accounts:read"
             }),
             &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
         )
@@ -680,7 +683,10 @@ mod tests {
             .uri("/internal/blink/accounts")
             .header(
                 "authorization",
-                format!("Bearer {}", internal_test_token_with_scope("accounts:read")),
+                format!(
+                    "Bearer {}",
+                    internal_test_token_with_scope("blink:accounts:read")
+                ),
             )
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
@@ -709,7 +715,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             valid_internal_transfer_to_spark_payload(),
-            "blink:accounts:create accounts:read",
+            "blink:accounts:create blink:accounts:read",
         )
         .await;
 
@@ -737,7 +743,7 @@ mod tests {
             let (status, body) = post_internal_transfer_to_spark(
                 app,
                 valid_internal_transfer_to_spark_payload(),
-                "transfer:write",
+                "blink:transfers:write",
             )
             .await;
 
@@ -755,7 +761,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             valid_internal_transfer_to_spark_payload(),
-            "accounts:read",
+            "blink:accounts:read",
         )
         .await;
 
@@ -778,7 +784,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             payload,
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
         )
         .await;
 
@@ -793,9 +799,12 @@ mod tests {
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
         let app = internal_transfer_to_spark_app(repo.clone()).await;
 
-        let (status, body) =
-            post_internal_transfer_to_spark_raw(app, "{", "blink:accounts:create accounts:read")
-                .await;
+        let (status, body) = post_internal_transfer_to_spark_raw(
+            app,
+            "{",
+            "blink:accounts:create blink:accounts:read",
+        )
+        .await;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
@@ -811,7 +820,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             valid_internal_transfer_to_spark_payload(),
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
         )
         .await;
 
@@ -828,7 +837,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             valid_internal_transfer_to_spark_payload(),
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
         )
         .await;
 
@@ -849,7 +858,7 @@ mod tests {
         let (status, body) = post_internal_transfer_to_spark(
             app,
             valid_internal_transfer_to_spark_payload(),
-            crate::internal_auth::SCOPE_TRANSFER_WRITE,
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
         )
         .await;
 
@@ -887,7 +896,7 @@ mod tests {
         let (status, body) = get_internal_identifier(
             app,
             "/internal/domains/example.com/identifiers/alice+btc",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
 
@@ -925,7 +934,7 @@ mod tests {
         let (status, body) = get_internal_identifier(
             app,
             "/internal/domains/Example.COM/identifiers/bob+usd",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
 
@@ -970,7 +979,7 @@ mod tests {
         let (status, body) = get_internal_identifier(
             app,
             "/internal/domains/example.com/identifiers/alice",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
 
@@ -990,13 +999,13 @@ mod tests {
         let (domain_status, domain_body) = get_internal_identifier(
             app.clone(),
             "/internal/domains/%20%20/identifiers/alice",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
         let (identifier_status, identifier_body) = get_internal_identifier(
             app,
             "/internal/domains/example.com/identifiers/alice+eur",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
 
@@ -1015,7 +1024,7 @@ mod tests {
         let (status, _body) = get_internal_identifier(
             app,
             "/internal/accounts/by-identifier/alice?domain=example.com",
-            internal_test_token_with_scope("accounts:read"),
+            internal_test_token_with_scope("blink:accounts:read"),
         )
         .await;
 

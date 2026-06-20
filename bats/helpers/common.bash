@@ -262,7 +262,7 @@ blink_settlement_notify() {
 internal_identifier_lookup() {
   local identifier="${1:?identifier is required}"
   local token
-  token="$(internal_test_token "accounts:read")"
+  token="$(internal_test_token "blink:accounts:read")"
 
   curl -fsS \
     --header "Host: localhost:8080" \
@@ -329,7 +329,7 @@ transfer_blink_identifier_to_spark() {
   local destination_pubkey="${2:?destination pubkey is required}"
   local description="${3:?description is required}"
   local token
-  token="$(internal_test_token "transfer:write")"
+  token="$(internal_test_token "blink:transfers:write")"
 
   curl -fsS \
     --request POST \

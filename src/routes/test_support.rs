@@ -758,7 +758,7 @@ pub(super) fn internal_test_token() -> String {
             "aud": "lnurl-server.internal.test",
             "exp": 4_102_444_800_u64,
             "nbf": 1_700_000_000_u64,
-            "scope": "blink:accounts:create accounts:read"
+            "scope": "blink:accounts:create blink:accounts:read"
         }),
         &EncodingKey::from_rsa_pem(private_key).expect("test RSA key must parse"),
     )

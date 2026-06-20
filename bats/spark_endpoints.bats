@@ -152,7 +152,7 @@ identifier_spark_pubkey() {
 @test "spark: internal transfer-to-spark requires transfer scope" {
   seed_blink_transfer_fixture "acct_blink_bats_scope" "scopemove" "scopestay" "Scoped Blink wallet"
   destination_pubkey="$(json_get "$(auth_payload "scopemove")" '.to_pubkey')"
-  token="$(internal_test_token "accounts:read")"
+  token="$(internal_test_token "blink:accounts:read")"
 
   response="$(internal_transfer_to_spark "${token}" "scopemove" "${destination_pubkey}" "Should not move")"
   code="${response##*$'\n'}"
@@ -166,7 +166,7 @@ identifier_spark_pubkey() {
 @test "spark: internal transfer-to-spark moves one Blink identifier to Spark" {
   seed_blink_transfer_fixture "acct_blink_bats_success" "internalmove" "internalstay" "Internal Blink wallet"
   destination_pubkey="$(json_get "$(auth_payload "internalmove")" '.to_pubkey')"
-  token="$(internal_test_token "transfer:write")"
+  token="$(internal_test_token "blink:transfers:write")"
 
   response="$(internal_transfer_to_spark "${token}" "internalmove" "${destination_pubkey}" "Internal Spark wallet")"
   code="${response##*$'\n'}"
