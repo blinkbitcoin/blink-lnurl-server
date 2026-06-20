@@ -31,8 +31,8 @@ The API uses different authentication mechanisms by route group:
 | `POST` | `/lnurlpay/{pubkey}/invoice-paid` | Legacy single-invoice paid notification with a preimage. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/invoices-paid` | Batch paid-invoice notification with up to 100 invoices. | Spark signature; optional client certificate |
 | `POST` | `/internal/blink/accounts` | Create a Blink-backed account and its identifiers. | Internal JWT with `blink:accounts:create` |
-| `GET` | `/internal/domains/{domain}/identifiers/{identifier}` | Resolve an identifier to provider-neutral account details. | Internal JWT with `accounts:read` |
-| `POST` | `/internal/identifiers/transfer-to-spark` | Transfer a Blink identifier to a Spark pubkey. | Internal JWT with `transfer:write` |
+| `GET` | `/internal/domains/{domain}/identifiers/{identifier}` | Resolve an identifier to provider-neutral account details. | Internal JWT with `blink:accounts:read` |
+| `POST` | `/internal/identifiers/transfer-to-spark` | Transfer a Blink identifier to a Spark pubkey. | Internal JWT with `blink:transfers:write` |
 | `POST` | `/webhook` | Receive Spark Service Provider payment notifications. | `X-Spark-Signature` HMAC |
 | `POST` | `/webhook/blink` | Receive Blink invoice `PAID` or `EXPIRED` notifications. | No |
 
