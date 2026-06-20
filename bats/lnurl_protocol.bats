@@ -102,7 +102,7 @@ latest_invoice_provider_account_for_spark_pubkey() {
   historical_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   seed_post_transfer_fixture "acct_blink_lnurl_history" "posttransfer" "${historical_hash}"
   destination_pubkey="$(json_get "$(auth_payload "posttransfer")" '.to_pubkey')"
-  token="$(internal_test_token "transfer:write")"
+  token="$(internal_test_token "blink:transfers:write")"
 
   response="$(internal_transfer_to_spark "${token}" "posttransfer" "${destination_pubkey}")"
   code="${response##*$'\n'}"

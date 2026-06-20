@@ -312,7 +312,7 @@ teardown_file() {
   [ "${response##*$'\n'}" = "401" ]
   response="$(post_internal_blink_account_status_body "$account_body" "not-a-jwt")"
   [ "${response##*$'\n'}" = "401" ]
-  response="$(post_internal_blink_account_status_body "$account_body" "$(internal_test_token "accounts:read")")"
+  response="$(post_internal_blink_account_status_body "$account_body" "$(internal_test_token "blink:accounts:read")")"
   code="${response##*$'\n'}"
   body="${response%$'\n'*}"
   [ "$code" = "403" ]
