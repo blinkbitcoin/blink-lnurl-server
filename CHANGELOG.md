@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.4.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.4.1)
+
+
+### Refactor
+
+- Namespace internal Blink scopes (#26)
+
 # [blink-lnurl-server release v0.4.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.4.0)
 
 
