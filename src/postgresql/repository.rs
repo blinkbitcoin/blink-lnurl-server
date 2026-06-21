@@ -469,7 +469,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              WHERE b.account_id = a.account_id
                AND a.provider = 'blink'
                AND b.blink_account_id = $3
-             RETURNING b.account_id, a.provider, b.blink_account_id, b.default_wallet",
+             RETURNING b.account_id, b.blink_account_id, b.default_wallet",
         )
         .bind(default_wallet.as_str())
         .bind(now())
@@ -483,7 +483,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
         Ok(UpdatedBlinkAccount {
             account_id: row.try_get("account_id")?,
-            provider: AccountProvider::from_database_value(row.try_get("provider")?)?,
             blink_account_id: row.try_get("blink_account_id")?,
             default_wallet: WalletKind::from_database_value(
                 row.try_get::<String, _>("default_wallet")?.as_str(),

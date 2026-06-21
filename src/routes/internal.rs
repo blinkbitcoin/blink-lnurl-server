@@ -220,7 +220,7 @@ where
 
         Ok(Json(UpdateBlinkAccountResponse {
             account_id: updated.account_id,
-            provider: updated.provider.as_str().to_string(),
+            provider: AccountProvider::Blink.as_str().to_string(),
             blink_account_id: updated.blink_account_id,
             default_wallet: updated.default_wallet.as_str().to_string(),
         }))
@@ -824,7 +824,7 @@ mod tests {
                 ),
             )
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{}"#))
+            .body(axum::body::Body::from(r"{}"))
             .expect("request builds");
 
         let response = app.oneshot(request).await.expect("route responds");

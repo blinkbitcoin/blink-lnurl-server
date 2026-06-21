@@ -192,7 +192,6 @@ impl LnurlRepository for MockRepository {
         }
         Ok(UpdatedBlinkAccount {
             account_id: "acct_updated_blink".to_string(),
-            provider: AccountProvider::Blink,
             blink_account_id: blink_account_id.to_string(),
             default_wallet,
         })

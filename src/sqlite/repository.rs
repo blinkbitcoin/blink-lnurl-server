@@ -485,7 +485,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
         Ok(UpdatedBlinkAccount {
             account_id: row.try_get("account_id")?,
-            provider: AccountProvider::Blink,
             blink_account_id: row.try_get("blink_account_id")?,
             default_wallet: WalletKind::from_database_value(
                 row.try_get::<String, _>("default_wallet")?.as_str(),

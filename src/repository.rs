@@ -151,7 +151,6 @@ pub struct BlinkAccount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatedBlinkAccount {
     pub account_id: String,
-    pub provider: AccountProvider,
     pub blink_account_id: String,
     pub default_wallet: WalletKind,
 }
@@ -895,7 +894,6 @@ pub mod shared_tests {
             .await
             .unwrap();
         assert_eq!(updated.account_id, "acct_update_blink_default_wallet");
-        assert_eq!(updated.provider, AccountProvider::Blink);
         assert_eq!(updated.blink_account_id, "blink_update_default_wallet");
         assert_eq!(updated.default_wallet, WalletKind::Usd);
 
