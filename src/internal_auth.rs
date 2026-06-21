@@ -19,6 +19,7 @@ use crate::{models::InternalErrorResponse, state::State};
 
 pub const SCOPE_BLINK_ACCOUNTS_CREATE: &str = "blink:accounts:create";
 pub const SCOPE_BLINK_ACCOUNTS_READ: &str = "blink:accounts:read";
+pub const SCOPE_BLINK_ACCOUNTS_UPDATE: &str = "blink:accounts:update";
 #[allow(dead_code)]
 pub const SCOPE_BLINK_SETTLEMENTS_WRITE: &str = "blink:settlements:write";
 pub const SCOPE_BLINK_TRANSFERS_WRITE: &str = "blink:transfers:write";

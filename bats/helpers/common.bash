@@ -221,6 +221,26 @@ post_internal_blink_account_status_body() {
     "${BASE_URL}/internal/blink/accounts"
 }
 
+patch_internal_blink_account_status_body() {
+  local blink_account_id="${1:?blink account id is required}"
+  local body="${2:?body is required}"
+  local token="${3:-}"
+  local headers=(
+    --header "Host: localhost:8080"
+    --header "Content-Type: application/json"
+  )
+  if [ -n "${token}" ]; then
+    headers+=(--header "Authorization: Bearer ${token}")
+  fi
+
+  curl -sS \
+    --request PATCH \
+    "${headers[@]}" \
+    --data "${body}" \
+    --write-out $'\n%{http_code}' \
+    "${BASE_URL}/internal/blink/accounts/${blink_account_id}"
+}
+
 create_blink_account_status() {
   local identifier="${1:?identifier is required}"
   local description="${2:-Blink test wallet}"

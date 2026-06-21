@@ -31,6 +31,7 @@ The API uses different authentication mechanisms by route group:
 | `POST` | `/lnurlpay/{pubkey}/invoice-paid` | Legacy single-invoice paid notification with a preimage. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/invoices-paid` | Batch paid-invoice notification with up to 100 invoices. | Spark signature; optional client certificate |
 | `POST` | `/internal/blink/accounts` | Create a Blink-backed account and its identifiers. | Internal JWT with `blink:accounts:create` |
+| `PATCH` | `/internal/blink/accounts/{blink_account_id}` | Update a Blink-backed account default wallet. | Internal JWT with `blink:accounts:update` |
 | `GET` | `/internal/domains/{domain}/identifiers/{identifier}` | Resolve an identifier to provider-neutral account details. | Internal JWT with `blink:accounts:read` |
 | `POST` | `/internal/identifiers/transfer-to-spark` | Transfer a Blink identifier to a Spark pubkey. | Internal JWT with `blink:transfers:write` |
 | `POST` | `/webhook` | Receive Spark Service Provider payment notifications. | `X-Spark-Signature` HMAC |
@@ -153,6 +154,31 @@ Response:
   ]
 }
 ```
+
+### Internal Blink account default-wallet update
+
+`PATCH /internal/blink/accounts/{blink_account_id}` request:
+
+```json
+{
+  "default_wallet": "usd"
+}
+```
+
+Response:
+
+```json
+{
+  "account_id": "acct_blink_...",
+  "provider": "blink",
+  "blink_account_id": "blink_account_123",
+  "default_wallet": "usd"
+}
+```
+
+Only `btc` and `usd` are accepted. The route updates only `blink_accounts.default_wallet`.
+
+Errors include `400 invalid_request`, `403 forbidden`, `404 not_found`, and `503 provider_disabled`.
 
 ### Internal identifier lookup
 

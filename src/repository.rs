@@ -149,6 +149,13 @@ pub struct BlinkAccount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedBlinkAccount {
+    pub account_id: String,
+    pub blink_account_id: String,
+    pub default_wallet: WalletKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAccountIdentifier {
     pub domain: String,
     pub identifier: String,
@@ -315,6 +322,14 @@ pub trait LnurlRepository {
         &self,
         _account: &NewBlinkAccount,
     ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    async fn update_blink_default_wallet(
+        &self,
+        _blink_account_id: &str,
+        _default_wallet: WalletKind,
+    ) -> Result<UpdatedBlinkAccount, LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
 
@@ -832,6 +847,103 @@ pub mod shared_tests {
         );
         assert_eq!(recipient.default_wallet, Some(WalletKind::Usd));
         assert!(recipient.spark_pubkey.is_none());
+    }
+
+    pub async fn update_blink_default_wallet<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        db.create_blink_account(&NewBlinkAccount {
+            account_id: Some("acct_update_blink_default_wallet".to_string()),
+            blink_account_id: "blink_update_default_wallet".to_string(),
+            btc_wallet_id: "btc_wallet_update_default_wallet".to_string(),
+            usd_wallet_id: "usd_wallet_update_default_wallet".to_string(),
+            default_wallet: WalletKind::Btc,
+            identifiers: vec![
+                NewAccountIdentifier {
+                    domain: "update-wallet.example.com".to_string(),
+                    identifier: "walletuser".to_string(),
+                    identifier_kind: AccountIdentifierKind::Username,
+                    description: "Wallet user".to_string(),
+                },
+                NewAccountIdentifier {
+                    domain: "update-wallet.example.com".to_string(),
+                    identifier: "+573005870000".to_string(),
+                    identifier_kind: AccountIdentifierKind::Phone,
+                    description: "Wallet phone".to_string(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some("acct_update_spark_untouched".to_string()),
+            pubkey: "update_spark_untouched_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "update-wallet.example.com".to_string(),
+                identifier: "sparkuser".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "Spark user".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let updated = db
+            .update_blink_default_wallet("blink_update_default_wallet", WalletKind::Usd)
+            .await
+            .unwrap();
+        assert_eq!(updated.account_id, "acct_update_blink_default_wallet");
+        assert_eq!(updated.blink_account_id, "blink_update_default_wallet");
+        assert_eq!(updated.default_wallet, WalletKind::Usd);
+
+        let username = db
+            .resolve_recipient_by_identifier("update-wallet.example.com", "walletuser")
+            .await
+            .unwrap()
+            .expect("username resolves");
+        let phone = db
+            .resolve_recipient_by_identifier("update-wallet.example.com", "+573005870000")
+            .await
+            .unwrap()
+            .expect("phone resolves");
+        assert_eq!(username.default_wallet, Some(WalletKind::Usd));
+        assert_eq!(phone.default_wallet, Some(WalletKind::Usd));
+        assert_eq!(
+            username.btc_wallet_id.as_deref(),
+            Some("btc_wallet_update_default_wallet")
+        );
+        assert_eq!(
+            username.usd_wallet_id.as_deref(),
+            Some("usd_wallet_update_default_wallet")
+        );
+
+        let updated = db
+            .update_blink_default_wallet("blink_update_default_wallet", WalletKind::Btc)
+            .await
+            .unwrap();
+        assert_eq!(updated.default_wallet, WalletKind::Btc);
+        let username = db
+            .resolve_recipient_by_identifier("update-wallet.example.com", "walletuser")
+            .await
+            .unwrap()
+            .expect("username resolves after btc update");
+        assert_eq!(username.default_wallet, Some(WalletKind::Btc));
+
+        assert!(matches!(
+            db.update_blink_default_wallet("missing_blink_account", WalletKind::Usd)
+                .await,
+            Err(LnurlRepositoryError::AccountNotFound)
+        ));
+        assert!(
+            db.get_spark_username_by_pubkey(
+                "update-wallet.example.com",
+                "update_spark_untouched_pubkey"
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
     }
 
     pub async fn global_identifier_conflict_rejects_cross_provider_duplicate<DB>(db: &DB)
