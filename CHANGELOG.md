@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.5.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.5.0)
+
+
+### Features
+
+- Add internal Blink default wallet update API (#27)
+
 # [blink-lnurl-server release v0.4.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.4.1)
 
 
