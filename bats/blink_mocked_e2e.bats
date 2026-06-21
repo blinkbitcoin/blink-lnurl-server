@@ -266,6 +266,12 @@ teardown_file() {
   body="${response%$'\n'*}"
   [ "$code" = "400" ]
   assert_json_equals "$body" '.error' 'invalid_request'
+
+  response="$(patch_internal_blink_account_status_body "acct-blinkpatch10" '{}' "$(internal_test_token "blink:accounts:update")")"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [ "$code" = "400" ]
+  assert_json_equals "$body" '.error' 'invalid_request'
 }
 
 @test "blink: registration rejects same blink_account_id and Spark-owned identifiers" {
