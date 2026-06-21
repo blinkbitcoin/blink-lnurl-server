@@ -198,7 +198,7 @@ where
         Extension(principal): Extension<crate::internal_auth::InternalPrincipal>,
         Path(blink_account_id): Path<String>,
         Extension(state): Extension<State<DB>>,
-        Json(payload): Json<UpdateBlinkAccountRequest>,
+        body: Bytes,
     ) -> Result<Json<UpdateBlinkAccountResponse>, (StatusCode, Json<InternalErrorResponse>)> {
         crate::internal_auth::require_scope(
             &principal,
@@ -206,6 +206,10 @@ where
         )?;
         require_internal_provider_enabled(state.providers.blink_enabled())?;
 
+        let payload: UpdateBlinkAccountRequest = serde_json::from_slice(&body).map_err(|e| {
+            trace!("invalid internal Blink account update request JSON: {e}");
+            internal_bad_request(INTERNAL_ERROR_INVALID_REQUEST)
+        })?;
         let blink_account_id = validate_internal_required_string(&blink_account_id)?;
         let default_wallet = parse_internal_default_wallet(&payload.default_wallet)?;
         let updated = state
@@ -797,6 +801,38 @@ mod tests {
             )),
         )
         .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
+        assert_eq!(repo.updated_blink_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_blink_account_patch_rejects_malformed_body_with_internal_error_shape() {
+        let repo = MockRepository::default();
+        let app = internal_account_app(repo.clone()).await;
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/internal/blink/accounts/blink_account_123")
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    internal_test_token_with_scope(
+                        crate::internal_auth::SCOPE_BLINK_ACCOUNTS_UPDATE,
+                    )
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{}"#))
+            .expect("request builds");
+
+        let response = app.oneshot(request).await.expect("route responds");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let body: Value = serde_json::from_slice(&body).expect("response body is JSON");
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
