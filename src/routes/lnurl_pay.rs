@@ -106,17 +106,15 @@ fn build_callback_url<DB>(
     recipient_domain: &str,
     callback_identifier: &str,
 ) -> String {
-    let callback_host = state.callback_domain.as_deref().unwrap_or(recipient_domain);
-    if state.callback_domain.is_some() {
-        format!(
+    match state.callback_domain.as_deref() {
+        Some(callback_domain) => format!(
             "{}://{}/lnurlp/{}/{}/invoice",
-            state.scheme, callback_host, recipient_domain, callback_identifier
-        )
-    } else {
-        format!(
+            state.scheme, callback_domain, recipient_domain, callback_identifier
+        ),
+        None => format!(
             "{}://{}/lnurlp/{}/invoice",
-            state.scheme, callback_host, callback_identifier
-        )
+            state.scheme, recipient_domain, callback_identifier
+        ),
     }
 }
 
