@@ -27,7 +27,7 @@ graph TD
 
 1. A wallet requests `/.well-known/lnurlp/{identifier}` or `/lnurlp/{identifier}`.
 2. `src/routes/lnurl_pay.rs` sanitizes the request host through the allowed-domain cache, parses username/phone identifiers and optional `+btc` or `+usd` wallet modifiers, and resolves the canonical recipient through `LnurlRepository::resolve_recipient_by_identifier`.
-3. The route returns LNURL metadata with a callback URL under `/lnurlp/{identifier}/invoice`.
+3. The route returns LNURL metadata with a callback URL under `/lnurlp/{identifier}/invoice`, or under `/lnurlp/{domain}/{identifier}/invoice` when `LNURL_CALLBACK_DOMAIN` is configured so invoice generation can resolve the original recipient domain independently of callback request host.
 4. When the wallet calls the invoice callback, the route validates amount, comments, zap request size, NIP-57 zap data, and provider-specific expiry constraints.
 5. `ProviderRegistry::provider_for` dispatches invoice creation to either `SparkProvider` or `BlinkProvider`.
 6. The returned BOLT11 invoice is parsed and checked for the expected amount and description hash before an invoice record is persisted for verification, zap, settlement, and webhook handling.

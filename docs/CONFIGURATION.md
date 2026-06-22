@@ -19,13 +19,14 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_DB_URL` | Required for persistent deployments | `""` | Database connection string. Values beginning with `postgres` use PostgreSQL; other values use SQLite. |
 | `LNURL_LOG_LEVEL` | Optional | `info` | `tracing_subscriber` env-filter string for application logs. |
 | `LNURL_SPARK_NETWORK` | Optional | unset | Explicit Spark/LNURL network override. When unset, startup derives the Spark/LNURL runtime network from `DEPLOYMENT_ENV`. |
-| `LNURL_SCHEME` | Optional | `https` | Scheme used when constructing LNURL callback and webhook URLs. |
+| `LNURL_SCHEME` | Optional | `https` | Scheme used when constructing LNURL callback, verify, and webhook URLs. |
 | `LNURL_MIN_SENDABLE` | Optional | `1000` | Minimum LNURL payment amount in millisatoshi. |
 | `LNURL_MAX_SENDABLE` | Optional | `4000000000` | Maximum LNURL payment amount in millisatoshi. |
 | `LNURL_DOMAINS` | Optional | `localhost:8080` | Comma-separated allowed domains. Configured domains are inserted into the database on startup. |
 | `LNURL_NSEC` | Optional | unset | Nostr private key used to sign NIP-57 zap receipts. If unset, zap requests are ignored. |
 | `LNURL_CA_CERT` | Optional | unset | Base64-encoded DER CA certificate used to validate bearer client certificates for authenticated `/lnurlpay/...` routes. |
 | `LNURL_CRL_URL` | Optional | unset | URL fetched at startup for a comma-separated certificate revocation list. |
+| `LNURL_CALLBACK_DOMAIN` | Optional | unset | Public domain used when constructing LNURL invoice callback and verify URLs. If unset, those URLs use the request domain. This does not affect provider webhook registration. |
 | `LNURL_WEBHOOK_DOMAIN` | **Required at startup** | unset | Domain used to build Blink invoice callback URLs at `{scheme}://{webhook_domain}/webhook/blink`; also used for Spark SSP webhook registration at `{scheme}://{webhook_domain}/webhook`. |
 | `LNURL_SSP_AUTH_SEED` | Optional | random seed | Hex-encoded 32-byte seed used for Spark SSP authentication. Invalid or wrong-length values log an error and fall back to a random seed. |
 | `LNURL_WEBHOOK_DELIVERY_TTL_DAYS` | Optional | `90` | Number of days to retain webhook delivery rows before cleanup. |
@@ -53,6 +54,7 @@ db_url = "postgres://user:password@127.0.0.1:5432/lnurl"
 domains = "localhost:8080,127.0.0.1:8080"
 log_level = "info"
 scheme = "http"
+callback_domain = "localhost:8080"
 webhook_domain = "localhost:8080"
 ssp_auth_seed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ```
@@ -68,6 +70,7 @@ db_url = "postgres://user:password@postgres-host:5432/lnurl"
 domains = "lnurl.example.com"
 log_level = "info"
 scheme = "https"
+callback_domain = "lnurl.example.com"
 webhook_domain = "lnurl.example.com"
 internal_jwks_url = "https://issuer.example.com/.well-known/jwks.json"
 internal_jwt_issuer = "https://issuer.example.com/"

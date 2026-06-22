@@ -101,6 +101,33 @@ pub(super) struct PublicRecipient {
     pub(super) callback_identifier: String,
 }
 
+fn build_callback_url<DB>(
+    state: &State<DB>,
+    recipient_domain: &str,
+    callback_identifier: &str,
+) -> String {
+    let callback_host = state.callback_domain.as_deref().unwrap_or(recipient_domain);
+    if state.callback_domain.is_some() {
+        format!(
+            "{}://{}/lnurlp/{}/{}/invoice",
+            state.scheme, callback_host, recipient_domain, callback_identifier
+        )
+    } else {
+        format!(
+            "{}://{}/lnurlp/{}/invoice",
+            state.scheme, callback_host, callback_identifier
+        )
+    }
+}
+
+fn build_verify_url<DB>(state: &State<DB>, recipient_domain: &str, payment_hash: &str) -> String {
+    let callback_host = state.callback_domain.as_deref().unwrap_or(recipient_domain);
+    format!(
+        "{}://{}/verify/{}",
+        state.scheme, callback_host, payment_hash
+    )
+}
+
 impl<DB> LnurlServer<DB>
 where
     DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
@@ -166,10 +193,7 @@ where
             (None, None)
         };
         Ok(Json(PayResponse {
-            callback: format!(
-                "{}://{}/lnurlp/{}/invoice",
-                state.scheme, domain, public_recipient.callback_identifier
-            ),
+            callback: build_callback_url(&state, &domain, &public_recipient.callback_identifier),
             max_sendable: state.max_sendable,
             min_sendable: state.min_sendable,
             tag: Tag::Pay,
@@ -195,6 +219,34 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
+        let domain = account::sanitize_domain(&state, &host).await?;
+        Self::handle_invoice_for_resolved_domain(domain, identifier, params, state).await
+    }
+
+    pub async fn handle_invoice_for_domain(
+        Path((domain, identifier)): Path<(String, String)>,
+        Query(params): Query<LnurlPayCallbackParams>,
+        Extension(state): Extension<State<DB>>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        if identifier.is_empty() {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        }
+
+        let domain = account::sanitize_domain(&state, &domain).await?;
+        Self::handle_invoice_for_resolved_domain(domain, identifier, params, state).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_invoice_for_resolved_domain(
+        domain: String,
+        identifier: String,
+        params: LnurlPayCallbackParams,
+        state: State<DB>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        if identifier.is_empty() {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        }
+
         let Some(public_identifier) =
             account::parse_public_identifier_for_public_route(&identifier).map_err(|e| {
                 trace!("invalid public identifier '{identifier}': {e:?}");
@@ -203,7 +255,6 @@ where
         else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
-        let domain = account::sanitize_domain(&state, &host).await?;
         let public_recipient =
             account::resolve_public_recipient(&state, &domain, public_identifier).await?;
         let Some(public_recipient) = public_recipient else {
@@ -400,7 +451,7 @@ where
             return Err(lnurl_error("internal server error"));
         }
 
-        let verify_url = format!("{}://{}/verify/{}", state.scheme, domain, payment_hash);
+        let verify_url = build_verify_url(&state, &domain, &payment_hash);
 
         Ok(Json(json!({
             "pr": res.bolt11,
@@ -1158,6 +1209,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_discovery_with_callback_domain_includes_recipient_domain_in_path() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let mut state = internal_route_test_state(repo, None).await;
+        state.callback_domain = Some("callback.example.com".to_string());
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("configured callback domain should return PayResponse metadata");
+
+        assert_eq!(
+            response.callback,
+            "http://callback.example.com/lnurlp/example.com/alice+usd/invoice"
+        );
+    }
+
+    #[tokio::test]
     async fn blink_public_discovery_missing_user_returns_lnurl_error_but_invalid_phone_like_identifier_keeps_not_found_shape_d_19()
      {
         // D-19: valid missing usernames now follow the LNURL error contract,
@@ -1325,6 +1396,42 @@ mod tests {
         assert_ne!(
             stored.user_pubkey, "spark_pubkey_123",
             "Blink must not invent a fake Spark pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_with_callback_domain_uses_path_domain_and_configured_verify_host()
+     {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(41);
+        let (endpoint, calls, _bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let mut state =
+            internal_route_test_state_with_blink_endpoint(repo.clone(), None, &endpoint).await;
+        state.callback_domain = Some("callback.example.com".to_string());
+
+        let Json(body) = get_public_invoice_for_domain(
+            state,
+            "example.com",
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("configured callback-domain invoice callback should succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let returned_invoice = Bolt11Invoice::from_str(body["pr"].as_str().unwrap())
+            .expect("mock should return a valid invoice");
+        let payment_hash = returned_invoice.payment_hash().to_string();
+        assert_eq!(
+            body["verify"],
+            format!("http://callback.example.com/verify/{payment_hash}")
+        );
+        assert_eq!(
+            repo.resolve_calls(),
+            vec![("example.com".to_string(), "alice".to_string())]
         );
     }
 

@@ -88,6 +88,11 @@ struct Args {
     #[arg(long, default_value = "https")]
     pub scheme: String,
 
+    /// Optional public domain used for LNURL callback and verify URLs.
+    /// If unset, request host behavior is preserved.
+    #[arg(long)]
+    pub callback_domain: Option<String>,
+
     /// Minimum amount (in millisatoshi) that can be sent in a lnurl payment.
     #[arg(long, default_value = "1000")]
     pub min_sendable: u64,
@@ -499,6 +504,7 @@ where
         providers,
         internal_auth,
         scheme: args.scheme,
+        callback_domain: args.callback_domain,
         min_sendable: args.min_sendable,
         max_sendable: args.max_sendable,
         include_spark_address: {
@@ -586,6 +592,10 @@ where
         .route(
             "/lnurlp/{identifier}",
             get(LnurlServer::<DB>::handle_lnurl_pay),
+        )
+        .route(
+            "/lnurlp/{domain}/{identifier}/invoice",
+            get(LnurlServer::<DB>::handle_invoice_for_domain),
         )
         .route(
             "/lnurlp/{identifier}/invoice",
