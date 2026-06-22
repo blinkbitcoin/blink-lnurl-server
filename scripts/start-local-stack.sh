@@ -9,10 +9,13 @@ BIND_ADDR="127.0.0.1:8080"
 BASE_URL="http://${BIND_ADDR}"
 POSTGRES_PORT="${LNURL_POSTGRES_PORT:-5432}"
 DB_URL="postgres://user:password@127.0.0.1:${POSTGRES_PORT}/lnurl"
-LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl-server}"
+DEFAULT_LNURL_BIN="${ROOT_DIR}/target/debug/lnurl-server"
+LNURL_BIN="${LNURL_BIN:-${DEFAULT_LNURL_BIN}}"
 WEBHOOK_DOMAIN="${LNURL_WEBHOOK_DOMAIN:-localhost:8080}"
+CALLBACK_DOMAIN="${LNURL_CALLBACK_DOMAIN:-}"
 RESET_DB="${RESET_DB:-false}"
 BLINK_GRAPHQL_ARGS=()
+CALLBACK_DOMAIN_ARGS=()
 
 mkdir -p "${STATE_DIR}"
 
@@ -83,8 +86,11 @@ fi
 
 : >"${LOG_FILE}"
 
-if [ ! -x "${LNURL_BIN}" ]; then
-  cargo build --locked --bin lnurl-server
+if [ "${LNURL_BIN}" = "${DEFAULT_LNURL_BIN}" ]; then
+  cargo build --quiet --locked --bin lnurl-server
+elif [ ! -x "${LNURL_BIN}" ]; then
+  echo "LNURL_BIN is not executable: ${LNURL_BIN}" >&2
+  exit 1
 fi
 
 EFFECTIVE_DEPLOYMENT_ENV="${DEPLOYMENT_ENV:-local}"
@@ -96,6 +102,10 @@ elif [ "${EFFECTIVE_DEPLOYMENT_ENV}" = "local" ]; then
   exit 1
 fi
 
+if [ -n "${CALLBACK_DOMAIN}" ]; then
+  CALLBACK_DOMAIN_ARGS=(--callback-domain "${CALLBACK_DOMAIN}")
+fi
+
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   DEPLOYMENT_ENV="${EFFECTIVE_DEPLOYMENT_ENV}" \
   "${LNURL_BIN}" \
@@ -104,6 +114,7 @@ LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     --db-url "${DB_URL}" \
     --domains "localhost:8080,127.0.0.1:8080" \
     "${BLINK_GRAPHQL_ARGS[@]}" \
+    "${CALLBACK_DOMAIN_ARGS[@]}" \
     --log-level "info" \
     --scheme "http" \
     --webhook-domain "${WEBHOOK_DOMAIN}" \

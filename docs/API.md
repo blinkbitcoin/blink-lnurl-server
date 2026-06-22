@@ -19,6 +19,7 @@ The API uses different authentication mechanisms by route group:
 | `GET` | `/.well-known/lnurlp/{identifier}` | Return an LNURL-pay metadata response for a Lightning Address identifier. | No |
 | `GET` | `/lnurlp/{identifier}` | Return an LNURL-pay metadata response. Supports `+btc` and `+usd` wallet modifiers for Blink identifiers. | No |
 | `GET` | `/lnurlp/{identifier}/invoice` | Create a BOLT11 invoice for an LNURL payment callback. | No |
+| `GET` | `/lnurlp/{domain}/{identifier}/invoice` | Create a BOLT11 invoice for an LNURL payment callback using the path domain. Used when `LNURL_CALLBACK_DOMAIN` is configured. | No |
 | `GET` | `/verify/{payment_hash}` | Return LUD-21 settlement status, preimage, and invoice for a stored payment hash. | No |
 | `GET` | `/health` | Readiness check returning HTTP 200. | No |
 | `GET` | `/lnurlpay/available/{identifier}` | Check whether a Spark username is available on the request host domain. | Optional client certificate if `LNURL_CA_CERT` is configured |
@@ -58,9 +59,17 @@ The API uses different authentication mechanisms by route group:
 
 `allowsNostr` and `nostrPubkey` are included only when the server has Nostr keys configured.
 
+If `LNURL_CALLBACK_DOMAIN` is configured, the advertised callback uses that host and includes the original recipient domain in the path so multi-domain identifiers remain unambiguous:
+
+```json
+{
+  "callback": "https://callback.example.com/lnurlp/example.com/alice/invoice"
+}
+```
+
 ### Public invoice callback
 
-`GET /lnurlp/{identifier}/invoice` accepts these query parameters:
+`GET /lnurlp/{identifier}/invoice` and `GET /lnurlp/{domain}/{identifier}/invoice` accept these query parameters:
 
 | Parameter | Required | Description |
 |---|---:|---|
@@ -78,6 +87,8 @@ Successful responses contain exactly `pr`, `routes`, and `verify`:
   "verify": "https://example.com/verify/<payment_hash>"
 }
 ```
+
+When `LNURL_CALLBACK_DOMAIN` is configured, the advertised `verify` URL uses that host as well.
 
 ### Spark-compatible management requests
 

@@ -544,6 +544,7 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_f
         providers,
         internal_auth,
         scheme: "http".to_string(),
+        callback_domain: None,
         min_sendable: 1_000,
         max_sendable: 4_000_000_000,
         include_spark_address: false,
@@ -770,6 +771,26 @@ pub(super) async fn get_public_invoice(
     LnurlServer::<MockRepository>::handle_invoice(
         Host("example.com".to_string()),
         Path(identifier.to_string()),
+        Query(params),
+        Extension(state),
+    )
+    .await
+}
+
+pub(super) async fn get_public_invoice_for_domain(
+    state: State<MockRepository>,
+    domain: &str,
+    identifier: &str,
+    params: LnurlPayCallbackParams,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    LnurlServer::<MockRepository>::handle_invoice_for_domain(
+        Host(
+            state
+                .callback_domain
+                .clone()
+                .unwrap_or_else(|| "example.com".to_string()),
+        ),
+        Path((domain.to_string(), identifier.to_string())),
         Query(params),
         Extension(state),
     )
