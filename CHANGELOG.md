@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.6.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.6.0)
+
+
+### Features
+
+- Support configured LNURL callback domain (#28)
+
 # [blink-lnurl-server release v0.5.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.5.0)
 
 
