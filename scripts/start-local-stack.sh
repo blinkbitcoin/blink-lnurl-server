@@ -9,7 +9,8 @@ BIND_ADDR="127.0.0.1:8080"
 BASE_URL="http://${BIND_ADDR}"
 POSTGRES_PORT="${LNURL_POSTGRES_PORT:-5432}"
 DB_URL="postgres://user:password@127.0.0.1:${POSTGRES_PORT}/lnurl"
-LNURL_BIN="${LNURL_BIN:-${ROOT_DIR}/target/debug/lnurl-server}"
+DEFAULT_LNURL_BIN="${ROOT_DIR}/target/debug/lnurl-server"
+LNURL_BIN="${LNURL_BIN:-${DEFAULT_LNURL_BIN}}"
 WEBHOOK_DOMAIN="${LNURL_WEBHOOK_DOMAIN:-localhost:8080}"
 CALLBACK_DOMAIN="${LNURL_CALLBACK_DOMAIN:-}"
 RESET_DB="${RESET_DB:-false}"
@@ -85,7 +86,12 @@ fi
 
 : >"${LOG_FILE}"
 
-cargo build --quiet --locked --bin lnurl-server
+if [ "${LNURL_BIN}" = "${DEFAULT_LNURL_BIN}" ]; then
+  cargo build --quiet --locked --bin lnurl-server
+elif [ ! -x "${LNURL_BIN}" ]; then
+  echo "LNURL_BIN is not executable: ${LNURL_BIN}" >&2
+  exit 1
+fi
 
 EFFECTIVE_DEPLOYMENT_ENV="${DEPLOYMENT_ENV:-local}"
 

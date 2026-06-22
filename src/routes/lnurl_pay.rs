@@ -222,11 +222,20 @@ where
     }
 
     pub async fn handle_invoice_for_domain(
+        Host(host): Host,
         Path((domain, identifier)): Path<(String, String)>,
         Query(params): Query<LnurlPayCallbackParams>,
         Extension(state): Extension<State<DB>>,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if identifier.is_empty() {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        }
+
+        let Some(callback_domain) = state.callback_domain.as_deref() else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+
+        if !host.trim().eq_ignore_ascii_case(callback_domain) {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
@@ -1431,6 +1440,29 @@ mod tests {
             repo.resolve_calls(),
             vec![("example.com".to_string(), "alice".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_for_domain_is_unavailable_without_callback_domain() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo, None).await;
+
+        let Err((status, Json(body))) = get_public_invoice_for_domain(
+            state,
+            "example.com",
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        else {
+            panic!("domain-qualified callback should be unavailable without callback domain");
+        };
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, Value::String(String::new()));
     }
 
     #[tokio::test]
