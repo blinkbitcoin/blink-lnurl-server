@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.6.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.6.1)
+
+
+### Bug Fixes
+
+- NIP-57 p tag validation (#29)
+
 # [blink-lnurl-server release v0.6.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.6.0)
 
 
