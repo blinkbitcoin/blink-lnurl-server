@@ -368,7 +368,7 @@ pub(super) fn validate_nostr_zap_request(
 #[cfg(test)]
 mod tests {
     use super::validate_nostr_zap_request;
-    use nostr::{EventBuilder, JsonUtil, Kind, Keys};
+    use nostr::{EventBuilder, Keys, Kind};
 
     #[test]
     fn validate_nostr_zap_request_allows_recipient_p_tag_different_from_server_key() {
@@ -380,8 +380,11 @@ mod tests {
                 nostr::Tag::parse(["p", &recipient_keys.public_key.to_string()]).unwrap(),
                 nostr::Tag::parse(["amount", "21000"]).unwrap(),
                 nostr::Tag::parse(["relays", "wss://relay.damus.io"]).unwrap(),
-                nostr::Tag::parse(["e", "df7add863ee33a5ffc895444fcd067f617ea1723c7eaade80d7e5de2b1a75741"])
-                    .unwrap(),
+                nostr::Tag::parse([
+                    "e",
+                    "df7add863ee33a5ffc895444fcd067f617ea1723c7eaade80d7e5de2b1a75741",
+                ])
+                .unwrap(),
                 nostr::Tag::parse(["k", "1"]).unwrap(),
             ])
             .sign_with_keys(&sender_keys)
