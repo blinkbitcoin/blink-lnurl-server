@@ -290,7 +290,6 @@ where
 pub(super) fn validate_nostr_zap_request(
     amount_msat: u64,
     event: &Event,
-    expected_nostr_pubkey: bitcoin::secp256k1::XOnlyPublicKey,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     if event.kind != Kind::ZapRequest {
         trace!("nostr event is incorrect kind");
@@ -309,25 +308,16 @@ pub(super) fn validate_nostr_zap_request(
         return Err(lnurl_error("invalid nostr event"));
     }
 
-    // 3. It MUST have only one p tag for the advertised recipient pubkey.
-    let mut p_tags = event
+    // 3. It MUST have only one p tag.
+    if event
         .tags
         .iter()
-        .filter(|tag| {
-            tag.single_letter_tag()
-                .is_some_and(|t| t.is_lowercase() && t.character == Alphabet::P)
-        })
-        .filter_map(nostr::Tag::content);
-    let Some(p_tag) = p_tags.next() else {
-        trace!("invalid nostr event, missing 'p' tag");
-        return Err(lnurl_error("invalid nostr event"));
-    };
-    if p_tags.next().is_some() {
+        .filter_map(nostr::Tag::single_letter_tag)
+        .filter(|t| t.is_lowercase() && t.character == Alphabet::P)
+        .count()
+        != 1
+    {
         trace!("invalid nostr event, missing or multiple 'p' tags");
-        return Err(lnurl_error("invalid nostr event"));
-    }
-    if p_tag != expected_nostr_pubkey.to_string() {
-        trace!("invalid nostr event, 'p' tag does not match recipient pubkey");
         return Err(lnurl_error("invalid nostr event"));
     }
 
@@ -373,4 +363,30 @@ pub(super) fn validate_nostr_zap_request(
     // 8. There MUST be 0 or 1 P tags. If there is one, it MUST be equal to the zap receipt's pubkey.
     // TODO(Phase 7): Enforce optional NIP-57 P-tag recipient checks when provider-neutral zap receipt keys are migrated.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_nostr_zap_request;
+    use nostr::{EventBuilder, JsonUtil, Kind, Keys};
+
+    #[test]
+    fn validate_nostr_zap_request_allows_recipient_p_tag_different_from_server_key() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let event = EventBuilder::new(Kind::ZapRequest, "Zap!")
+            .tags([
+                nostr::Tag::parse(["p", &recipient_keys.public_key.to_string()]).unwrap(),
+                nostr::Tag::parse(["amount", "21000"]).unwrap(),
+                nostr::Tag::parse(["relays", "wss://relay.damus.io"]).unwrap(),
+                nostr::Tag::parse(["e", "df7add863ee33a5ffc895444fcd067f617ea1723c7eaade80d7e5de2b1a75741"])
+                    .unwrap(),
+                nostr::Tag::parse(["k", "1"]).unwrap(),
+            ])
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+
+        assert!(validate_nostr_zap_request(21_000, &event).is_ok());
+    }
 }
