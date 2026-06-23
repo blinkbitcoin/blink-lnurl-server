@@ -311,7 +311,7 @@ where
             .transpose()?;
 
         let desc_hash = if let Some(raw_event) = &params.nostr {
-            let Some(expected_nostr_pubkey) = nostr_pubkey else {
+            let Some(_nostr_pubkey) = nostr_pubkey else {
                 trace!("nostr zap not supported");
                 return Err(lnurl_error("nostr zap not supported"));
             };
@@ -324,7 +324,7 @@ where
                 trace!("invalid nostr event, could not parse: {}", e);
                 lnurl_error("invalid nostr event")
             })?;
-            super::zap::validate_nostr_zap_request(amount_msat, &event, expected_nostr_pubkey)?;
+            super::zap::validate_nostr_zap_request(amount_msat, &event)?;
             sha256::Hash::hash(raw_event.as_bytes())
         } else {
             let metadata = get_metadata_for_recipient(
