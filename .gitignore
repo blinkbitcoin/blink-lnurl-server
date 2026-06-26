@@ -4,3 +4,4 @@
 *.sqlite
 target/
 .planning/
+.envrc.local

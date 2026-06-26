@@ -1,6 +1,7 @@
 use crate::{
     providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
 };
+use ::tracing::{debug, error, info};
 use anyhow::anyhow;
 use axum::{
     Extension, Router,
@@ -22,8 +23,6 @@ use std::str::FromStr;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod auth;
@@ -40,6 +39,7 @@ mod routes;
 mod sqlite;
 mod state;
 mod time;
+mod tracing;
 mod webhook_notify;
 mod webhooks;
 mod zap;
@@ -183,10 +183,7 @@ async fn main() -> Result<(), anyhow::Error> {
         resolve_startup_runtime_config(&args, std::env::var("DEPLOYMENT_ENV").ok().as_deref())?;
     let should_run_migrations = args.auto_migrate || args.migrate_only;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::new(&args.log_level))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-        .init();
+    tracing::init(&args.log_level).map_err(|e| anyhow!("failed to initialize tracing: {e}"))?;
 
     if let Some(config_file) = &config_file {
         info!(
@@ -530,19 +527,35 @@ where
     let internal_router = Router::new()
         .route(
             "/blink/accounts",
-            post(LnurlServer::<DB>::create_internal_blink_account),
+            traced_route!(
+                post(LnurlServer::<DB>::create_internal_blink_account),
+                "lnurl.create_internal_blink_account",
+                "/internal/blink/accounts"
+            ),
         )
         .route(
             "/blink/accounts/{blink_account_id}",
-            patch(LnurlServer::<DB>::update_internal_blink_account),
+            traced_route!(
+                patch(LnurlServer::<DB>::update_internal_blink_account),
+                "lnurl.update_internal_blink_account",
+                "/internal/blink/accounts/{blink_account_id}"
+            ),
         )
         .route(
             "/domains/{domain}/identifiers/{identifier}",
-            get(LnurlServer::<DB>::get_internal_identifier),
+            traced_route!(
+                get(LnurlServer::<DB>::get_internal_identifier),
+                "lnurl.get_internal_identifier",
+                "/internal/domains/{domain}/identifiers/{identifier}"
+            ),
         )
         .route(
             "/identifiers/transfer-to-spark",
-            post(LnurlServer::<DB>::transfer_identifier_to_spark),
+            traced_route!(
+                post(LnurlServer::<DB>::transfer_identifier_to_spark),
+                "lnurl.transfer_identifier_to_spark",
+                "/internal/identifiers/transfer-to-spark"
+            ),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -553,33 +566,75 @@ where
         .nest("/internal", internal_router)
         .route(
             "/lnurlpay/available/{identifier}",
-            get(LnurlServer::<DB>::available),
+            traced_route!(
+                get(LnurlServer::<DB>::available),
+                "lnurl.available",
+                "/lnurlpay/available/{identifier}"
+            ),
         )
-        .route("/lnurlpay/{pubkey}", post(LnurlServer::<DB>::register))
-        .route("/lnurlpay/{pubkey}", delete(LnurlServer::<DB>::unregister))
+        .route(
+            "/lnurlpay/{pubkey}",
+            traced_route!(
+                post(LnurlServer::<DB>::register),
+                "lnurl.register",
+                "/lnurlpay/{pubkey}"
+            ),
+        )
+        .route(
+            "/lnurlpay/{pubkey}",
+            traced_route!(
+                delete(LnurlServer::<DB>::unregister),
+                "lnurl.unregister",
+                "/lnurlpay/{pubkey}"
+            ),
+        )
         .route(
             "/lnurlpay/{pubkey}/transfer",
-            post(LnurlServer::<DB>::transfer),
+            traced_route!(
+                post(LnurlServer::<DB>::transfer),
+                "lnurl.transfer",
+                "/lnurlpay/{pubkey}/transfer"
+            ),
         )
         .route(
             "/lnurlpay/{pubkey}/recover",
-            post(LnurlServer::<DB>::recover),
+            traced_route!(
+                post(LnurlServer::<DB>::recover),
+                "lnurl.recover",
+                "/lnurlpay/{pubkey}/recover"
+            ),
         )
         .route(
             "/lnurlpay/{pubkey}/metadata",
-            get(LnurlServer::<DB>::list_metadata),
+            traced_route!(
+                get(LnurlServer::<DB>::list_metadata),
+                "lnurl.list_metadata",
+                "/lnurlpay/{pubkey}/metadata"
+            ),
         )
         .route(
             "/lnurlpay/{pubkey}/metadata/{payment_hash}/zap",
-            post(LnurlServer::<DB>::publish_zap_receipt),
+            traced_route!(
+                post(LnurlServer::<DB>::publish_zap_receipt),
+                "lnurl.publish_zap_receipt",
+                "/lnurlpay/{pubkey}/metadata/{payment_hash}/zap"
+            ),
         )
         .route(
             "/lnurlpay/{pubkey}/invoice-paid",
-            post(LnurlServer::<DB>::invoice_paid),
+            traced_route!(
+                post(LnurlServer::<DB>::invoice_paid),
+                "lnurl.invoice_paid",
+                "/lnurlpay/{pubkey}/invoice-paid"
+            ),
         )
         .route(
             "/lnurlpay/{pubkey}/invoices-paid",
-            post(LnurlServer::<DB>::invoices_paid),
+            traced_route!(
+                post(LnurlServer::<DB>::invoices_paid),
+                "lnurl.invoices_paid",
+                "/lnurlpay/{pubkey}/invoices-paid"
+            ),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -587,24 +642,64 @@ where
         ))
         .route(
             "/.well-known/lnurlp/{identifier}",
-            get(LnurlServer::<DB>::handle_lnurl_pay),
+            traced_route!(
+                get(LnurlServer::<DB>::handle_lnurl_pay),
+                "lnurl.handle_lnurl_pay",
+                "/.well-known/lnurlp/{identifier}"
+            ),
         )
         .route(
             "/lnurlp/{identifier}",
-            get(LnurlServer::<DB>::handle_lnurl_pay),
+            traced_route!(
+                get(LnurlServer::<DB>::handle_lnurl_pay),
+                "lnurl.handle_lnurl_pay",
+                "/lnurlp/{identifier}"
+            ),
         )
         .route(
             "/lnurlp/{domain}/{identifier}/invoice",
-            get(LnurlServer::<DB>::handle_invoice_for_domain),
+            traced_route!(
+                get(LnurlServer::<DB>::handle_invoice_for_domain),
+                "lnurl.handle_invoice_for_domain",
+                "/lnurlp/{domain}/{identifier}/invoice"
+            ),
         )
         .route(
             "/lnurlp/{identifier}/invoice",
-            get(LnurlServer::<DB>::handle_invoice),
+            traced_route!(
+                get(LnurlServer::<DB>::handle_invoice),
+                "lnurl.handle_invoice",
+                "/lnurlp/{identifier}/invoice"
+            ),
         )
-        .route("/verify/{payment_hash}", get(LnurlServer::<DB>::verify))
-        .route("/webhook", post(LnurlServer::<DB>::webhook))
-        .route("/webhook/blink", post(LnurlServer::<DB>::blink_webhook))
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/verify/{payment_hash}",
+            traced_route!(
+                get(LnurlServer::<DB>::verify),
+                "lnurl.verify",
+                "/verify/{payment_hash}"
+            ),
+        )
+        .route(
+            "/webhook",
+            traced_route!(
+                post(LnurlServer::<DB>::webhook),
+                "lnurl.webhook",
+                "/webhook"
+            ),
+        )
+        .route(
+            "/webhook/blink",
+            traced_route!(
+                post(LnurlServer::<DB>::blink_webhook),
+                "lnurl.blink_webhook",
+                "/webhook/blink"
+            ),
+        )
+        .route(
+            "/health",
+            traced_route!(get(|| async { StatusCode::OK }), "lnurl.health", "/health"),
+        )
         .layer(Extension(state))
         .layer(
             CorsLayer::new()

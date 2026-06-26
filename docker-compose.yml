@@ -11,6 +11,19 @@ services:
       timeout: 5s
       retries: 10
 
+  otel-agent:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    restart: unless-stopped
+    command: ["--config=/etc/otel-agent-config.yaml"]
+    environment:
+      HONEYCOMB_API_KEY: ${HONEYCOMB_API_KEY:-}
+      HONEYCOMB_DATASET: ${HONEYCOMB_DATASET:-blink-lnurl-server-dev}
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./dev/otel-agent-config.yaml:/etc/otel-agent-config.yaml:ro
+
   lnurl-server:
     build: .
     environment:
@@ -24,8 +37,13 @@ services:
       LNURL_SCHEME: http
       LNURL_SSP_AUTH_SEED: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       LNURL_WEBHOOK_DOMAIN: localhost:8080
+      OTEL_SERVICE_NAME: blink-lnurl-server-dev
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-agent:4317
     depends_on:
       postgres:
         condition: service_healthy
+      otel-agent:
+        condition: service_started
     ports:
       - "8080:8080"
