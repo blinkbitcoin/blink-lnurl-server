@@ -1,6 +1,5 @@
 use std::env;
 
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use tracing::{Level, Span, field::display};
@@ -57,44 +56,38 @@ pub fn init(log_level: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
         .with_target(false)
         .with_writer(std::io::stdout);
 
-    if otlp_enabled(
-        env::var("OTEL_TRACES_EXPORTER").ok().as_deref(),
-        env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
-    ) {
+    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let otlp_exporter = env::var("OTEL_TRACES_EXPORTER").ok();
+
+    if otlp_enabled(otlp_exporter.as_deref(), otlp_endpoint.as_deref()) {
         let service_name = service_name();
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
-            .with_endpoint(env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?)
+            .with_endpoint(otlp_endpoint.expect("checked above"))
             .build()?;
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(
                 opentelemetry_sdk::Resource::builder_empty()
                     .with_service_name(service_name.clone())
-                    .with_attribute(KeyValue::new("service.name", service_name.clone()))
                     .build(),
             )
             .build();
         opentelemetry::global::set_tracer_provider(provider.clone());
         let telemetry = tracing_opentelemetry::layer().with_tracer(provider.tracer(service_name));
 
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .with(telemetry)
-            .try_init()?;
+        subscriber.with(telemetry).try_init()?;
     } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init()?;
+        subscriber.try_init()?;
     }
 
     Ok(())
 }
 
 fn otlp_enabled(exporter: Option<&str>, endpoint: Option<&str>) -> bool {
-    matches!(exporter, Some("otlp")) && endpoint.is_some_and(|value| !value.trim().is_empty())
+    exporter == Some("otlp") && endpoint.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn service_name() -> String {
@@ -118,41 +111,25 @@ pub fn record_http_status(span: &Span, status: axum::http::StatusCode) {
 }
 
 pub fn record_http_params(span: &Span, route: &str, path: &str, query: Option<&str>) {
-    record_path_param(span, route, path, "identifier");
-    record_path_param(span, route, path, "pubkey");
-    record_path_param(span, route, path, "payment_hash");
-    record_path_param(span, route, path, "domain");
-    record_path_param(span, route, path, "blink_account_id");
+    for name in [
+        "identifier",
+        "pubkey",
+        "payment_hash",
+        "domain",
+        "blink_account_id",
+    ] {
+        record_param(span, name, path_param(route, path, name));
+    }
     if route == "/lnurlpay/{pubkey}/transfer" {
-        record_path_param_as(span, route, path, "pubkey", "to_pubkey");
+        record_param(span, "to_pubkey", path_param(route, path, "pubkey"));
     }
-    record_query_param(span, query, "amount");
-    record_query_param(span, query, "expiry");
-    record_query_param(span, query, "offset");
-    record_query_param(span, query, "limit");
-    record_query_param(span, query, "updated_after");
-}
-
-fn record_path_param_as(span: &Span, route: &str, path: &str, from: &str, to: &str) {
-    if let Some(value) = path_param(route, path, from) {
-        span.record(
-            format!("code.function.params.{to}").as_str(),
-            display(value),
-        );
+    for name in ["amount", "expiry", "offset", "limit", "updated_after"] {
+        record_param(span, name, query_param(query, name));
     }
 }
 
-fn record_path_param(span: &Span, route: &str, path: &str, name: &str) {
-    if let Some(value) = path_param(route, path, name) {
-        span.record(
-            format!("code.function.params.{name}").as_str(),
-            display(value),
-        );
-    }
-}
-
-fn record_query_param(span: &Span, query: Option<&str>, name: &str) {
-    if let Some(value) = query_param(query, name) {
+fn record_param(span: &Span, name: &str, value: Option<String>) {
+    if let Some(value) = value {
         span.record(
             format!("code.function.params.{name}").as_str(),
             display(value),
@@ -161,13 +138,12 @@ fn record_query_param(span: &Span, query: Option<&str>, name: &str) {
 }
 
 pub fn path_param(route: &str, path: &str, name: &str) -> Option<String> {
+    let pattern = format!("{{{name}}}");
     route
         .trim_matches('/')
         .split('/')
         .zip(path.trim_matches('/').split('/'))
-        .find_map(|(route_part, path_part)| {
-            (route_part == format!("{{{name}}}")).then(|| path_part.to_string())
-        })
+        .find_map(|(route_part, path_part)| (route_part == pattern).then(|| path_part.to_string()))
 }
 
 pub fn query_param(query: Option<&str>, name: &str) -> Option<String> {
@@ -180,7 +156,7 @@ pub fn query_param(query: Option<&str>, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::otlp_enabled;
+    use super::*;
 
     #[test]
     fn otlp_requires_exporter_and_endpoint() {
