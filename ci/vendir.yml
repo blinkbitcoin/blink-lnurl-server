@@ -3,15 +3,42 @@ kind: Config
 
 # Relative to ci/
 directories:
-  - path: ./vendor
-    contents:
-      - path: .
-        git:
-          url: https://github.com/blinkbitcoin/concourse-shared.git
-          ref: 8abc39e9e056b79b774007e6fadc40ca5d92c2e5
-        includePaths:
-          - shared/ci/**/*
-        excludePaths:
-          - shared/ci/**/nodejs-*
-          - shared/ci/**/tofu-*
-        newRootPath: shared/ci
+- path: ../.github/workflows/vendor
+  contents:
+  - path: . # Copy this folder out to ..
+    git:
+      url: https://github.com/blinkbitcoin/concourse-shared.git
+      ref: 43a32a3f830f6b23cc5326b7d98e950121bb637b
+    includePaths:
+    - shared/actions/*
+    excludePaths:
+    - shared/actions/nodejs-*
+    - shared/actions/tofu-*
+    newRootPath: shared/actions
+
+- path: ./vendor
+  contents:
+  - path: .
+    git:
+      url: https://github.com/blinkbitcoin/concourse-shared.git
+      ref: 43a32a3f830f6b23cc5326b7d98e950121bb637b
+    includePaths:
+    - shared/ci/**/*
+    excludePaths:
+    - shared/ci/**/nodejs-*
+    - shared/ci/**/tofu-*
+    newRootPath: shared/ci
+
+- path: ../bin/vendor
+  contents:
+  - path: .
+    git:
+      url: https://github.com/blinkbitcoin/concourse-shared.git
+      ref: 43a32a3f830f6b23cc5326b7d98e950121bb637b
+    includePaths:
+    - shared/bin/**/*
+    excludePaths:
+    - shared/bin/**/nodejs-*
+    - shared/bin/**/tofu-*
+    newRootPath: shared/bin
+
