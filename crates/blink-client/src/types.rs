@@ -38,6 +38,27 @@ pub struct CreatedInvoice {
     pub payment_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayCurrency {
+    Usd,
+}
+
+impl DisplayCurrency {
+    pub const fn as_graphql_value(self) -> &'static str {
+        match self {
+            Self::Usd => "USD",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrencyConversionEstimate {
+    pub btc_sat_amount: u64,
+    pub id: String,
+    pub timestamp: i64,
+    pub usd_cent_amount: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentStatusState {
     Paid,

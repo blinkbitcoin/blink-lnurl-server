@@ -1,6 +1,6 @@
 use blink_client::{
     BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice,
-    PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
+    DisplayCurrency, PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -101,6 +101,29 @@ fn assert_graphql_payment_status_request(request: &Request, payment_hash: &str) 
             .pointer("/variables/input/paymentHash")
             .and_then(Value::as_str)
             == Some(payment_hash)
+}
+
+fn assert_graphql_currency_conversion_request(
+    request: &Request,
+    amount: f64,
+    currency: &str,
+) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        return false;
+    };
+
+    body.get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|query| {
+            query.contains("CurrencyConversionEstimation")
+                && query.contains("currencyConversionEstimation")
+                && query.contains("btcSatAmount")
+        })
+        && body
+            .pointer("/variables/amount")
+            .and_then(Value::as_f64)
+            .is_some_and(|value| (value - amount).abs() < f64::EPSILON)
+        && body.pointer("/variables/currency").and_then(Value::as_str) == Some(currency)
 }
 
 async fn mount_invoice_response(
@@ -564,6 +587,97 @@ async fn payment_status_rejects_malformed_response() {
         .payment_status("bad-hash")
         .await
         .expect_err("missing payment hash must be rejected");
+
+    assert!(matches!(error, BlinkClientError::MalformedResponse(_)));
+}
+
+#[tokio::test]
+async fn gets_currency_conversion_estimation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_currency_conversion_request(request, 0.01, "USD")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "currencyConversionEstimation": {
+                    "btcSatAmount": 1,
+                    "id": "estimate-1",
+                    "timestamp": 1_752_000_000_i64,
+                    "usdCentAmount": 1
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let estimate = client
+        .currency_conversion_estimation(0.01, DisplayCurrency::Usd)
+        .await
+        .expect("conversion estimate should parse");
+
+    assert_eq!(estimate.btc_sat_amount, 1);
+    assert_eq!(estimate.id, "estimate-1");
+    assert_eq!(estimate.timestamp, 1_752_000_000_i64);
+    assert_eq!(estimate.usd_cent_amount, 1);
+}
+
+#[tokio::test]
+async fn currency_conversion_maps_top_level_graphql_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_currency_conversion_request(request, 0.01, "USD")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [{ "message": "conversion query failed" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .currency_conversion_estimation(0.01, DisplayCurrency::Usd)
+        .await
+        .expect_err("top-level GraphQL errors must not be accepted as conversion estimates");
+
+    let BlinkClientError::Graphql(errors) = error else {
+        panic!("expected Graphql error");
+    };
+    assert_eq!(errors[0].message, "conversion query failed");
+}
+
+#[tokio::test]
+async fn currency_conversion_rejects_malformed_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            assert_graphql_currency_conversion_request(request, 0.01, "USD")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "currencyConversionEstimation": {
+                    "id": "estimate-1",
+                    "timestamp": 1_752_000_000_i64,
+                    "usdCentAmount": 1
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let error = client
+        .currency_conversion_estimation(0.01, DisplayCurrency::Usd)
+        .await
+        .expect_err("missing btcSatAmount must be rejected");
 
     assert!(matches!(error, BlinkClientError::MalformedResponse(_)));
 }
