@@ -1,9 +1,15 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::RwLock;
 
 use crate::repository::{AccountProvider, ResolvedRecipient, WalletKind};
 use bitcoin::secp256k1::PublicKey;
-use blink_client::{BlinkClientError, PaymentStatusState};
+use blink_client::{BlinkClientError, DisplayCurrency, PaymentStatusState};
+
+const USD_MIN_SENDABLE_CACHE_TTL: Duration = Duration::from_mins(5);
+const USD_MIN_SENDABLE_ESTIMATION_AMOUNT: f64 = 0.01;
 
 const SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL: &str = "DEF-03-SPARK-PAYMENT-STATUS-PHASE-7: Spark payment status remains route-owned until Phase 7 SETL-01 settlement dispatch";
 
@@ -63,6 +69,10 @@ pub enum ProviderError {
     BlinkInvoiceCreationFailed(#[source] BlinkClientError),
     #[error("Blink payment status unavailable: {0}")]
     BlinkPaymentStatusUnavailable(#[source] BlinkClientError),
+    #[error("Blink USD minSendable conversion failed: {0}")]
+    BlinkUsdMinSendableUnavailable(#[source] BlinkClientError),
+    #[error("Blink USD minSendable overflowed")]
+    UsdMinSendableOverflow,
     #[error("Blink status endpoint unavailable")]
     BlinkStatusEndpointUnavailable,
     #[error("invoice creation failed: {0}")]
@@ -71,9 +81,15 @@ pub enum ProviderError {
     PaymentStatusUnavailable(anyhow::Error),
 }
 
+struct CachedUsdMinSendable {
+    min_sendable_msat: u64,
+    fetched_at: Instant,
+}
+
 pub struct BlinkProvider {
     client: blink_client::Client,
     blink_webhook_url: Option<String>,
+    usd_min_sendable_cache: RwLock<Option<CachedUsdMinSendable>>,
 }
 
 impl BlinkProvider {
@@ -89,6 +105,7 @@ impl BlinkProvider {
         Self {
             client,
             blink_webhook_url,
+            usd_min_sendable_cache: RwLock::new(None),
         }
     }
 }
@@ -196,6 +213,38 @@ impl SparkProvider {
 }
 
 impl BlinkProvider {
+    pub async fn usd_min_sendable_msat(&self) -> Result<u64, ProviderError> {
+        {
+            let cache = self.usd_min_sendable_cache.read().await;
+            if let Some(cache) = cache.as_ref()
+                && cache.fetched_at.elapsed() < USD_MIN_SENDABLE_CACHE_TTL
+            {
+                return Ok(cache.min_sendable_msat);
+            }
+        }
+
+        let estimate = self
+            .client
+            .currency_conversion_estimation(
+                USD_MIN_SENDABLE_ESTIMATION_AMOUNT,
+                DisplayCurrency::Usd,
+            )
+            .await
+            .map_err(ProviderError::BlinkUsdMinSendableUnavailable)?;
+        let min_sendable_msat = estimate
+            .btc_sat_amount
+            .checked_add(1)
+            .and_then(|sats| sats.checked_mul(1000))
+            .ok_or(ProviderError::UsdMinSendableOverflow)?;
+
+        let mut cache = self.usd_min_sendable_cache.write().await;
+        *cache = Some(CachedUsdMinSendable {
+            min_sendable_msat,
+            fetched_at: Instant::now(),
+        });
+        Ok(min_sendable_msat)
+    }
+
     pub async fn create_invoice(
         &self,
         request: CreateInvoiceRequest<'_>,
@@ -415,6 +464,10 @@ impl ProviderRegistry {
             AccountProvider::Blink => Err(ProviderError::BlinkStatusEndpointUnavailable),
         }
     }
+
+    pub async fn blink_usd_min_sendable_msat(&self) -> Result<u64, ProviderError> {
+        self.blink.usd_min_sendable_msat().await
+    }
 }
 
 #[cfg(test)]
@@ -538,9 +591,24 @@ mod tests {
                 let request_body_tx = request_body_tx.clone();
                 async move {
                     request_body_tx
-                        .send(body)
+                        .send(body.clone())
                         .await
                         .expect("request body receiver should stay open");
+                    if body["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("currencyConversionEstimation"))
+                    {
+                        return axum::Json(serde_json::json!({
+                            "data": {
+                                "currencyConversionEstimation": {
+                                    "btcSatAmount": 20,
+                                    "id": "estimate-1",
+                                    "timestamp": 1_752_000_000_i64,
+                                    "usdCentAmount": 1
+                                }
+                            }
+                        }));
+                    }
                     axum::Json(serde_json::json!({
                         "data": {
                             "lnInvoiceCreateOnBehalfOfRecipient": {
@@ -658,6 +726,80 @@ mod tests {
             .await
             .expect_err("selected USD wallet id must be present");
         assert!(matches!(err, ProviderError::MissingBlinkUsdWalletId));
+    }
+
+    #[tokio::test]
+    async fn blink_provider_caches_usd_min_sendable_for_five_minutes() {
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(2);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(endpoint),
+        ));
+
+        let first = provider
+            .usd_min_sendable_msat()
+            .await
+            .expect("USD min sendable should be fetched");
+        let second = provider
+            .usd_min_sendable_msat()
+            .await
+            .expect("USD min sendable should be served from cache");
+
+        assert_eq!(first, 21_000);
+        assert_eq!(second, 21_000);
+
+        let first_body = request_body_rx
+            .recv()
+            .await
+            .expect("first conversion request should be captured");
+        assert!(
+            first_body["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("currencyConversionEstimation"))
+        );
+        assert_eq!(first_body["variables"]["amount"], serde_json::json!(0.01));
+        assert_eq!(first_body["variables"]["currency"], "USD");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), request_body_rx.recv(),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_provider_surfaces_usd_min_sendable_conversion_failures() {
+        let app = axum::Router::new().route(
+            "/graphql",
+            axum::routing::post(
+                |axum::Json(_body): axum::Json<serde_json::Value>| async move {
+                    axum::Json(serde_json::json!({
+                        "errors": [{ "message": "conversion unavailable" }]
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener.local_addr().expect("mock listener has addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should serve");
+        });
+        let provider = BlinkProvider::new(blink_client::Client::new(
+            blink_client::ClientConfig::new(format!("http://{addr}/graphql")),
+        ));
+
+        let err = provider
+            .usd_min_sendable_msat()
+            .await
+            .expect_err("conversion failures should surface through the provider");
+
+        assert!(matches!(
+            err,
+            ProviderError::BlinkUsdMinSendableUnavailable(BlinkClientError::Graphql(_))
+        ));
     }
 
     #[tokio::test]

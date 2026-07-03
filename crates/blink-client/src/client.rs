@@ -297,9 +297,7 @@ impl GraphqlCurrencyConversionEstimate {
             ));
         };
         let Some(id) = self.id else {
-            return Err(BlinkClientError::MalformedResponse(
-                "missing conversion id",
-            ));
+            return Err(BlinkClientError::MalformedResponse("missing conversion id"));
         };
         let Some(timestamp) = self.timestamp else {
             return Err(BlinkClientError::MalformedResponse(

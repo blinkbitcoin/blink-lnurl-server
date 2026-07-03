@@ -14,7 +14,7 @@ use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     invoice_paid::{
@@ -101,6 +101,30 @@ pub(super) struct PublicRecipient {
     pub(super) callback_identifier: String,
 }
 
+fn public_recipient_wallet(public_recipient: &PublicRecipient) -> Option<WalletKind> {
+    public_recipient
+        .wallet
+        .or(public_recipient.recipient.default_wallet)
+}
+
+async fn resolve_min_sendable_msat<DB>(
+    state: &State<DB>,
+    public_recipient: &PublicRecipient,
+) -> u64 {
+    if public_recipient.recipient.provider == AccountProvider::Blink
+        && public_recipient_wallet(public_recipient) == Some(WalletKind::Usd)
+    {
+        match state.providers.blink_usd_min_sendable_msat().await {
+            Ok(min_sendable) => return min_sendable,
+            Err(err) => warn!(
+                "failed to fetch Blink USD minSendable conversion; falling back to configured min_sendable: {err}"
+            ),
+        }
+    }
+
+    state.min_sendable
+}
+
 fn build_callback_url<DB>(
     state: &State<DB>,
     recipient_domain: &str,
@@ -178,6 +202,8 @@ where
             return Err(lnurl_error(&format!("Couldn't find user '{identifier}'.")));
         };
 
+        let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
+
         let (allows_nostr, nostr_pubkey) = if let Some(nostr_keys) = state.nostr_keys.as_ref() {
             let xonly_pubkey = nostr_keys.public_key.xonly().map_err(|e| {
                 error!(
@@ -193,7 +219,7 @@ where
         Ok(Json(PayResponse {
             callback: build_callback_url(&state, &domain, &public_recipient.callback_identifier),
             max_sendable: state.max_sendable,
-            min_sendable: state.min_sendable,
+            min_sendable,
             tag: Tag::Pay,
             metadata: get_metadata_for_recipient(
                 &public_recipient.recipient,
@@ -279,13 +305,14 @@ where
             trace!("missing amount");
             return Err(lnurl_error("missing amount"));
         };
+        let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
 
         if amount_msat % 1000 != 0 {
             trace!("not a full sat amount");
             return Err(lnurl_error("amount must be a whole sat amount"));
         }
 
-        if amount_msat < state.min_sendable || amount_msat > state.max_sendable {
+        if amount_msat < min_sendable || amount_msat > state.max_sendable {
             trace!("amount outside advertised minSendable/maxSendable range");
             return Err(lnurl_error("amount out of range"));
         }
@@ -748,6 +775,8 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
         | ProviderError::MissingBlinkUsdWalletId
         | ProviderError::BlinkStatusEndpointUnavailable
         | ProviderError::BlinkPaymentStatusUnavailable(_)
+        | ProviderError::BlinkUsdMinSendableUnavailable(_)
+        | ProviderError::UsdMinSendableOverflow
         | ProviderError::PaymentStatusUnavailable(_) => {
             error!("invalid provider invoice state: {error}");
             lnurl_error("internal server error")
@@ -1166,6 +1195,7 @@ mod tests {
             response.callback,
             "http://example.com/lnurlp/alice+usd/invoice"
         );
+        assert_eq!(response.min_sendable, 1_000);
         assert_eq!(
             metadata_entries(&response.metadata),
             vec![
@@ -1176,6 +1206,57 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_usd_wallet_uses_cached_dynamic_min_sendable() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(90);
+        let (endpoint, calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink USD discovery should return dynamic minSendable");
+
+        assert_eq!(response.min_sendable, 21_000);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let body = bodies
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("conversion request body captured");
+        assert!(
+            body["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("currencyConversionEstimation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_usd_wallet_falls_back_to_configured_min_sendable_when_conversion_fails()
+     {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(91);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server_with_conversion_failure(bolt11, false, true).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink USD discovery should fall back to configured minSendable");
+
+        assert_eq!(response.min_sendable, 1_000);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1362,14 +1443,14 @@ mod tests {
             state,
             "alice",
             LnurlPayCallbackParams {
-                amount: Some(1_000),
+                amount: Some(21_000),
                 ..LnurlPayCallbackParams::default()
             },
         )
         .await
         .expect("Blink default invoice callback should succeed");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             body.as_object()
                 .unwrap()
@@ -1421,14 +1502,14 @@ mod tests {
             "example.com",
             "alice",
             LnurlPayCallbackParams {
-                amount: Some(1_000),
+                amount: Some(21_000),
                 ..LnurlPayCallbackParams::default()
             },
         )
         .await
         .expect("configured callback-domain invoice callback should succeed");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         let returned_invoice = Bolt11Invoice::from_str(body["pr"].as_str().unwrap())
             .expect("mock should return a valid invoice");
         let payment_hash = returned_invoice.payment_hash().to_string();
@@ -1479,14 +1560,14 @@ mod tests {
             state,
             "alice",
             LnurlPayCallbackParams {
-                amount: Some(1_000),
+                amount: Some(21_000),
                 ..LnurlPayCallbackParams::default()
             },
         )
         .await
         .expect("disabled Blink account mutations must not block invoices");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         let body = bodies
             .lock()
             .unwrap()
@@ -1500,6 +1581,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_invoice_callback_blink_usd_falls_back_to_configured_min_sendable_when_conversion_fails()
+     {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(32);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server_with_conversion_failure(bolt11, false, true).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let Json(body) = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(1_000),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("Blink USD invoice callback should fall back to configured minSendable");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(body.get("pr").is_some());
+    }
+
+    #[tokio::test]
     async fn public_invoice_callback_blink_wallet_alias_and_expiry_policy_lnurl_04_d_03_d_05_d_06_d_07_d_08_d_09_d_10()
      {
         // LNURL-04/D-03/D-05-D-10: +btc/+usd aliases select Blink wallets and
@@ -1508,12 +1613,18 @@ mod tests {
         let (_payment_hash, bolt11) = generate_route_test_invoice(12);
         let (endpoint, calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
 
-        for (identifier, expiry, expected_wallet, expected_expiry) in [
-            ("alice+btc", None, "btc_wallet_123", None),
-            ("alice+btc", Some(60), "btc_wallet_123", Some(1)),
-            ("alice+btc", Some(61), "btc_wallet_123", Some(2)),
-            ("alice+btc", Some(86_400), "btc_wallet_123", Some(1440)),
-            ("alice+usd", Some(300), "usd_wallet_123", Some(5)),
+        for (identifier, amount, expiry, expected_wallet, expected_expiry) in [
+            ("alice+btc", 1_000, None, "btc_wallet_123", None),
+            ("alice+btc", 1_000, Some(60), "btc_wallet_123", Some(1)),
+            ("alice+btc", 1_000, Some(61), "btc_wallet_123", Some(2)),
+            (
+                "alice+btc",
+                1_000,
+                Some(86_400),
+                "btc_wallet_123",
+                Some(1440),
+            ),
+            ("alice+usd", 21_000, Some(300), "usd_wallet_123", Some(5)),
         ] {
             let repo =
                 MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
@@ -1522,7 +1633,7 @@ mod tests {
                 state,
                 identifier,
                 LnurlPayCallbackParams {
-                    amount: Some(1_000),
+                    amount: Some(amount),
                     expiry,
                     ..LnurlPayCallbackParams::default()
                 },
@@ -1545,7 +1656,10 @@ mod tests {
             }
         }
 
-        for (identifier, expiry) in [("alice+btc", 86_401), ("alice+usd", 301)] {
+        for (identifier, amount, expiry, expected_call_delta) in [
+            ("alice+btc", 1_000, 86_401, 0),
+            ("alice+usd", 21_000, 301, 1),
+        ] {
             let before = calls.load(Ordering::SeqCst);
             let repo =
                 MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
@@ -1555,7 +1669,7 @@ mod tests {
                     state,
                     identifier,
                     LnurlPayCallbackParams {
-                        amount: Some(1_000),
+                        amount: Some(amount),
                         expiry: Some(expiry),
                         ..LnurlPayCallbackParams::default()
                     },
@@ -1565,43 +1679,47 @@ mod tests {
             );
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                before,
-                "over-limit expiry must not dispatch provider calls"
+                before + expected_call_delta,
+                "over-limit expiry must not dispatch provider invoice calls"
             );
         }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn public_invoice_callback_validation_before_dispatch_lnurl_03_comp_04_d_17_d_18() {
         // LNURL-03/COMP-04/D-17/D-18: route-owned validation must happen before
         // provider dispatch and public errors must use stable plain phrases.
         let (_payment_hash, bolt11) = generate_route_test_invoice(13);
         let (endpoint, calls, _bodies) = start_blink_invoice_mock_server(bolt11, false).await;
 
-        for (params, expected) in [
-            (LnurlPayCallbackParams::default(), "missing amount"),
+        for (params, expected, expected_call_delta) in [
+            (LnurlPayCallbackParams::default(), "missing amount", 0),
             (
                 LnurlPayCallbackParams {
                     amount: Some(0),
                     ..LnurlPayCallbackParams::default()
                 },
                 "amount out of range",
+                1,
             ),
             (
                 LnurlPayCallbackParams {
-                    amount: Some(1_000),
+                    amount: Some(21_000),
                     comment: Some("x".repeat(MAX_COMMENT_LENGTH + 1)),
                     ..LnurlPayCallbackParams::default()
                 },
                 "comment too long",
+                1,
             ),
             (
                 LnurlPayCallbackParams {
-                    amount: Some(1_000),
+                    amount: Some(21_000),
                     nostr: Some("not-json".to_string()),
                     ..LnurlPayCallbackParams::default()
                 },
                 "nostr zap not supported",
+                1,
             ),
         ] {
             let repo =
@@ -1611,20 +1729,24 @@ mod tests {
             assert_lnurl_error(get_public_invoice(state, "alice", params).await, expected);
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                before,
-                "{expected} must happen before provider dispatch"
+                before + expected_call_delta,
+                "{expected} must happen before provider invoice dispatch"
             );
         }
 
+        let (_mismatch_payment_hash, mismatch_bolt11) = generate_route_test_invoice(14);
+        let (mismatch_endpoint, mismatch_calls, _mismatch_bodies) =
+            start_blink_fixed_invoice_mock_server(mismatch_bolt11).await;
         let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
-        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
-        let before = calls.load(Ordering::SeqCst);
+        let state =
+            internal_route_test_state_with_blink_endpoint(repo, None, &mismatch_endpoint).await;
+        let before = mismatch_calls.load(Ordering::SeqCst);
         assert_lnurl_error(
             get_public_invoice(
                 state,
                 "alice",
                 LnurlPayCallbackParams {
-                    amount: Some(2_000),
+                    amount: Some(21_000),
                     ..LnurlPayCallbackParams::default()
                 },
             )
@@ -1632,9 +1754,9 @@ mod tests {
             "internal server error",
         );
         assert_eq!(
-            calls.load(Ordering::SeqCst),
-            before + 1,
-            "provider amount mismatch is rejected after provider dispatch"
+            mismatch_calls.load(Ordering::SeqCst),
+            before + 2,
+            "provider amount mismatch is rejected after conversion and provider invoice dispatch"
         );
 
         let spark_repo =
@@ -1666,7 +1788,7 @@ mod tests {
                 failing_state,
                 "alice",
                 LnurlPayCallbackParams {
-                    amount: Some(1_000),
+                    amount: Some(21_000),
                     ..LnurlPayCallbackParams::default()
                 },
             )

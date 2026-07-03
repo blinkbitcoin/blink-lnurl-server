@@ -493,12 +493,7 @@ pub(super) async fn internal_route_test_state(
     repo: MockRepository,
     internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
 ) -> State<MockRepository> {
-    internal_route_test_state_with_blink_endpoint(
-        repo,
-        internal_auth,
-        blink_client::PRODUCTION_GRAPHQL_ENDPOINT,
-    )
-    .await
+    internal_route_test_state_with_blink_endpoint(repo, internal_auth, "").await
 }
 
 pub(super) async fn internal_route_test_state_with_blink_endpoint(
@@ -595,6 +590,18 @@ pub(super) fn generate_route_test_invoice_with_description_hash(
     preimage_byte: u8,
     description_hash: sha256::Hash,
 ) -> (String, String) {
+    generate_route_test_invoice_with_amount_msat_and_description_hash(
+        preimage_byte,
+        description_hash,
+        1_000,
+    )
+}
+
+pub(super) fn generate_route_test_invoice_with_amount_msat_and_description_hash(
+    preimage_byte: u8,
+    description_hash: sha256::Hash,
+    amount_msat: u64,
+) -> (String, String) {
     let preimage = [preimage_byte; 32];
     let payment_hash = sha256::Hash::hash(&preimage);
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -605,7 +612,7 @@ pub(super) fn generate_route_test_invoice_with_description_hash(
         .payment_secret(lightning_invoice::PaymentSecret([0_u8; 32]))
         .current_timestamp()
         .min_final_cltv_expiry_delta(144)
-        .amount_milli_satoshis(1_000)
+        .amount_milli_satoshis(amount_msat)
         .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key))
         .expect("test invoice should build");
 
@@ -613,8 +620,16 @@ pub(super) fn generate_route_test_invoice_with_description_hash(
 }
 
 pub(super) async fn start_blink_invoice_mock_server(
+    bolt11: String,
+    fail: bool,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    start_blink_invoice_mock_server_with_conversion_failure(bolt11, fail, false).await
+}
+
+pub(super) async fn start_blink_invoice_mock_server_with_conversion_failure(
     _bolt11: String,
     fail: bool,
+    conversion_fail: bool,
 ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -628,6 +643,26 @@ pub(super) async fn start_blink_invoice_mock_server(
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 bodies.lock().unwrap().push(body.clone());
+                if body["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("currencyConversionEstimation"))
+                {
+                    if conversion_fail {
+                        return Json(json!({
+                            "errors": [{"message": "conversion unavailable"}]
+                        }));
+                    }
+                    return Json(json!({
+                        "data": {
+                            "currencyConversionEstimation": {
+                                "btcSatAmount": 20,
+                                "id": "estimate-1",
+                                "timestamp": 1_752_000_000_i64,
+                                "usdCentAmount": 1
+                            }
+                        }
+                    }));
+                }
                 if fail {
                     return Json(json!({
                         "data": {
@@ -640,11 +675,75 @@ pub(super) async fn start_blink_invoice_mock_server(
                     .as_str()
                     .and_then(|hash| sha256::Hash::from_str(hash).ok())
                     .expect("Blink invoice mock requires a description hash");
+                let amount_sat = body["variables"]["input"]["amount"]
+                    .as_u64()
+                    .expect("Blink invoice mock requires an amount");
                 let call_index = u8::try_from(calls.load(Ordering::SeqCst)).unwrap_or(u8::MAX);
-                let (_, bolt11) = generate_route_test_invoice_with_description_hash(
+                let (_, bolt11) = generate_route_test_invoice_with_amount_msat_and_description_hash(
                     100_u8.saturating_add(call_index),
                     request_description_hash,
+                    amount_sat.saturating_mul(1_000),
                 );
+                Json(json!({
+                    "data": {
+                        "lnInvoiceCreateOnBehalfOfRecipient": {
+                            "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_btc_hash" },
+                            "errors": []
+                        },
+                        "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient": {
+                            "invoice": { "paymentRequest": bolt11, "paymentHash": "provider_usd_hash" },
+                            "errors": []
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("mock listener should have addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock Blink server should serve");
+    });
+    (format!("http://{addr}/graphql"), calls, bodies)
+}
+
+pub(super) async fn start_blink_fixed_invoice_mock_server(
+    bolt11: String,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_route = Arc::clone(&calls);
+    let bodies_for_route = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/graphql",
+        post(move |Json(body): Json<Value>| {
+            let calls = Arc::clone(&calls_for_route);
+            let bodies = Arc::clone(&bodies_for_route);
+            let bolt11 = bolt11.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                bodies.lock().unwrap().push(body.clone());
+                if body["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("currencyConversionEstimation"))
+                {
+                    return Json(json!({
+                        "data": {
+                            "currencyConversionEstimation": {
+                                "btcSatAmount": 20,
+                                "id": "estimate-1",
+                                "timestamp": 1_752_000_000_i64,
+                                "usdCentAmount": 1
+                            }
+                        }
+                    }));
+                }
                 Json(json!({
                     "data": {
                         "lnInvoiceCreateOnBehalfOfRecipient": {

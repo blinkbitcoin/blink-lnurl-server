@@ -1,6 +1,6 @@
 use blink_client::{
-    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice,
-    DisplayCurrency, PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
+    BlinkClientError, Client, ClientConfig, CreateInvoiceRequest, CreatedInvoice, DisplayCurrency,
+    PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -596,13 +596,11 @@ async fn gets_currency_conversion_estimation() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(|request: &Request| {
-            assert_graphql_currency_conversion_request(request, 0.01, "USD")
-        })
+        .and(|request: &Request| assert_graphql_currency_conversion_request(request, 0.01, "USD"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
                 "currencyConversionEstimation": {
-                    "btcSatAmount": 1,
+                    "btcSatAmount": 20,
                     "id": "estimate-1",
                     "timestamp": 1_752_000_000_i64,
                     "usdCentAmount": 1
@@ -619,7 +617,7 @@ async fn gets_currency_conversion_estimation() {
         .await
         .expect("conversion estimate should parse");
 
-    assert_eq!(estimate.btc_sat_amount, 1);
+    assert_eq!(estimate.btc_sat_amount, 20);
     assert_eq!(estimate.id, "estimate-1");
     assert_eq!(estimate.timestamp, 1_752_000_000_i64);
     assert_eq!(estimate.usd_cent_amount, 1);
@@ -630,9 +628,7 @@ async fn currency_conversion_maps_top_level_graphql_errors() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(|request: &Request| {
-            assert_graphql_currency_conversion_request(request, 0.01, "USD")
-        })
+        .and(|request: &Request| assert_graphql_currency_conversion_request(request, 0.01, "USD"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "errors": [{ "message": "conversion query failed" }]
         })))
@@ -657,9 +653,7 @@ async fn currency_conversion_rejects_malformed_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(|request: &Request| {
-            assert_graphql_currency_conversion_request(request, 0.01, "USD")
-        })
+        .and(|request: &Request| assert_graphql_currency_conversion_request(request, 0.01, "USD"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
                 "currencyConversionEstimation": {

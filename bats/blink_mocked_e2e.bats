@@ -45,9 +45,10 @@ teardown_file() {
 @test "blink: usd callback uses mocked graphql" {
   create_blink_account "blinkusd" "Blink USD wallet" "btc" >/dev/null
   discovery="$(blink_lnurl_discovery "blinkusd+usd")"
+  assert_json_equals "$discovery" '.minSendable' '21000'
   callback_url="$(json_get "$discovery" '.callback')"
 
-  run blink_lnurl_callback "$callback_url" "1000"
+  run blink_lnurl_callback "$callback_url" "21000"
   [ "$status" -eq 0 ]
   assert_json_nonempty "$output" '.pr'
   payment_hash="$(json_get "$output" '.verify' | awk -F/ '{print $NF}')"
@@ -57,9 +58,10 @@ teardown_file() {
 @test "blink: default usd and explicit btc wallet selection use mocked graphql" {
   create_blink_account "blinkdefaultusd10" "Blink default USD wallet" "usd" >/dev/null
   discovery="$(blink_lnurl_discovery "blinkdefaultusd10")"
+  assert_json_equals "$discovery" '.minSendable' '21000'
   callback_url="$(json_get "$discovery" '.callback')"
 
-  run blink_lnurl_callback "$callback_url" "1000"
+  run blink_lnurl_callback "$callback_url" "21000"
   [ "$status" -eq 0 ]
   assert_json_nonempty "$output" '.pr'
   payment_hash="$(json_get "$output" '.verify' | awk -F/ '{print $NF}')"
@@ -67,6 +69,7 @@ teardown_file() {
 
   create_blink_account "blinkbtcoverride10" "Blink BTC override wallet" "usd" >/dev/null
   discovery="$(blink_lnurl_discovery "blinkbtcoverride10+btc")"
+  assert_json_equals "$discovery" '.minSendable' '1000'
   callback_url="$(json_get "$discovery" '.callback')"
 
   run blink_lnurl_callback "$callback_url" "1000"
