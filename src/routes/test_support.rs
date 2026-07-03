@@ -619,6 +619,31 @@ pub(super) fn generate_route_test_invoice_with_amount_msat_and_description_hash(
     (payment_hash.to_string(), invoice.to_string())
 }
 
+fn is_currency_conversion_request(body: &Value) -> bool {
+    body["query"]
+        .as_str()
+        .is_some_and(|query| query.contains("currencyConversionEstimation"))
+}
+
+fn mock_currency_conversion_response() -> Value {
+    json!({
+        "data": {
+            "currencyConversionEstimation": {
+                "btcSatAmount": 20,
+                "id": "estimate-1",
+                "timestamp": 1_752_000_000_i64,
+                "usdCentAmount": 1
+            }
+        }
+    })
+}
+
+fn mock_currency_conversion_error_response() -> Value {
+    json!({
+        "errors": [{"message": "conversion unavailable"}]
+    })
+}
+
 pub(super) async fn start_blink_invoice_mock_server(
     bolt11: String,
     fail: bool,
@@ -643,25 +668,11 @@ pub(super) async fn start_blink_invoice_mock_server_with_conversion_failure(
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 bodies.lock().unwrap().push(body.clone());
-                if body["query"]
-                    .as_str()
-                    .is_some_and(|query| query.contains("currencyConversionEstimation"))
-                {
+                if is_currency_conversion_request(&body) {
                     if conversion_fail {
-                        return Json(json!({
-                            "errors": [{"message": "conversion unavailable"}]
-                        }));
+                        return Json(mock_currency_conversion_error_response());
                     }
-                    return Json(json!({
-                        "data": {
-                            "currencyConversionEstimation": {
-                                "btcSatAmount": 20,
-                                "id": "estimate-1",
-                                "timestamp": 1_752_000_000_i64,
-                                "usdCentAmount": 1
-                            }
-                        }
-                    }));
+                    return Json(mock_currency_conversion_response());
                 }
                 if fail {
                     return Json(json!({
@@ -729,20 +740,8 @@ pub(super) async fn start_blink_fixed_invoice_mock_server(
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 bodies.lock().unwrap().push(body.clone());
-                if body["query"]
-                    .as_str()
-                    .is_some_and(|query| query.contains("currencyConversionEstimation"))
-                {
-                    return Json(json!({
-                        "data": {
-                            "currencyConversionEstimation": {
-                                "btcSatAmount": 20,
-                                "id": "estimate-1",
-                                "timestamp": 1_752_000_000_i64,
-                                "usdCentAmount": 1
-                            }
-                        }
-                    }));
+                if is_currency_conversion_request(&body) {
+                    return Json(mock_currency_conversion_response());
                 }
                 Json(json!({
                     "data": {

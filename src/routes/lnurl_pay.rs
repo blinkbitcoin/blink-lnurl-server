@@ -109,13 +109,16 @@ fn public_recipient_wallet(public_recipient: &PublicRecipient) -> Option<WalletK
         .or(public_recipient.recipient.default_wallet)
 }
 
+fn is_blink_usd_recipient(public_recipient: &PublicRecipient) -> bool {
+    public_recipient.recipient.provider == AccountProvider::Blink
+        && public_recipient_wallet(public_recipient) == Some(WalletKind::Usd)
+}
+
 async fn resolve_min_sendable_msat<DB>(
     state: &State<DB>,
     public_recipient: &PublicRecipient,
 ) -> u64 {
-    if public_recipient.recipient.provider == AccountProvider::Blink
-        && public_recipient_wallet(public_recipient) == Some(WalletKind::Usd)
-    {
+    if is_blink_usd_recipient(public_recipient) {
         let usd_min_sendable = match state.providers.blink_usd_min_sendable_msat().await {
             Ok(min_sendable) => min_sendable,
             Err(err) => {

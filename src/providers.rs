@@ -86,6 +86,12 @@ struct CachedUsdMinSendable {
     fetched_at: Instant,
 }
 
+impl CachedUsdMinSendable {
+    fn is_fresh(&self) -> bool {
+        self.fetched_at.elapsed() < USD_MIN_SENDABLE_CACHE_TTL
+    }
+}
+
 pub struct BlinkProvider {
     client: blink_client::Client,
     blink_webhook_url: Option<String>,
@@ -216,9 +222,7 @@ impl BlinkProvider {
     pub async fn usd_min_sendable_msat(&self) -> Result<u64, ProviderError> {
         {
             let cache = self.usd_min_sendable_cache.read().await;
-            if let Some(cache) = cache.as_ref()
-                && cache.fetched_at.elapsed() < USD_MIN_SENDABLE_CACHE_TTL
-            {
+            if let Some(cache) = cache.as_ref().filter(|cache| cache.is_fresh()) {
                 return Ok(cache.min_sendable_msat);
             }
         }

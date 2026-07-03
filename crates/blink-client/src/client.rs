@@ -291,24 +291,22 @@ impl GraphqlCurrencyConversionEstimate {
     fn into_currency_conversion_estimate(
         self,
     ) -> Result<CurrencyConversionEstimate, BlinkClientError> {
-        let Some(btc_sat_amount) = self.btc_sat_amount else {
-            return Err(BlinkClientError::MalformedResponse(
+        let btc_sat_amount = self
+            .btc_sat_amount
+            .ok_or(BlinkClientError::MalformedResponse(
                 "missing conversion btcSatAmount",
-            ));
-        };
-        let Some(id) = self.id else {
-            return Err(BlinkClientError::MalformedResponse("missing conversion id"));
-        };
-        let Some(timestamp) = self.timestamp else {
-            return Err(BlinkClientError::MalformedResponse(
-                "missing conversion timestamp",
-            ));
-        };
-        let Some(usd_cent_amount) = self.usd_cent_amount else {
-            return Err(BlinkClientError::MalformedResponse(
+            ))?;
+        let id = self
+            .id
+            .ok_or(BlinkClientError::MalformedResponse("missing conversion id"))?;
+        let timestamp = self.timestamp.ok_or(BlinkClientError::MalformedResponse(
+            "missing conversion timestamp",
+        ))?;
+        let usd_cent_amount = self
+            .usd_cent_amount
+            .ok_or(BlinkClientError::MalformedResponse(
                 "missing conversion usdCentAmount",
-            ));
-        };
+            ))?;
 
         Ok(CurrencyConversionEstimate {
             btc_sat_amount,
