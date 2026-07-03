@@ -3,7 +3,8 @@ use serde_json::json;
 
 use crate::error::{BlinkClientError, GraphqlError};
 use crate::types::{
-    ClientConfig, CreateInvoiceRequest, CreatedInvoice, PaymentStatus, PaymentStatusState,
+    ClientConfig, CreateInvoiceRequest, CreatedInvoice, CurrencyConversionEstimate,
+    DisplayCurrency, PaymentStatus, PaymentStatusState,
 };
 
 pub const PRODUCTION_GRAPHQL_ENDPOINT: &str = "https://api.blink.sv/graphql";
@@ -15,6 +16,8 @@ const USD_INVOICE_OPERATION: &str =
     include_str!("../graphql/ln_usd_invoice_btc_denominated_create_on_behalf_of_recipient.graphql");
 const PAYMENT_STATUS_OPERATION: &str =
     include_str!("../graphql/ln_invoice_payment_status_by_hash.graphql");
+const CURRENCY_CONVERSION_ESTIMATION_OPERATION: &str =
+    include_str!("../graphql/currency_conversion_estimation.graphql");
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -66,6 +69,24 @@ impl Client {
         data.ln_invoice_payment_status_by_hash.into_payment_status()
     }
 
+    pub async fn currency_conversion_estimation(
+        &self,
+        amount: f64,
+        currency: DisplayCurrency,
+    ) -> Result<CurrencyConversionEstimate, BlinkClientError> {
+        let data = self
+            .execute_with_variables::<CurrencyConversionEstimationData>(
+                CURRENCY_CONVERSION_ESTIMATION_OPERATION,
+                json!({
+                    "amount": amount,
+                    "currency": currency.as_graphql_value(),
+                }),
+            )
+            .await?;
+        data.currency_conversion_estimation
+            .into_currency_conversion_estimate()
+    }
+
     async fn execute<T>(
         &self,
         query: &'static str,
@@ -88,14 +109,24 @@ impl Client {
             input.insert("webhookUrl".to_string(), json!(webhook_url));
         }
 
+        self.execute_with_variables(query, json!({ "input": input }))
+            .await
+    }
+
+    async fn execute_with_variables<T>(
+        &self,
+        query: &'static str,
+        variables: serde_json::Value,
+    ) -> Result<T, BlinkClientError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         let response = self
             .http_client
             .post(self.config.endpoint())
             .json(&json!({
                 "query": query,
-                "variables": {
-                    "input": input
-                }
+                "variables": variables,
             }))
             .send()
             .await?
@@ -116,31 +147,15 @@ impl Client {
         query: &'static str,
         payment_hash: &str,
     ) -> Result<PaymentStatusData, BlinkClientError> {
-        let response = self
-            .http_client
-            .post(self.config.endpoint())
-            .json(&json!({
-                "query": query,
-                "variables": {
-                    "input": {
-                        "paymentHash": payment_hash,
-                    }
+        self.execute_with_variables(
+            query,
+            json!({
+                "input": {
+                    "paymentHash": payment_hash,
                 }
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-
-        let envelope = response
-            .json::<GraphqlEnvelope<PaymentStatusData>>()
-            .await?;
-        if !envelope.errors.is_empty() {
-            return Err(BlinkClientError::Graphql(envelope.errors));
-        }
-
-        envelope
-            .data
-            .ok_or(BlinkClientError::MalformedResponse("missing GraphQL data"))
+            }),
+        )
+        .await
     }
 }
 
@@ -167,6 +182,12 @@ struct UsdInvoiceData {
 #[serde(rename_all = "camelCase")]
 struct PaymentStatusData {
     ln_invoice_payment_status_by_hash: GraphqlPaymentStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrencyConversionEstimationData {
+    currency_conversion_estimation: GraphqlCurrencyConversionEstimate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +248,15 @@ struct GraphqlPaymentStatus {
     payment_preimage: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlCurrencyConversionEstimate {
+    btc_sat_amount: Option<u64>,
+    id: Option<String>,
+    timestamp: Option<i64>,
+    usd_cent_amount: Option<u64>,
+}
+
 impl GraphqlPaymentStatus {
     fn into_payment_status(self) -> Result<PaymentStatus, BlinkClientError> {
         let Some(status) = self.status else {
@@ -253,6 +283,36 @@ impl GraphqlPaymentStatus {
             payment_request: self.payment_request,
             preimage: self.payment_preimage,
             amount_received_sat: None,
+        })
+    }
+}
+
+impl GraphqlCurrencyConversionEstimate {
+    fn into_currency_conversion_estimate(
+        self,
+    ) -> Result<CurrencyConversionEstimate, BlinkClientError> {
+        let btc_sat_amount = self
+            .btc_sat_amount
+            .ok_or(BlinkClientError::MalformedResponse(
+                "missing conversion btcSatAmount",
+            ))?;
+        let id = self
+            .id
+            .ok_or(BlinkClientError::MalformedResponse("missing conversion id"))?;
+        let timestamp = self.timestamp.ok_or(BlinkClientError::MalformedResponse(
+            "missing conversion timestamp",
+        ))?;
+        let usd_cent_amount = self
+            .usd_cent_amount
+            .ok_or(BlinkClientError::MalformedResponse(
+                "missing conversion usdCentAmount",
+            ))?;
+
+        Ok(CurrencyConversionEstimate {
+            btc_sat_amount,
+            id,
+            timestamp,
+            usd_cent_amount,
         })
     }
 }

@@ -20,6 +20,7 @@ const FIXTURE_EXPIRED_WEBHOOK_PREIMAGE: [u8; 32] = [13_u8; 32];
 enum MockScenario {
     BtcInvoice,
     UsdInvoice,
+    CurrencyConversion,
     StatusPaid,
     StatusExpired,
     StatusPending,
@@ -54,6 +55,9 @@ async fn graphql_handler(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
             StatusCode::OK,
             Json(mock_invoice_response(&body, Wallet::Usd)),
         ),
+        MockScenario::CurrencyConversion => {
+            (StatusCode::OK, Json(mock_currency_conversion_response()))
+        }
         MockScenario::StatusPaid => (StatusCode::OK, Json(mock_status_response(&body, "PAID"))),
         MockScenario::StatusExpired => {
             (StatusCode::OK, Json(mock_status_response(&body, "EXPIRED")))
@@ -91,6 +95,9 @@ fn scenario_from_request(body: &Value) -> MockScenario {
     }
     if wallet_id.contains("error") || payment_hash == "graphql_error" {
         return MockScenario::GraphqlError;
+    }
+    if query.contains("currencyConversionEstimation") {
+        return MockScenario::CurrencyConversion;
     }
     if query.contains("lnInvoicePaymentStatusByHash") {
         if fixture_status_preimage_for_hash(payment_hash).is_some() || payment_hash.contains("paid")
@@ -161,6 +168,19 @@ fn mock_invoice_response(body: &Value, wallet: Wallet) -> Value {
             }
         }),
     }
+}
+
+fn mock_currency_conversion_response() -> Value {
+    json!({
+        "data": {
+            "currencyConversionEstimation": {
+                "btcSatAmount": 20,
+                "id": "estimate-1",
+                "timestamp": 1_752_000_000_i64,
+                "usdCentAmount": 1
+            }
+        }
+    })
 }
 
 fn mock_status_response(body: &Value, status: &str) -> Value {
@@ -278,5 +298,22 @@ mod tests {
             invoice.description(),
             Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0 == description_hash
         ));
+    }
+
+    #[test]
+    fn currency_conversion_requests_route_to_conversion_scenario() {
+        let body = serde_json::json!({
+            "query": "query CurrencyConversionEstimation { currencyConversionEstimation(amount: 0.01, currency: USD) { btcSatAmount } }",
+            "variables": { "amount": 0.01, "currency": "USD" }
+        });
+
+        assert_eq!(
+            scenario_from_request(&body),
+            MockScenario::CurrencyConversion
+        );
+        assert_eq!(
+            mock_currency_conversion_response()["data"]["currencyConversionEstimation"]["btcSatAmount"],
+            20
+        );
     }
 }
