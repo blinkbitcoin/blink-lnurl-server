@@ -101,6 +101,8 @@ pub(super) struct PublicRecipient {
     pub(super) callback_identifier: String,
 }
 
+const BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT: u64 = 50_000;
+
 fn public_recipient_wallet(public_recipient: &PublicRecipient) -> Option<WalletKind> {
     public_recipient
         .wallet
@@ -116,9 +118,12 @@ async fn resolve_min_sendable_msat<DB>(
     {
         match state.providers.blink_usd_min_sendable_msat().await {
             Ok(min_sendable) => return min_sendable,
-            Err(err) => warn!(
-                "failed to fetch Blink USD minSendable conversion; falling back to configured min_sendable: {err}"
-            ),
+            Err(err) => {
+                warn!(
+                    "failed to fetch Blink USD minSendable conversion; falling back to fixed USD minimum: {err}"
+                );
+                return BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT;
+            }
         }
     }
 
@@ -305,15 +310,14 @@ where
             trace!("missing amount");
             return Err(lnurl_error("missing amount"));
         };
-        let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
 
         if amount_msat % 1000 != 0 {
             trace!("not a full sat amount");
             return Err(lnurl_error("amount must be a whole sat amount"));
         }
 
-        if amount_msat < min_sendable || amount_msat > state.max_sendable {
-            trace!("amount outside advertised minSendable/maxSendable range");
+        if amount_msat > state.max_sendable {
+            trace!("amount exceeds maxSendable");
             return Err(lnurl_error("amount out of range"));
         }
 
@@ -367,6 +371,12 @@ where
             public_recipient.recipient.default_wallet,
             params.expiry,
         )?;
+
+        let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
+        if amount_msat < min_sendable {
+            trace!("amount below resolved minSendable");
+            return Err(lnurl_error("amount out of range"));
+        }
 
         let res = state
             .providers
@@ -1195,7 +1205,7 @@ mod tests {
             response.callback,
             "http://example.com/lnurlp/alice+usd/invoice"
         );
-        assert_eq!(response.min_sendable, 1_000);
+        assert_eq!(response.min_sendable, 50_000);
         assert_eq!(
             metadata_entries(&response.metadata),
             vec![
@@ -1239,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_public_discovery_usd_wallet_falls_back_to_configured_min_sendable_when_conversion_fails()
+    async fn blink_public_discovery_usd_wallet_falls_back_to_fixed_usd_minimum_when_conversion_fails()
      {
         let (_payment_hash, bolt11) = generate_route_test_invoice(91);
         let (endpoint, calls, _bodies) =
@@ -1253,9 +1263,9 @@ mod tests {
             Extension(state),
         )
         .await
-        .expect("Blink USD discovery should fall back to configured minSendable");
+        .expect("Blink USD discovery should fall back to the fixed USD minSendable");
 
-        assert_eq!(response.min_sendable, 1_000);
+        assert_eq!(response.min_sendable, 50_000);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1581,8 +1591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_invoice_callback_blink_usd_falls_back_to_configured_min_sendable_when_conversion_fails()
-     {
+    async fn public_invoice_callback_blink_usd_uses_fixed_fallback_minimum_when_conversion_fails() {
         let (_payment_hash, bolt11) = generate_route_test_invoice(32);
         let (endpoint, calls, _bodies) =
             start_blink_invoice_mock_server_with_conversion_failure(bolt11, false, true).await;
@@ -1593,12 +1602,12 @@ mod tests {
             state,
             "alice",
             LnurlPayCallbackParams {
-                amount: Some(1_000),
+                amount: Some(50_000),
                 ..LnurlPayCallbackParams::default()
             },
         )
         .await
-        .expect("Blink USD invoice callback should fall back to configured minSendable");
+        .expect("Blink USD invoice callback should use the fixed fallback minSendable");
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(body.get("pr").is_some());
@@ -1658,7 +1667,7 @@ mod tests {
 
         for (identifier, amount, expiry, expected_call_delta) in [
             ("alice+btc", 1_000, 86_401, 0),
-            ("alice+usd", 21_000, 301, 1),
+            ("alice+usd", 21_000, 301, 0),
         ] {
             let before = calls.load(Ordering::SeqCst);
             let repo =
@@ -1697,6 +1706,14 @@ mod tests {
             (LnurlPayCallbackParams::default(), "missing amount", 0),
             (
                 LnurlPayCallbackParams {
+                    amount: Some(1),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "amount must be a whole sat amount",
+                0,
+            ),
+            (
+                LnurlPayCallbackParams {
                     amount: Some(0),
                     ..LnurlPayCallbackParams::default()
                 },
@@ -1706,11 +1723,20 @@ mod tests {
             (
                 LnurlPayCallbackParams {
                     amount: Some(21_000),
+                    expiry: Some(301),
+                    ..LnurlPayCallbackParams::default()
+                },
+                "expiry too long",
+                0,
+            ),
+            (
+                LnurlPayCallbackParams {
+                    amount: Some(21_000),
                     comment: Some("x".repeat(MAX_COMMENT_LENGTH + 1)),
                     ..LnurlPayCallbackParams::default()
                 },
                 "comment too long",
-                1,
+                0,
             ),
             (
                 LnurlPayCallbackParams {
@@ -1719,7 +1745,7 @@ mod tests {
                     ..LnurlPayCallbackParams::default()
                 },
                 "nostr zap not supported",
-                1,
+                0,
             ),
         ] {
             let repo =
