@@ -116,15 +116,16 @@ async fn resolve_min_sendable_msat<DB>(
     if public_recipient.recipient.provider == AccountProvider::Blink
         && public_recipient_wallet(public_recipient) == Some(WalletKind::Usd)
     {
-        match state.providers.blink_usd_min_sendable_msat().await {
-            Ok(min_sendable) => return min_sendable,
+        let usd_min_sendable = match state.providers.blink_usd_min_sendable_msat().await {
+            Ok(min_sendable) => min_sendable,
             Err(err) => {
                 warn!(
                     "failed to fetch Blink USD minSendable conversion; falling back to fixed USD minimum: {err}"
                 );
-                return BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT;
+                BLINK_USD_MIN_SENDABLE_FALLBACK_MSAT
             }
-        }
+        };
+        return usd_min_sendable.max(state.min_sendable);
     }
 
     state.min_sendable
@@ -314,6 +315,11 @@ where
         if amount_msat % 1000 != 0 {
             trace!("not a full sat amount");
             return Err(lnurl_error("amount must be a whole sat amount"));
+        }
+
+        if amount_msat < state.min_sendable {
+            trace!("amount below configured minSendable");
+            return Err(lnurl_error("amount out of range"));
         }
 
         if amount_msat > state.max_sendable {
@@ -1270,6 +1276,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blink_public_discovery_usd_fallback_respects_configured_min_sendable_floor() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(92);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server_with_conversion_failure(bolt11, false, true).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let mut state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        state.min_sendable = 75_000;
+
+        let Json(response) = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await
+        .expect("Blink USD discovery should respect the configured minSendable floor");
+
+        assert_eq!(response.min_sendable, 75_000);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn blink_public_discovery_phone_identifier_keeps_requested_phone_identity_lnurl_01_lnurl_02_d_04()
      {
         // LNURL-01/LNURL-02/D-04: payer-supplied public phone identifiers are
@@ -1718,7 +1745,7 @@ mod tests {
                     ..LnurlPayCallbackParams::default()
                 },
                 "amount out of range",
-                1,
+                0,
             ),
             (
                 LnurlPayCallbackParams {
