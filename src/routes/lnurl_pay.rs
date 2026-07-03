@@ -209,6 +209,13 @@ where
         };
 
         let min_sendable = resolve_min_sendable_msat(&state, &public_recipient).await;
+        if min_sendable > state.max_sendable {
+            error!(
+                "resolved minSendable {} exceeds configured maxSendable {}",
+                min_sendable, state.max_sendable
+            );
+            return Err(lnurl_error("internal server error"));
+        }
 
         let (allows_nostr, nostr_pubkey) = if let Some(nostr_keys) = state.nostr_keys.as_ref() {
             let xonly_pubkey = nostr_keys.public_key.xonly().map_err(|e| {
@@ -1293,6 +1300,30 @@ mod tests {
         .expect("Blink USD discovery should respect the configured minSendable floor");
 
         assert_eq!(response.min_sendable, 75_000);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn blink_public_discovery_rejects_impossible_min_max_range() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(93);
+        let (endpoint, calls, _bodies) =
+            start_blink_invoice_mock_server_with_conversion_failure(bolt11, false, true).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let mut state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        state.max_sendable = 10_000;
+
+        let result = LnurlServer::<MockRepository>::handle_lnurl_pay(
+            Host("example.com".to_string()),
+            Path("alice+usd".to_string()),
+            Extension(state),
+        )
+        .await;
+        let Err((status, Json(body))) = result else {
+            panic!("Blink USD discovery should reject impossible min/max range");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ERROR");
+        assert_eq!(body["reason"], "internal server error");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
