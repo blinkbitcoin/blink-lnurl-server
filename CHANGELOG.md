@@ -1,3 +1,14 @@
+# [blink-lnurl-server release v0.7.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.7.0)
+
+
+### Features
+
+- Derive Blink USD minSendable from conversion estimation (#34)
+
+### Miscellaneous Tasks
+
+- Bump phonenumber to fix cargo audit (#35)
+
 # [blink-lnurl-server release v0.6.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.6.1)
 
 
