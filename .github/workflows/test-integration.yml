@@ -21,6 +21,6 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@v22
       - name: Run the Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v14
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run integration tests
         run: nix develop -c make test-in-ci
