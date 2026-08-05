@@ -101,6 +101,16 @@ where
             .await
             .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
 
+        // Server-initiated: fills an unset mode only. The caller's IP is
+        // blink-core's, so no country is ever resolved here.
+        if let Err(e) = state
+            .db
+            .set_spark_mode_enhanced_if_unset(&destination_spark_pubkey)
+            .await
+        {
+            error!("failed to backfill mode after internal transfer: {e}");
+        }
+
         Ok(Json(InternalTransferToSparkResponse {
             domain: domain.clone(),
             identifier: identifier.clone(),
@@ -1219,5 +1229,54 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(repo.resolve_calls().is_empty());
+    }
+
+    // -- Region-determination mode ---------------------------------------------
+
+    const MIGRATION_DESTINATION_PUBKEY: &str =
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    async fn run_internal_transfer(repo: MockRepository) -> StatusCode {
+        let app = internal_transfer_to_spark_app(repo).await;
+        let (status, _) = post_internal_transfer_to_spark(
+            app,
+            valid_internal_transfer_to_spark_payload(),
+            crate::internal_auth::SCOPE_BLINK_TRANSFERS_WRITE,
+        )
+        .await;
+        status
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_fills_an_unset_mode_without_resolving_a_country() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+
+        assert_eq!(run_internal_transfer(repo.clone()).await, StatusCode::OK);
+
+        let record = repo
+            .spark_mode(MIGRATION_DESTINATION_PUBKEY)
+            .expect("the migrated account gets a mode record");
+        assert_eq!(record.mode, Some(AccountMode::Enhanced));
+        assert_eq!(record.mode_source, Some(ModeSource::Migration));
+        assert!(
+            record.country.is_none(),
+            "the internal caller's IP is blink-core's and is never resolved"
+        );
+        assert!(record.mode_last_timestamp.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_never_overwrites_a_user_set_mode() {
+        for mode in [AccountMode::Anon, AccountMode::Enhanced] {
+            let repo = MockRepository::default()
+                .with_resolved_recipient(blink_resolved_recipient())
+                .with_spark_mode(MIGRATION_DESTINATION_PUBKEY, Some(mode));
+
+            assert_eq!(run_internal_transfer(repo.clone()).await, StatusCode::OK);
+
+            let record = repo.spark_mode(MIGRATION_DESTINATION_PUBKEY).unwrap();
+            assert_eq!(record.mode, Some(mode));
+            assert_eq!(record.mode_source, None);
+        }
     }
 }

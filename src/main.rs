@@ -27,6 +27,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod auth;
+mod country;
 mod domains;
 mod error;
 mod identifier;
@@ -35,6 +36,7 @@ mod invoice_paid;
 mod models;
 mod postgresql;
 mod providers;
+mod rate_limit;
 mod repository;
 mod routes;
 mod sqlite;
@@ -160,13 +162,31 @@ struct Args {
     /// Expected audience for Blink Core internal-auth JWTs.
     #[arg(long)]
     pub internal_jwt_audience: Option<String>,
+
+    /// proxycheck.io API key used to resolve the country evidence stored for
+    /// Enhanced accounts. Country resolution is disabled while unset.
+    #[arg(long)]
+    pub proxycheck_api_key: Option<String>,
+
+    /// Base URL of the proxycheck.io lookup API.
+    #[arg(long, default_value = country::DEFAULT_PROXYCHECK_URL)]
+    pub proxycheck_url: String,
+
+    /// Maximum signed mode requests and country lookups accepted per client IP
+    /// per minute.
+    #[arg(long, default_value = "10")]
+    pub mode_requests_per_ip_per_minute: u32,
 }
+
+/// Bound on the limiter's in-process key set.
+const RATE_LIMIT_TRACKED_IPS: usize = 100_000;
 
 #[derive(Debug)]
 struct RuntimeConfig {
     spark_network: spark_client::Network,
     blink_network: &'static str,
     blink_graphql_endpoint: Option<String>,
+    local_env: bool,
 }
 
 #[tokio::main]
@@ -370,6 +390,7 @@ fn resolve_runtime_config(
         spark_network,
         blink_network,
         blink_graphql_endpoint,
+        local_env: deployment_env == "local",
     })
 }
 
@@ -498,11 +519,33 @@ where
         args.blink_enabled,
     ));
 
+    let country_resolver = match args.proxycheck_api_key.as_deref().map(str::trim) {
+        Some(api_key) if !api_key.is_empty() => Arc::new(country::CountryResolver::new(
+            &args.proxycheck_url,
+            Some(api_key.to_string()),
+        )?),
+        _ => {
+            info!("no proxycheck API key configured; country evidence stays unresolved");
+            Arc::new(country::CountryResolver::disabled())
+        }
+    };
+    // Only a local deployment has no edge to supply the trusted client-IP
+    // header; anywhere else an absent IP gets no budget.
+    let ip_rate_limiter = Arc::new(rate_limit::PerIpRateLimiter::new(
+        args.mode_requests_per_ip_per_minute,
+        std::time::Duration::from_mins(1),
+        RATE_LIMIT_TRACKED_IPS,
+        runtime_config.local_env,
+    ));
+
     let state = State {
         db: repository,
         spark_client,
         providers,
         internal_auth,
+        country_resolver,
+        ip_rate_limiter,
+        local_env: runtime_config.local_env,
         scheme: args.scheme,
         callback_domain: args.callback_domain,
         min_sendable: args.min_sendable,
@@ -565,6 +608,7 @@ where
             "/lnurlpay/{pubkey}/recover",
             post(LnurlServer::<DB>::recover),
         )
+        .route("/lnurlpay/{pubkey}/mode", post(LnurlServer::<DB>::set_mode))
         .route(
             "/lnurlpay/{pubkey}/metadata",
             get(LnurlServer::<DB>::list_metadata),

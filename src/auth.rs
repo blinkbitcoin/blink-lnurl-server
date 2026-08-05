@@ -25,7 +25,11 @@ where
     }
 
     let Some(ca_cert) = state.ca_cert.as_ref() else {
-        return Ok(next.run(req).await);
+        if state.local_env {
+            return Ok(next.run(req).await);
+        }
+        error!("no CA certificate configured; rejecting client-certificate request");
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     let Ok((_, ca_cert)) = X509Certificate::from_der(ca_cert.as_ref()) else {
@@ -80,4 +84,48 @@ fn verify_cert_against_ca(
         .map_err(|e| format!("signature verification failed: {e:?}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, body::Body, http::Request, middleware, routing::get};
+    use tower::util::ServiceExt;
+
+    use crate::routes::test_support::{MockRepository, internal_route_test_state};
+
+    async fn app(local_env: bool) -> Router {
+        let mut state = internal_route_test_state(MockRepository::default(), None).await;
+        state.ca_cert = None;
+        state.local_env = local_env;
+        Router::new()
+            .route("/guarded", get(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::auth::<MockRepository>,
+            ))
+    }
+
+    async fn call(app: Router) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .uri("/guarded")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("route responds")
+        .status()
+    }
+
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn missing_ca_certificate_fails_closed_outside_local() {
+        assert_eq!(call(app(false).await).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_ca_certificate_stays_open_locally() {
+        assert_eq!(call(app(true).await).await, StatusCode::OK);
+    }
 }

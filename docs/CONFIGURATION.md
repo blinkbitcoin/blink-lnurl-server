@@ -24,7 +24,7 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_MAX_SENDABLE` | Optional | `4000000000` | Maximum LNURL payment amount in millisatoshi. |
 | `LNURL_DOMAINS` | Optional | `localhost:8080` | Comma-separated allowed domains. Configured domains are inserted into the database on startup. |
 | `LNURL_NSEC` | Optional | unset | Nostr private key used to sign NIP-57 zap receipts. If unset, zap requests are ignored. |
-| `LNURL_CA_CERT` | Optional | unset | Base64-encoded DER CA certificate used to validate bearer client certificates for authenticated `/lnurlpay/...` routes. |
+| `LNURL_CA_CERT` | Optional in `local`, **required otherwise** | unset | Base64-encoded DER CA certificate used to validate bearer client certificates for authenticated `/lnurlpay/...` routes. When unset outside `DEPLOYMENT_ENV=local`, those routes reject every request. |
 | `LNURL_CRL_URL` | Optional | unset | URL fetched at startup for a comma-separated certificate revocation list. |
 | `LNURL_CALLBACK_DOMAIN` | Optional | unset | Public domain used when constructing LNURL invoice callback and verify URLs. If unset, those URLs use the request domain. This does not affect provider webhook registration. |
 | `LNURL_WEBHOOK_DOMAIN` | **Required at startup** | unset | Domain used to build Blink invoice callback URLs at `{scheme}://{webhook_domain}/webhook/blink`; also used for Spark SSP webhook registration at `{scheme}://{webhook_domain}/webhook`. |
@@ -35,6 +35,9 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_INTERNAL_JWKS_PATH` | Optional | unset | Local path to read Blink Core internal-auth JWKS from at startup. Takes precedence over `LNURL_INTERNAL_JWKS_URL`. |
 | `LNURL_INTERNAL_JWT_ISSUER` | Optional | unset | Expected issuer for RS256 internal-auth JWTs. Required, with an audience and JWKS source, for `/internal/...` routes to authorize requests. |
 | `LNURL_INTERNAL_JWT_AUDIENCE` | Optional | unset | Expected audience for RS256 internal-auth JWTs. Required, with an issuer and JWKS source, for `/internal/...` routes to authorize requests. |
+| `LNURL_PROXYCHECK_API_KEY` | Optional | unset | proxycheck.io API key used to resolve the country stored as compliance evidence for Enhanced accounts. While unset, no lookup is ever performed and the country columns stay NULL. |
+| `LNURL_PROXYCHECK_URL` | Optional | `https://proxycheck.io/v2` | Base URL of the proxycheck.io lookup API. |
+| `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE` | Optional | `10` | Per-client-IP budget shared by `POST /lnurlpay/{pubkey}/mode` and the country lookups the register/recover routes make for Enhanced accounts. The counter is in-process, so the effective budget is per replica. Outside `DEPLOYMENT_ENV=local` a request with no trusted `x-real-ip` gets no budget. |
 | `LNURL_CONFIG` | Optional | `lnurl.conf` | Mirrors the `config` field, but the TOML file path is resolved before environment variables are merged; use `--config` to select a non-default config file. |
 | `LNURL_DEV_DONT_USE_LNURL_INCLUDE_SPARK_ADDRESS` | Optional, dev feature only | `false` | Development-only option compiled behind the `dev` Cargo feature to include Spark addresses in generated invoices. |
 | `LNURL_TEST_POSTGRES_URL` | Test-only | unset | PostgreSQL URL used by tests named `postgres_tests`; not used by the runtime server. |
@@ -96,7 +99,8 @@ Settings that fail closed or fall back instead of stopping the server:
 - Internal auth is enabled only when issuer, audience, and either a JWKS path or URL are available and parse successfully. Otherwise `/internal/...` routes return unauthorized.
 - `ssp_auth_seed` falls back to a random seed when omitted or invalid.
 - `nsec` omitted means zap requests are ignored rather than signed.
-- `ca_cert` omitted disables bearer certificate validation on the authenticated `/lnurlpay/...` route group.
+- `ca_cert` omitted disables bearer certificate validation on the authenticated `/lnurlpay/...` route group **only when `DEPLOYMENT_ENV=local`**; in every other environment the omission fails closed and the route group returns unauthorized.
+- `proxycheck_api_key` omitted disables country resolution: Enhanced accounts are still recorded, they simply carry no country evidence.
 
 ## Defaults
 

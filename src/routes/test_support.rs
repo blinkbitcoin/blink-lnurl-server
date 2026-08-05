@@ -20,10 +20,11 @@ pub(super) use crate::models::{
 };
 use crate::providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError};
 pub(super) use crate::repository::{
-    AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
-    Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier,
-    NewBlinkAccount, PendingZapReceipt, ResolvedRecipient, SparkUsername, UpdatedBlinkAccount,
-    WalletKind, generate_account_id,
+    AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
+    CountrySource, IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError,
+    LnurlSenderComment, ModeSource, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
+    PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate, SparkUsername,
+    UpdatedBlinkAccount, WalletKind, generate_account_id,
 };
 pub(super) use crate::routes::lnurl_pay::lnurl_error;
 use crate::state::State;
@@ -54,7 +55,7 @@ pub(super) use tower::util::ServiceExt;
 // -- Mock repository -------------------------------------------------------
 
 #[derive(Clone, Default)]
-pub(super) struct MockRepository {
+pub(crate) struct MockRepository {
     pub(super) invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
     pub(super) pending_zap_receipts: std::sync::Arc<Mutex<HashMap<String, PendingZapReceipt>>>,
     pub(super) webhook_deliveries: std::sync::Arc<Mutex<Vec<NewWebhookDelivery>>>,
@@ -67,6 +68,8 @@ pub(super) struct MockRepository {
     pub(super) resolved_recipient: std::sync::Arc<Mutex<Option<ResolvedRecipient>>>,
     pub(super) resolve_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
+    pub(super) spark_modes: std::sync::Arc<Mutex<HashMap<String, SparkAccountMode>>>,
+    pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +118,39 @@ impl MockRepository {
     pub(super) fn blink_to_spark_transfers(&self) -> Vec<BlinkToSparkIdentifierTransfer> {
         self.blink_to_spark_transfers.lock().unwrap().clone()
     }
+
+    pub(super) fn spark_mode(&self, pubkey: &str) -> Option<SparkAccountMode> {
+        self.spark_modes.lock().unwrap().get(pubkey).cloned()
+    }
+
+    pub(super) fn with_spark_mode(self, pubkey: &str, mode: Option<AccountMode>) -> Self {
+        self.spark_modes.lock().unwrap().insert(
+            pubkey.to_string(),
+            SparkAccountMode {
+                mode,
+                ..empty_spark_mode_record(pubkey)
+            },
+        );
+        self
+    }
+
+    pub(super) fn spark_registration_count(&self) -> usize {
+        self.spark_registrations.lock().unwrap().len()
+    }
+}
+
+pub(super) fn empty_spark_mode_record(pubkey: &str) -> SparkAccountMode {
+    SparkAccountMode {
+        account_id: format!("acct_mock_{pubkey}"),
+        pubkey: pubkey.to_string(),
+        mode: None,
+        mode_source: None,
+        mode_updated_at: None,
+        mode_last_timestamp: None,
+        country: None,
+        country_source: None,
+        country_updated_at: None,
+    }
 }
 
 #[async_trait::async_trait]
@@ -146,9 +182,109 @@ impl LnurlRepository for MockRepository {
     }
     async fn get_account_by_spark_pubkey(
         &self,
-        _: &str,
+        pubkey: &str,
     ) -> Result<Option<crate::repository::Account>, LnurlRepositoryError> {
-        Ok(None)
+        Ok(self
+            .spark_modes
+            .lock()
+            .unwrap()
+            .get(pubkey)
+            .map(|record| crate::repository::Account {
+                account_id: record.account_id.clone(),
+                provider: AccountProvider::Spark,
+                created_at: 0,
+                updated_at: 0,
+            }))
+    }
+    async fn upsert_spark_registration(
+        &self,
+        registration: &NewSparkRegistration,
+    ) -> Result<(), LnurlRepositoryError> {
+        registration.validate()?;
+        self.spark_registrations
+            .lock()
+            .unwrap()
+            .push(registration.clone());
+        Ok(())
+    }
+    async fn get_spark_account_mode(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<SparkAccountMode>, LnurlRepositoryError> {
+        Ok(self.spark_modes.lock().unwrap().get(pubkey).cloned())
+    }
+    async fn upsert_spark_mode(
+        &self,
+        update: &SparkModeUpdate,
+    ) -> Result<(), LnurlRepositoryError> {
+        let mut modes = self.spark_modes.lock().unwrap();
+        let existing = modes.get(&update.pubkey).cloned();
+        if existing
+            .as_ref()
+            .and_then(|record| record.mode_last_timestamp)
+            .is_some_and(|last| update.client_timestamp <= last)
+        {
+            return crate::repository::classify_refused_mode_write(existing.as_ref(), update);
+        }
+
+        let now = crate::time::now();
+        let mode_source = if existing.as_ref().and_then(|record| record.mode).is_none() {
+            ModeSource::Signup
+        } else {
+            ModeSource::Switch
+        };
+        let (country, country_source, country_updated_at) = match (update.mode, &update.country) {
+            (AccountMode::Anon, _) => (None, None, None),
+            (AccountMode::Enhanced, Some(country)) => {
+                (Some(country.clone()), Some(CountrySource::Ip), Some(now))
+            }
+            (AccountMode::Enhanced, None) => existing.as_ref().map_or((None, None, None), |r| {
+                (r.country.clone(), r.country_source, r.country_updated_at)
+            }),
+        };
+
+        let record = SparkAccountMode {
+            mode: Some(update.mode),
+            mode_source: Some(mode_source),
+            mode_updated_at: Some(now),
+            mode_last_timestamp: Some(update.client_timestamp.min(now)),
+            country,
+            country_source,
+            country_updated_at,
+            ..existing.unwrap_or_else(|| empty_spark_mode_record(&update.pubkey))
+        };
+        modes.insert(update.pubkey.clone(), record);
+        Ok(())
+    }
+    async fn refresh_spark_country_evidence(
+        &self,
+        pubkey: &str,
+        country: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let mut modes = self.spark_modes.lock().unwrap();
+        if let Some(record) = modes.get_mut(pubkey)
+            && record.mode == Some(AccountMode::Enhanced)
+        {
+            record.country = Some(country.to_string());
+            record.country_source = Some(CountrySource::Ip);
+            record.country_updated_at = Some(crate::time::now());
+        }
+        Ok(())
+    }
+    async fn set_spark_mode_enhanced_if_unset(
+        &self,
+        pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let mut modes = self.spark_modes.lock().unwrap();
+        let record = modes
+            .entry(pubkey.to_string())
+            .or_insert_with(|| empty_spark_mode_record(pubkey));
+        if record.mode.is_none() {
+            record.mode = Some(AccountMode::Enhanced);
+            record.mode_source = Some(ModeSource::Migration);
+            record.mode_updated_at = Some(crate::time::now());
+        }
+        Ok(())
     }
     async fn create_blink_account(
         &self,
@@ -489,7 +625,7 @@ pub(super) fn signed_headers_and_body(
     (headers, Bytes::from(body))
 }
 
-pub(super) async fn internal_route_test_state(
+pub(crate) async fn internal_route_test_state(
     repo: MockRepository,
     internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
 ) -> State<MockRepository> {
@@ -518,6 +654,32 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_f
     spark_enabled: bool,
     blink_enabled: bool,
 ) -> State<MockRepository> {
+    internal_route_test_state_full(
+        repo,
+        internal_auth,
+        blink_endpoint,
+        spark_enabled,
+        blink_enabled,
+        crate::country::CountryResolver::disabled(),
+    )
+    .await
+}
+
+pub(super) async fn route_test_state_with_country_resolver(
+    repo: MockRepository,
+    country_resolver: crate::country::CountryResolver,
+) -> State<MockRepository> {
+    internal_route_test_state_full(repo, None, "", true, true, country_resolver).await
+}
+
+pub(super) async fn internal_route_test_state_full(
+    repo: MockRepository,
+    internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+    blink_endpoint: &str,
+    spark_enabled: bool,
+    blink_enabled: bool,
+    country_resolver: crate::country::CountryResolver,
+) -> State<MockRepository> {
     let network = spark_client::Network::Regtest;
     let auth_seed = [7_u8; 32];
     let blink_webhook_url = Some("http://127.0.0.1/webhook/blink".to_string());
@@ -538,6 +700,14 @@ pub(super) async fn internal_route_test_state_with_blink_endpoint_and_provider_f
         spark_client,
         providers,
         internal_auth,
+        country_resolver: Arc::new(country_resolver),
+        ip_rate_limiter: Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1_000,
+            std::time::Duration::from_mins(1),
+            1_000,
+            true,
+        )),
+        local_env: true,
         scheme: "http".to_string(),
         callback_domain: None,
         min_sendable: 1_000,
