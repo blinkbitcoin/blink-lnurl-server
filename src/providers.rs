@@ -19,6 +19,10 @@ pub struct CreateInvoiceRequest<'a> {
     pub wallet: Option<WalletKind>,
     pub amount_sat: u64,
     pub description_hash: [u8; 32],
+    /// Recipient-visible memo, carried outside the BOLT11 because
+    /// `description_hash` owns its description field. Only the Blink provider
+    /// supports it today; Spark ignores it.
+    pub memo: Option<&'a str>,
     pub expiry: Option<u32>,
     pub include_spark_address: bool,
 }
@@ -264,6 +268,7 @@ impl BlinkProvider {
             wallet_id,
             amount_sat: request.amount_sat,
             description_hash_hex: Some(hex::encode(request.description_hash)),
+            memo: request.memo,
             expires_in_minutes: request.expiry,
             webhook_url: self.blink_webhook_url.as_deref(),
         };
@@ -515,6 +520,7 @@ mod tests {
                 wallet: Some(WalletKind::Usd),
                 amount_sat: 1,
                 description_hash: [0; 32],
+                memo: None,
                 expiry: None,
                 include_spark_address: false,
             })
@@ -542,6 +548,7 @@ mod tests {
                     wallet,
                     amount_sat: 1,
                     description_hash: [0; 32],
+                    memo: None,
                     expiry: None,
                     include_spark_address: false,
                 })
@@ -691,6 +698,7 @@ mod tests {
             wallet,
             amount_sat: 21,
             description_hash: [7; 32],
+            memo: None,
             expiry,
             include_spark_address: true,
         }
@@ -877,6 +885,59 @@ mod tests {
         assert!(usd_body["variables"]["input"].get("expiresIn").is_none());
     }
 
+    #[tokio::test]
+    async fn blink_provider_forwards_memo_alongside_description_hash() {
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(2);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let provider = BlinkProvider::new_with_webhook_url(
+            blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
+        );
+        let recipient = blink_recipient(Some(WalletKind::Btc));
+
+        let mut request = blink_invoice_request(&recipient, Some(WalletKind::Btc));
+        request.memo = Some("thanks for the coffee");
+        provider
+            .create_invoice(request)
+            .await
+            .expect("BTC invoice should be created");
+
+        let body = request_body_rx
+            .recv()
+            .await
+            .expect("request body should be captured");
+        // The memo must travel next to the description hash, not replace it: the BOLT11
+        // keeps its `h` tag while Blink stores the memo separately, which is the only
+        // copy that reaches the recipient's transaction history.
+        assert_eq!(body["variables"]["input"]["memo"], "thanks for the coffee");
+        assert_eq!(
+            body["variables"]["input"]["descriptionHash"],
+            hex::encode([7; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_provider_omits_memo_when_absent() {
+        let (request_body_tx, mut request_body_rx) = tokio::sync::mpsc::channel(2);
+        let endpoint = start_blink_mock_server(request_body_tx).await;
+        let provider = BlinkProvider::new_with_webhook_url(
+            blink_client::Client::new(blink_client::ClientConfig::new(endpoint)),
+            Some(TEST_BLINK_WEBHOOK_URL.to_string()),
+        );
+        let recipient = blink_recipient(Some(WalletKind::Btc));
+
+        provider
+            .create_invoice(blink_invoice_request(&recipient, Some(WalletKind::Btc)))
+            .await
+            .expect("BTC invoice should be created");
+
+        let body = request_body_rx
+            .recv()
+            .await
+            .expect("request body should be captured");
+        assert!(body["variables"]["input"].get("memo").is_none());
+    }
+
     #[test]
     fn blink_provider_selects_explicit_wallets_test_01() {
         let default_btc = blink_recipient(Some(WalletKind::Btc));
@@ -990,6 +1051,7 @@ mod tests {
                 wallet: Some(WalletKind::Usd),
                 amount_sat: 1,
                 description_hash: [0; 32],
+                memo: None,
                 expiry: Some(1),
                 include_spark_address: false,
             })
@@ -1010,6 +1072,7 @@ mod tests {
                     wallet,
                     amount_sat: 1,
                     description_hash: [0; 32],
+                    memo: None,
                     expiry: Some(2),
                     include_spark_address: false,
                 })

@@ -102,6 +102,9 @@ impl Client {
         if let Some(description_hash_hex) = request.description_hash_hex {
             input.insert("descriptionHash".to_string(), json!(description_hash_hex));
         }
+        if let Some(memo) = request.memo {
+            input.insert("memo".to_string(), json!(memo));
+        }
         if let Some(expires_in_minutes) = request.expires_in_minutes {
             input.insert("expiresIn".to_string(), json!(expires_in_minutes));
         }
