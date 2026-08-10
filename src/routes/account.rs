@@ -1928,6 +1928,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_and_recover_never_resolve_for_anon_or_untyped_accounts() {
+        for mode in [Some(AccountMode::Anon), None] {
+            let (secret, pubkey) = mode_key(22);
+            let (base_url, calls) = start_country_mock("CO").await;
+            let repo = MockRepository::default().with_spark_mode(&pubkey, mode);
+            let state = route_test_state_with_country_resolver(
+                repo.clone(),
+                CountryResolver::new(&base_url, None).expect("resolver builds"),
+            )
+            .await;
+            let timestamp = now_u64();
+
+            let recovered = LnurlServer::recover(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state.clone()),
+                headers_with_request_ip("203.0.113.7"),
+                Json(RecoverLnurlPayRequest {
+                    signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                    timestamp,
+                }),
+            )
+            .await;
+            match mode {
+                Some(_) => {
+                    let _ = recovered.expect("an anon account recovers its mode");
+                }
+                // No username and no mode leaves nothing to recover; the 404
+                // must still happen after the (skipped) evidence refresh.
+                None => assert!(recovered.is_err()),
+            }
+
+            let _ = LnurlServer::register(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state),
+                headers_with_request_ip("203.0.113.7"),
+                Json(RegisterLnurlPayRequest {
+                    username: "alice".to_string(),
+                    signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+                    timestamp,
+                    description: "Alice".to_string(),
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a non-enhanced account's ip must never reach the vendor (mode: {mode:?})"
+            );
+            assert!(
+                repo.spark_mode(&pubkey)
+                    .is_none_or(|record| record.country.is_none()),
+                "no country evidence may appear for mode: {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recover_returns_the_mode_and_tolerates_address_less_accounts() {
         let (secret, pubkey) = mode_key(20);
         let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
