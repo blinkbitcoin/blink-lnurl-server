@@ -81,4 +81,3 @@ fn verify_cert_against_ca(
 
     Ok(())
 }
-
