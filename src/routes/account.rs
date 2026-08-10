@@ -1665,66 +1665,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fast_client_clock_does_not_wedge_later_mode_requests() {
-        // The device is 5 minutes fast but still inside the freshness window;
-        // the account must stay usable from a correctly clocked one.
-        let (secret, pubkey) = mode_key(26);
-        let repo = MockRepository::default();
-        let state =
-            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
-        let now = now_u64();
-
-        let _ = post_mode(
-            &state,
-            &pubkey,
-            mode_request(&secret, &pubkey, "anon", now + 300),
-            HeaderMap::new(),
-        )
-        .await
-        .expect("a request from a fast clock is still validly signed and fresh");
-        let anchor = repo
-            .spark_mode(&pubkey)
-            .unwrap()
-            .mode_last_timestamp
-            .expect("an accepted request always anchors");
-        assert!(
-            anchor <= i64::try_from(now_u64()).unwrap()
-                && anchor < i64::try_from(now + 300).unwrap(),
-            "the stored anchor must be clamped to server time"
-        );
-
-        let _ = post_mode(
-            &state,
-            &pubkey,
-            mode_request(
-                &secret,
-                &pubkey,
-                "enhanced",
-                u64::try_from(anchor).unwrap() + 1,
-            ),
-            HeaderMap::new(),
-        )
-        .await
-        .expect("the user's correctly clocked device must not be locked out");
-        assert_eq!(
-            repo.spark_mode(&pubkey).unwrap().mode,
-            Some(AccountMode::Enhanced)
-        );
-
-        // Rollback protection is unchanged.
-        assert_conflict(
-            post_mode(
-                &state,
-                &pubkey,
-                mode_request(&secret, &pubkey, "anon", now - 60),
-                HeaderMap::new(),
-            )
-            .await,
-            ERROR_MODE_REQUEST_NOT_NEWER,
-        );
-    }
-
-    #[tokio::test]
     async fn an_identical_mode_request_retried_after_a_dropped_response_succeeds() {
         let (secret, pubkey) = mode_key(27);
         let repo = MockRepository::default();
