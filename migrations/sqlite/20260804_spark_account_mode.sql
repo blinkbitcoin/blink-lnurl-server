@@ -5,5 +5,4 @@ ALTER TABLE spark_accounts ADD COLUMN mode_updated_at INTEGER;
 -- Client timestamp of the last accepted mode request; the monotonic anti-replay/rollback anchor.
 ALTER TABLE spark_accounts ADD COLUMN mode_last_timestamp INTEGER;
 ALTER TABLE spark_accounts ADD COLUMN country TEXT;
-ALTER TABLE spark_accounts ADD COLUMN country_source TEXT CHECK (country_source IN ('ip', 'phone'));
 ALTER TABLE spark_accounts ADD COLUMN country_updated_at INTEGER;

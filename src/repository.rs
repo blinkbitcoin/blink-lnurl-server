@@ -156,29 +156,6 @@ impl ModeSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CountrySource {
-    Ip,
-    Phone,
-}
-
-impl CountrySource {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ip => "ip",
-            Self::Phone => "phone",
-        }
-    }
-
-    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
-        match value {
-            "ip" => Ok(Self::Ip),
-            "phone" => Ok(Self::Phone),
-            _ => Err(LnurlRepositoryError::InvalidAccountMode),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparkAccountMode {
     pub account_id: String,
@@ -188,7 +165,6 @@ pub struct SparkAccountMode {
     pub mode_updated_at: Option<i64>,
     pub mode_last_timestamp: Option<i64>,
     pub country: Option<String>,
-    pub country_source: Option<CountrySource>,
     pub country_updated_at: Option<i64>,
 }
 
@@ -648,9 +624,9 @@ pub struct WebhookPayloadData {
 pub mod shared_tests {
     use super::{
         AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
-        CountrySource, IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError,
-        LnurlSenderComment, ModeSource, NewAccountIdentifier, NewBlinkAccount,
-        NewSparkRegistration, SparkModeUpdate, WalletKind, generate_account_id,
+        IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment,
+        ModeSource, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration, SparkModeUpdate,
+        WalletKind, generate_account_id,
     };
     use crate::zap::Zap;
 
@@ -2826,7 +2802,6 @@ pub mod shared_tests {
 
         let stored = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
         assert_eq!(stored.country.as_deref(), Some("SV"));
-        assert_eq!(stored.country_source, Some(CountrySource::Ip));
         assert!(stored.country_updated_at.is_some());
 
         db.refresh_spark_country_evidence(pubkey, "CO")
@@ -2850,7 +2825,6 @@ pub mod shared_tests {
         let cleared = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
         assert_eq!(cleared.mode, Some(AccountMode::Anon));
         assert!(cleared.country.is_none());
-        assert!(cleared.country_source.is_none());
         assert!(cleared.country_updated_at.is_none());
 
         db.refresh_spark_country_evidence(pubkey, "US")
@@ -3028,10 +3002,14 @@ pub mod provider_neutral_schema_tests {
                 "mode_updated_at",
                 "mode_last_timestamp",
                 "country",
-                "country_source",
                 "country_updated_at",
             ],
-            forbidden_columns: &["deleted_at", "mode_last_signature", "deactivated"],
+            forbidden_columns: &[
+                "deleted_at",
+                "mode_last_signature",
+                "deactivated",
+                "country_source",
+            ],
         },
         TableExpectation {
             name: "blink_accounts",
@@ -3108,15 +3086,12 @@ pub mod provider_neutral_schema_tests {
         assert_sqlite_check_contains(pool, "blink_accounts", "'usd'").await;
         assert_sqlite_check_contains(pool, "spark_accounts", "'enhanced'").await;
         assert_sqlite_check_contains(pool, "spark_accounts", "'anon'").await;
-        assert_sqlite_check_contains(pool, "spark_accounts", "'ip'").await;
-        assert_sqlite_check_contains(pool, "spark_accounts", "'phone'").await;
         for column in [
             "mode",
             "mode_source",
             "mode_updated_at",
             "mode_last_timestamp",
             "country",
-            "country_source",
             "country_updated_at",
         ] {
             assert_eq!(
@@ -3169,15 +3144,12 @@ pub mod provider_neutral_schema_tests {
         assert_postgres_check_contains(pool, "blink_accounts", "'usd'").await;
         assert_postgres_check_contains(pool, "spark_accounts", "'enhanced'").await;
         assert_postgres_check_contains(pool, "spark_accounts", "'anon'").await;
-        assert_postgres_check_contains(pool, "spark_accounts", "'ip'").await;
-        assert_postgres_check_contains(pool, "spark_accounts", "'phone'").await;
         for column in [
             "mode",
             "mode_source",
             "mode_updated_at",
             "mode_last_timestamp",
             "country",
-            "country_source",
             "country_updated_at",
         ] {
             assert!(

@@ -1564,7 +1564,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let stored = repo.spark_mode(&pubkey).unwrap();
         assert_eq!(stored.country.as_deref(), Some("SV"));
-        assert_eq!(stored.country_source, Some(CountrySource::Ip));
 
         let _ = post_mode(
             &state,
@@ -1577,7 +1576,6 @@ mod tests {
         let cleared = repo.spark_mode(&pubkey).unwrap();
         assert_eq!(cleared.mode, Some(AccountMode::Anon));
         assert!(cleared.country.is_none());
-        assert!(cleared.country_source.is_none());
         assert!(cleared.country_updated_at.is_none());
         assert_eq!(
             calls.load(Ordering::SeqCst),

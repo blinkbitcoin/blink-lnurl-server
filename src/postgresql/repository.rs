@@ -3,7 +3,7 @@ use sqlx::{PgPool, Row};
 
 use crate::repository::{
     Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
-    CountrySource, IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
+    IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
     NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
     UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
     generate_account_id,
@@ -107,10 +107,6 @@ fn map_spark_account_mode(
         mode_updated_at: row.try_get("mode_updated_at")?,
         mode_last_timestamp: row.try_get("mode_last_timestamp")?,
         country: row.try_get("country")?,
-        country_source: row
-            .try_get::<Option<String>, _>("country_source")?
-            .map(|source| CountrySource::from_database_value(&source))
-            .transpose()?,
         country_updated_at: row.try_get("country_updated_at")?,
     })
 }
@@ -428,7 +424,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
     ) -> Result<Option<SparkAccountMode>, LnurlRepositoryError> {
         sqlx::query(
             "SELECT account_id, pubkey, mode, mode_source, mode_updated_at, mode_last_timestamp
-             ,      country, country_source, country_updated_at
+             ,      country, country_updated_at
              FROM spark_accounts
              WHERE pubkey = $1",
         )
@@ -453,7 +449,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             AccountMode::Enhanced => update.country.clone(),
         };
         let write_country = update.mode == AccountMode::Anon || country.is_some();
-        let country_source = country.as_ref().map(|_| CountrySource::Ip.as_str());
         let country_updated_at = country.as_ref().map(|_| now);
 
         // One conditional statement: the monotonic check and the write are a
@@ -466,11 +461,10 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              ,   mode_updated_at = $5
              ,   mode_last_timestamp = $6
              ,   country = CASE WHEN $7::boolean THEN $8::text ELSE country END
-             ,   country_source = CASE WHEN $7::boolean THEN $9::text ELSE country_source END
-             ,   country_updated_at = CASE WHEN $7::boolean THEN $10::bigint ELSE country_updated_at END
+             ,   country_updated_at = CASE WHEN $7::boolean THEN $9::bigint ELSE country_updated_at END
              ,   updated_at = $5
              WHERE pubkey = $1
-             AND (mode_last_timestamp IS NULL OR mode_last_timestamp < $11)",
+             AND (mode_last_timestamp IS NULL OR mode_last_timestamp < $10)",
         )
         .bind(&update.pubkey)
         .bind(update.mode.as_str())
@@ -480,7 +474,6 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(update.client_timestamp.min(now))
         .bind(write_country)
         .bind(country.as_deref())
-        .bind(country_source)
         .bind(country_updated_at)
         .bind(update.client_timestamp)
         .execute(&self.pool)
@@ -502,14 +495,12 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         sqlx::query(
             "UPDATE spark_accounts
              SET country = $2
-             ,   country_source = $3
-             ,   country_updated_at = $4
-             ,   updated_at = $4
+             ,   country_updated_at = $3
+             ,   updated_at = $3
              WHERE pubkey = $1 AND mode = 'enhanced'",
         )
         .bind(pubkey)
         .bind(country)
-        .bind(CountrySource::Ip.as_str())
         .bind(now)
         .execute(&self.pool)
         .await?;

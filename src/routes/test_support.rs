@@ -21,7 +21,7 @@ pub(super) use crate::models::{
 use crate::providers::{CreateInvoiceRequest, PaymentStatusRequest, ProviderError};
 pub(super) use crate::repository::{
     AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
-    CountrySource, IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError,
+    IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError,
     LnurlSenderComment, ModeSource, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration,
     PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate, SparkUsername,
     UpdatedBlinkAccount, WalletKind, generate_account_id,
@@ -148,7 +148,6 @@ pub(super) fn empty_spark_mode_record(pubkey: &str) -> SparkAccountMode {
         mode_updated_at: None,
         mode_last_timestamp: None,
         country: None,
-        country_source: None,
         country_updated_at: None,
     }
 }
@@ -233,14 +232,12 @@ impl LnurlRepository for MockRepository {
         } else {
             ModeSource::Switch
         };
-        let (country, country_source, country_updated_at) = match (update.mode, &update.country) {
-            (AccountMode::Anon, _) => (None, None, None),
-            (AccountMode::Enhanced, Some(country)) => {
-                (Some(country.clone()), Some(CountrySource::Ip), Some(now))
-            }
-            (AccountMode::Enhanced, None) => existing.as_ref().map_or((None, None, None), |r| {
-                (r.country.clone(), r.country_source, r.country_updated_at)
-            }),
+        let (country, country_updated_at) = match (update.mode, &update.country) {
+            (AccountMode::Anon, _) => (None, None),
+            (AccountMode::Enhanced, Some(country)) => (Some(country.clone()), Some(now)),
+            (AccountMode::Enhanced, None) => existing
+                .as_ref()
+                .map_or((None, None), |r| (r.country.clone(), r.country_updated_at)),
         };
 
         let record = SparkAccountMode {
@@ -249,7 +246,6 @@ impl LnurlRepository for MockRepository {
             mode_updated_at: Some(now),
             mode_last_timestamp: Some(update.client_timestamp.min(now)),
             country,
-            country_source,
             country_updated_at,
             ..existing.unwrap_or_else(|| empty_spark_mode_record(&update.pubkey))
         };
@@ -266,7 +262,6 @@ impl LnurlRepository for MockRepository {
             && record.mode == Some(AccountMode::Enhanced)
         {
             record.country = Some(country.to_string());
-            record.country_source = Some(CountrySource::Ip);
             record.country_updated_at = Some(crate::time::now());
         }
         Ok(())

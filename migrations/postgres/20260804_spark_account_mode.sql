@@ -6,5 +6,4 @@ ALTER TABLE spark_accounts
     -- Client timestamp of the last accepted mode request; the monotonic anti-replay/rollback anchor.
     ADD COLUMN mode_last_timestamp BIGINT,
     ADD COLUMN country TEXT,
-    ADD COLUMN country_source TEXT CONSTRAINT spark_accounts_country_source_check CHECK (country_source IN ('ip', 'phone')),
     ADD COLUMN country_updated_at BIGINT;
