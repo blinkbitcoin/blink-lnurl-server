@@ -24,7 +24,7 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_MAX_SENDABLE` | Optional | `4000000000` | Maximum LNURL payment amount in millisatoshi. |
 | `LNURL_DOMAINS` | Optional | `localhost:8080` | Comma-separated allowed domains. Configured domains are inserted into the database on startup. |
 | `LNURL_NSEC` | Optional | unset | Nostr private key used to sign NIP-57 zap receipts. If unset, zap requests are ignored. |
-| `LNURL_CA_CERT` | Optional in `local`, **required otherwise** | unset | Base64-encoded DER CA certificate used to validate bearer client certificates for authenticated `/lnurlpay/...` routes. When unset outside `DEPLOYMENT_ENV=local`, those routes reject every request. |
+| `LNURL_CA_CERT` | Optional | unset | Base64-encoded DER CA certificate used to validate bearer client certificates for authenticated `/lnurlpay/...` routes. |
 | `LNURL_CRL_URL` | Optional | unset | URL fetched at startup for a comma-separated certificate revocation list. |
 | `LNURL_CALLBACK_DOMAIN` | Optional | unset | Public domain used when constructing LNURL invoice callback and verify URLs. If unset, those URLs use the request domain. This does not affect provider webhook registration. |
 | `LNURL_WEBHOOK_DOMAIN` | **Required at startup** | unset | Domain used to build Blink invoice callback URLs at `{scheme}://{webhook_domain}/webhook/blink`; also used for Spark SSP webhook registration at `{scheme}://{webhook_domain}/webhook`. |
@@ -99,7 +99,7 @@ Settings that fail closed or fall back instead of stopping the server:
 - Internal auth is enabled only when issuer, audience, and either a JWKS path or URL are available and parse successfully. Otherwise `/internal/...` routes return unauthorized.
 - `ssp_auth_seed` falls back to a random seed when omitted or invalid.
 - `nsec` omitted means zap requests are ignored rather than signed.
-- `ca_cert` omitted disables bearer certificate validation on the authenticated `/lnurlpay/...` route group **only when `DEPLOYMENT_ENV=local`**; in every other environment the omission fails closed and the route group returns unauthorized.
+- `ca_cert` omitted disables bearer certificate validation on the authenticated `/lnurlpay/...` route group.
 - `proxycheck_api_key` omitted disables country resolution: Enhanced accounts are still recorded, they simply carry no country evidence.
 
 ## Defaults
