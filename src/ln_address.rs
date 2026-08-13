@@ -143,7 +143,7 @@ where
         })?;
 
     let invoice = Bolt11Invoice::from_str(&res.bolt11).map_err(|e| {
-        error!("provider returned unparseable invoice: {e}");
+        error!("provider returned unparsable invoice: {e}");
         LnAddressError::Internal
     })?;
 
