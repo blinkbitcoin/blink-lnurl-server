@@ -16,10 +16,11 @@ use crate::{
     },
     models::{
         ERROR_ENHANCED_MODE_REQUIRED, ERROR_INVALID_MODE, ERROR_MODE_REQUEST_NOT_NEWER,
-        ERROR_RATE_LIMITED, ListMetadataRequest, ListMetadataResponse, RecoverLnurlPayRequest,
-        RecoverLnurlPayResponse, RegisterLnurlPayRequest, RegisterLnurlPayResponse,
-        SetLnurlPayModeRequest, SetLnurlPayModeResponse, TransferLnurlPayRequest,
-        TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
+        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, ListMetadataRequest,
+        ListMetadataResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+        RegisterLnurlPayRequest, RegisterLnurlPayResponse, SetLnurlPayModeRequest,
+        SetLnurlPayModeResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
+        UnregisterLnurlPayRequest, sanitize_username,
     },
     repository::{
         AccountIdentifierKind, AccountMode, AccountProvider, IdentifierTransfer, LnurlRepository,
@@ -33,6 +34,10 @@ use crate::{
 use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
+
+// Bounds how far ahead of the stored anchor an accepted mode request can sit,
+// which bounds the cross-device lockout after a fast-clock request.
+const MODE_MAX_FUTURE_SKEW_SECS: i64 = 30;
 
 impl<DB> LnurlServer<DB>
 where
@@ -305,6 +310,15 @@ where
                 Json(Value::String("invalid timestamp".into())),
             )
         })?;
+        // The anchor stores this value verbatim, so a future-dated request must
+        // be refused outright: a clamped anchor could be replayed past a later
+        // mode switch.
+        if client_timestamp > crate::time::now() + MODE_MAX_FUTURE_SKEW_SECS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String(ERROR_MODE_TIMESTAMP_IN_FUTURE.into())),
+            ));
+        }
 
         let country = match mode {
             AccountMode::Enhanced => resolve_country(&state, request_ip).await,
@@ -1791,6 +1805,36 @@ mod tests {
             spark_mode_error(LnurlRepositoryError::StaleModeTimestamp);
         assert_eq!(mode_status, status);
         assert_eq!(mode_body, body);
+    }
+
+    #[tokio::test]
+    async fn a_future_dated_mode_request_is_rejected_before_any_lookup() {
+        let (secret, pubkey) = mode_key(26);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+
+        let Err((status, Json(body))) = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64() + 120),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        else {
+            panic!("a future-dated mode request must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            Value::String(ERROR_MODE_TIMESTAMP_IN_FUTURE.to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(repo.spark_mode(&pubkey).is_none());
     }
 
     #[tokio::test]

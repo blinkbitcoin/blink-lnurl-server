@@ -244,7 +244,7 @@ impl LnurlRepository for MockRepository {
             mode: Some(update.mode),
             mode_source: Some(mode_source),
             mode_updated_at: Some(now),
-            mode_last_timestamp: Some(update.client_timestamp.min(now)),
+            mode_last_timestamp: Some(update.client_timestamp),
             country,
             country_updated_at,
             ..existing.unwrap_or_else(|| empty_spark_mode_record(&update.pubkey))

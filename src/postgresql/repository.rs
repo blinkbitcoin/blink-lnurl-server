@@ -453,7 +453,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
 
         // One conditional statement: the monotonic check and the write are a
         // single atomic operation, so two concurrent requests cannot both pass
-        // it. The stored anchor is clamped to server time.
+        // it. The route refuses future-dated timestamps, so the anchor stores
+        // the client timestamp verbatim.
         let updated = sqlx::query(
             "UPDATE spark_accounts
              SET mode = $2
@@ -471,7 +472,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(ModeSource::Signup.as_str())
         .bind(ModeSource::Switch.as_str())
         .bind(now)
-        .bind(update.client_timestamp.min(now))
+        .bind(update.client_timestamp)
         .bind(write_country)
         .bind(country.as_deref())
         .bind(country_updated_at)
@@ -2380,11 +2381,11 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
-    async fn mode_anchor_is_clamped_to_server_time() {
+    async fn mode_anchor_stores_the_client_timestamp_verbatim() {
         let Some((_pool, db)) = setup_test_db().await else {
             return;
         };
-        shared_tests::mode_anchor_is_clamped_to_server_time(&db).await;
+        shared_tests::mode_anchor_stores_the_client_timestamp_verbatim(&db).await;
     }
 
     #[tokio::test]

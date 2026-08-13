@@ -2645,64 +2645,44 @@ pub mod shared_tests {
         assert_eq!(switched.mode_last_timestamp, Some(1_700_000_101));
     }
 
-    pub async fn mode_anchor_is_clamped_to_server_time<DB>(db: &DB)
+    pub async fn mode_anchor_stores_the_client_timestamp_verbatim<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
-        // A client clock running fast is still inside the +/-600s freshness
-        // window, so it must not be able to anchor the account in the future and
-        // lock out every later request — including the user's second device.
-        let pubkey = "spark_mode_fast_clock_pubkey";
-        let sent_at = crate::time::now();
+        // The route bounds how far ahead a timestamp may sit; the repository
+        // stores whatever was accepted, verbatim. A clamped anchor would sit
+        // below the timestamp of the request that wrote it, letting that
+        // request be replayed past a later mode switch.
+        let pubkey = "spark_mode_anchor_verbatim_pubkey";
+        let sent_at = crate::time::now() - 120;
 
-        db.upsert_spark_mode(&mode_update(
-            pubkey,
-            AccountMode::Anon,
-            sent_at.saturating_add(300),
-        ))
-        .await
-        .unwrap();
-
-        let anchor = db
-            .get_spark_account_mode(pubkey)
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, sent_at))
             .await
-            .unwrap()
-            .unwrap()
-            .mode_last_timestamp
-            .expect("an accepted request always anchors");
-        assert!(
-            anchor <= crate::time::now() && anchor < sent_at.saturating_add(300),
-            "the stored anchor must be clamped to server time"
-        );
-
-        // A correctly clocked second device: its timestamp is nowhere near the
-        // fast device's, and it must still be accepted.
-        db.upsert_spark_mode(&mode_update(
-            pubkey,
-            AccountMode::Enhanced,
-            anchor.saturating_add(1),
-        ))
-        .await
-        .expect("a correctly clocked device must still be accepted");
+            .unwrap();
         assert_eq!(
             db.get_spark_account_mode(pubkey)
                 .await
                 .unwrap()
                 .unwrap()
-                .mode,
-            Some(AccountMode::Enhanced)
+                .mode_last_timestamp,
+            Some(sent_at),
+            "the anchor must equal the accepted timestamp exactly"
         );
 
-        // Anti-rollback is unaffected: an older request is still refused.
+        // The guard holds exactly at the anchor: the same timestamp with a
+        // different mode is refused, one second later passes.
         assert!(matches!(
-            db.upsert_spark_mode(&mode_update(
-                pubkey,
-                AccountMode::Anon,
-                sent_at.saturating_sub(60)
-            ))
-            .await,
+            db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Enhanced, sent_at))
+                .await,
             Err(LnurlRepositoryError::StaleModeTimestamp)
         ));
+        db.upsert_spark_mode(&mode_update(
+            pubkey,
+            AccountMode::Enhanced,
+            sent_at.saturating_add(1),
+        ))
+        .await
+        .expect("a strictly newer request must pass");
     }
 
     pub async fn mode_retry_of_the_same_request_is_idempotent<DB>(db: &DB)

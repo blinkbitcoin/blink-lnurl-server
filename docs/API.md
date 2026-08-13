@@ -140,7 +140,7 @@ Recover response. `mode` is always present; `null` means the account has never c
 }
 ```
 
-Mode request. The signed message is `mode:{mode}:{pubkey}-{timestamp}`; `timestamp` must be within 600 seconds of server time AND strictly newer than the last accepted mode request for this pubkey. Re-sending the exact request that was last accepted (same mode, same timestamp — a retry after a dropped response) succeeds without changing anything; any other older request is refused:
+Mode request. The signed message is `mode:{mode}:{pubkey}-{timestamp}`; `timestamp` must be within 600 seconds of server time, at most 30 seconds ahead of it, AND strictly newer than the last accepted mode request for this pubkey. Re-sending the exact request that was last accepted (same mode, same timestamp — a retry after a dropped response) succeeds without changing anything; any other older request is refused:
 
 ```json
 {
@@ -158,7 +158,7 @@ Mode response:
 }
 ```
 
-Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a user-initiated transfer are both refused while the stored mode is `anon`. The server-initiated migration transfer is the deliberate exception: it completes even for an `anon` destination, and the address stays dormant (no invoices are minted) until the account switches to `enhanced` — failing the migration would be the harsher outcome for a state only the account holder can create. Only the client timestamp of an accepted request is stored, clamped to server time, so a client clock running fast cannot lock the account out of later requests.
+Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a user-initiated transfer are both refused while the stored mode is `anon`. The server-initiated migration transfer is the deliberate exception: it completes even for an `anon` destination, and the address stays dormant (no invoices are minted) until the account switches to `enhanced` — failing the migration would be the harsher outcome for a state only the account holder can create. The accepted timestamp is stored verbatim as the monotonic anchor; a timestamp more than 30 seconds ahead of server time is refused with `mode_timestamp_in_future` rather than clamped — a clamped anchor would sit below the timestamp of the request that wrote it, letting a captured request be replayed past a later mode switch. The refusal caps any fast-clock cross-device lockout at 30 seconds.
 
 Successful `DELETE`, `/invoice-paid`, and `/invoices-paid` responses have an empty body.
 
@@ -282,7 +282,7 @@ Blink `/webhook/blink` body:
 | Status | Shape | Meaning |
 |---:|---|---|
 | `200` | `{ "status": "ERROR", "reason": "..." }` | Public LNURL protocol errors such as missing amount, unsupported wallet, invalid zap request, expired policy, or invoice creation failure. |
-| `400` | JSON string or `{ "error": "..." }` | Invalid usernames, invalid signatures, invalid timestamps, malformed JSON, invalid preimages/invoices, invalid internal request fields, or zap receipt validation failures. |
+| `400` | JSON string or `{ "error": "..." }` | Invalid usernames, invalid signatures, invalid timestamps, `mode_timestamp_in_future` for a mode request more than 30 seconds ahead of server time, malformed JSON, invalid preimages/invoices, invalid internal request fields, or zap receipt validation failures. |
 | `401` | Empty body or JSON string | Missing/invalid client certificate, missing/invalid internal bearer JWT, or invalid Spark webhook signature. |
 | `403` | `{ "error": "forbidden" }` or `{ "error": "unauthorized" }` | Internal JWT lacks the required scope, or a zap receipt is being published by the wrong Spark pubkey. |
 | `404` | JSON string, `{ "error": "not_found" }`, or empty string | User, invoice, zap, account, or identifier was not found. |
