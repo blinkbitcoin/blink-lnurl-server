@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Fixed-window per-IP counter. In-process only: with several replicas the
@@ -25,6 +26,7 @@ pub struct PerIpRateLimiter {
     /// client-IP header; everywhere else an absent IP means no budget.
     allow_untrusted: bool,
     counters: Mutex<HashMap<IpAddr, Window>>,
+    saturated: AtomicBool,
 }
 
 struct Window {
@@ -45,6 +47,7 @@ impl PerIpRateLimiter {
             max_tracked_ips,
             allow_untrusted,
             counters: Mutex::new(HashMap::new()),
+            saturated: AtomicBool::new(false),
         }
     }
 
@@ -60,17 +63,25 @@ impl PerIpRateLimiter {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if !counters.contains_key(&ip) && counters.len() >= self.max_tracked_ips {
+        let is_new = !counters.contains_key(&ip);
+        if is_new && counters.len() >= self.max_tracked_ips {
             // Only expired windows may be dropped: evicting live ones would let
             // any flood reset every counter, its own included.
             counters.retain(|_, window| now.duration_since(window.started_at) < self.window);
             if counters.len() >= self.max_tracked_ips {
-                tracing::warn!(
-                    tracked_ips = counters.len(),
-                    "per-ip limiter table saturated; refusing untracked ips"
-                );
+                // Warn on the transition only: per-refusal logging would scale
+                // with the very flood that causes the saturation.
+                if !self.saturated.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        tracked_ips = counters.len(),
+                        "per-ip limiter table saturated; refusing untracked ips"
+                    );
+                }
                 return false;
             }
+        }
+        if is_new {
+            self.saturated.store(false, Ordering::Relaxed);
         }
 
         let window = counters.entry(ip).or_insert(Window {
