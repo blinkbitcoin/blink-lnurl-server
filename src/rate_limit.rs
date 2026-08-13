@@ -95,10 +95,18 @@ mod tests {
 
     #[test]
     fn window_resets_after_expiry() {
-        let limiter = PerIpRateLimiter::new(1, Duration::from_millis(0), 1_000, false);
+        let limiter = PerIpRateLimiter::new(1, Duration::from_millis(20), 1_000, false);
 
         assert!(limiter.check(Some(ip(1))));
-        assert!(limiter.check(Some(ip(1))));
+        assert!(
+            !limiter.check(Some(ip(1))),
+            "the live window must still enforce the budget"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            limiter.check(Some(ip(1))),
+            "an expired window must grant a fresh budget"
+        );
     }
 
     #[test]
