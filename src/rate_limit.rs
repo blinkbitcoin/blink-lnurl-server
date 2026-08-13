@@ -52,6 +52,12 @@ impl PerIpRateLimiter {
             // any flood reset every counter, its own included.
             counters.retain(|_, window| now.duration_since(window.started_at) < self.window);
             if counters.len() >= self.max_tracked_ips {
+                // Saturation denies every NEW ip, not the flood; make that
+                // state distinguishable from ordinary throttling.
+                tracing::warn!(
+                    tracked_ips = counters.len(),
+                    "per-ip limiter table saturated; refusing untracked ips"
+                );
                 return false;
             }
         }

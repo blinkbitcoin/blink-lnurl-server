@@ -178,7 +178,8 @@ struct Args {
     pub mode_requests_per_ip_per_minute: u32,
 }
 
-/// Bound on the limiter's in-process key set.
+/// Bound on the limiter's in-process key set. Per replica, and filled by every
+/// route sharing the budget (mode, register, recover), not just mode traffic.
 const RATE_LIMIT_TRACKED_IPS: usize = 100_000;
 
 #[derive(Debug)]
