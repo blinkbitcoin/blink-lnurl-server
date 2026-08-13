@@ -43,6 +43,9 @@ impl<DB> LnurlServer<DB>
 where
     DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
+    /// Unlike both transfer paths, claiming a username deliberately never
+    /// records a mode: registering a name is not consent to IP region checks,
+    /// so the account stays untyped until its owner declares one.
     pub async fn register(
         Host(host): Host,
         Path(pubkey): Path<String>,
