@@ -84,7 +84,7 @@ where
             return Err(spark_registration_error(e, &username));
         }
 
-        refresh_country_evidence(&state, &pubkey.to_string(), stored_mode, &headers).await;
+        spawn_country_evidence_refresh(&state, &pubkey.to_string(), stored_mode, &headers);
 
         debug!("registered user '{username}' for pubkey {pubkey}");
         let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
@@ -237,7 +237,7 @@ where
         }
 
         let mode = stored_account_mode(&state, &pubkey.to_string()).await?;
-        refresh_country_evidence(&state, &pubkey.to_string(), mode, &headers).await;
+        spawn_country_evidence_refresh(&state, &pubkey.to_string(), mode, &headers);
 
         let user = state
             .db
@@ -429,8 +429,9 @@ async fn resolve_country<DB>(state: &State<DB>, request_ip: Option<IpAddr>) -> O
 /// untyped request never determines a region at all — and only within the same
 /// per-IP budget the mode route spends, so routine register/recover traffic
 /// cannot drive the paid vendor quota. Over budget, the evidence simply keeps
-/// its previous value.
-async fn refresh_country_evidence<DB>(
+/// its previous value. Spawned fire-and-forget: the caller never observes the
+/// result, so the vendor timeout must not sit on the response path.
+fn spawn_country_evidence_refresh<DB>(
     state: &State<DB>,
     pubkey: &str,
     mode: Option<AccountMode>,
@@ -446,21 +447,25 @@ async fn refresh_country_evidence<DB>(
     if !state.country_resolver.is_enabled() {
         return;
     }
+    let state = state.clone();
+    let pubkey = pubkey.to_string();
     let request_ip = client_ip(headers);
-    if !state.ip_rate_limiter.check(request_ip) {
-        debug!("country evidence refresh skipped: per-IP budget spent");
-        return;
-    }
-    let Some(country) = resolve_country(state, request_ip).await else {
-        return;
-    };
-    if let Err(e) = state
-        .db
-        .refresh_spark_country_evidence(pubkey, &country)
-        .await
-    {
-        error!("failed to refresh country evidence: {e}");
-    }
+    tokio::spawn(async move {
+        if !state.ip_rate_limiter.check(request_ip) {
+            debug!("country evidence refresh skipped: per-IP budget spent");
+            return;
+        }
+        let Some(country) = resolve_country(&state, request_ip).await else {
+            return;
+        };
+        if let Err(e) = state
+            .db
+            .refresh_spark_country_evidence(&pubkey, &country)
+            .await
+        {
+            error!("failed to refresh country evidence: {e}");
+        }
+    });
 }
 
 pub(super) fn canonical_spark_username_for_route(
@@ -1376,6 +1381,21 @@ mod tests {
         assert_eq!(body, Value::String(code.to_string()));
     }
 
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Long enough for a spawned refresh task to have run if it was going to.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     /// A proxycheck.io stand-in that echoes a fixed isocode and counts
     /// lookups. Like the real vendor it withholds the isocode unless the
     /// query carries `asn=1`.
@@ -1772,6 +1792,11 @@ mod tests {
             .expect("recover keeps working while over budget");
         }
 
+        wait_until("the one in-budget refresh to reach the vendor", || {
+            calls.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        settle().await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1838,6 +1863,7 @@ mod tests {
         )
         .await
         .expect("an enhanced account recovers");
+        settle().await;
 
         let _ = post_mode(
             &state,
@@ -1960,6 +1986,14 @@ mod tests {
         .await
         .expect("an enhanced account may claim a username");
 
+        wait_until("the spawned refresh to store the country", || {
+            repo.spark_mode(&pubkey)
+                .unwrap()
+                .country
+                .as_deref()
+                .is_some()
+        })
+        .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             repo.spark_mode(&pubkey).unwrap().country.as_deref(),
@@ -2013,6 +2047,7 @@ mod tests {
                 }),
             )
             .await;
+            settle().await;
 
             assert_eq!(
                 calls.load(Ordering::SeqCst),
