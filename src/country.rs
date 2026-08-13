@@ -39,6 +39,10 @@ impl CountryResolver {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.base_url.is_some()
+    }
+
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, anyhow::Error> {
         Ok(Self {
             client: reqwest::Client::builder()

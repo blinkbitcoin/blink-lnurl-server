@@ -441,6 +441,11 @@ async fn refresh_country_evidence<DB>(
     if mode != Some(AccountMode::Enhanced) {
         return;
     }
+    // A disabled resolver must cost nothing: the budget is shared with the
+    // mode route, so spending it on impossible lookups would 429 that route.
+    if !state.country_resolver.is_enabled() {
+        return;
+    }
     let request_ip = client_ip(headers);
     if !state.ip_rate_limiter.check(request_ip) {
         debug!("country evidence refresh skipped: per-IP budget spent");
@@ -1805,6 +1810,43 @@ mod tests {
             spark_mode_error(LnurlRepositoryError::StaleModeTimestamp);
         assert_eq!(mode_status, status);
         assert_eq!(mode_body, body);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_resolver_spends_no_register_or_recover_budget() {
+        let (secret, pubkey) = mode_key(27);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let mut state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        state.ip_rate_limiter = Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1,
+            std::time::Duration::from_mins(1),
+            10,
+            true,
+        ));
+        let timestamp = now_u64();
+
+        let _ = LnurlServer::recover(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state.clone()),
+            headers_with_request_ip("203.0.113.7"),
+            Json(RecoverLnurlPayRequest {
+                signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                timestamp,
+            }),
+        )
+        .await
+        .expect("an enhanced account recovers");
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", timestamp),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        .expect("recover with a disabled resolver must not spend the mode route's budget");
     }
 
     #[tokio::test]
