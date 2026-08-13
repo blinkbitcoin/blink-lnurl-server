@@ -702,7 +702,6 @@ pub(super) async fn internal_route_test_state_full(
             1_000,
             true,
         )),
-        local_env: true,
         scheme: "http".to_string(),
         callback_domain: None,
         min_sendable: 1_000,

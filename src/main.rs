@@ -545,7 +545,6 @@ where
         internal_auth,
         country_resolver,
         ip_rate_limiter,
-        local_env: runtime_config.local_env,
         scheme: args.scheme,
         callback_domain: args.callback_domain,
         min_sendable: args.min_sendable,
