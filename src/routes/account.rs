@@ -401,6 +401,10 @@ pub(super) fn spark_mode_error(error: LnurlRepositoryError) -> (StatusCode, Json
             StatusCode::CONFLICT,
             Json(Value::String(ERROR_MODE_REQUEST_NOT_NEWER.into())),
         ),
+        LnurlRepositoryError::AccountNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(Value::String("user not found".into())),
+        ),
         error => storage_error(error),
     }
 }
