@@ -313,7 +313,7 @@ where
         // The anchor stores this value verbatim, so a future-dated request must
         // be refused outright: a clamped anchor could be replayed past a later
         // mode switch.
-        if client_timestamp > crate::time::now() + MODE_MAX_FUTURE_SKEW_SECS {
+        if client_timestamp > crate::time::now().saturating_add(MODE_MAX_FUTURE_SKEW_SECS) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(Value::String(ERROR_MODE_TIMESTAMP_IN_FUTURE.into())),

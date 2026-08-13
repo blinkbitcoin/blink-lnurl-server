@@ -2654,7 +2654,7 @@ pub mod shared_tests {
         // below the timestamp of the request that wrote it, letting that
         // request be replayed past a later mode switch.
         let pubkey = "spark_mode_anchor_verbatim_pubkey";
-        let sent_at = crate::time::now() - 120;
+        let sent_at = crate::time::now().saturating_sub(120);
 
         db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, sent_at))
             .await
