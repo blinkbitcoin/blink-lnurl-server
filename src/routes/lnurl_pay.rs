@@ -319,11 +319,16 @@ where
         // mode-invariant; a prober who already knows a username can still infer
         // anon from a refused invoice, the residual the spec accepts as
         // inherent to user-visible deactivation.
-        if let Some(spark_pubkey) = public_recipient.recipient.spark_pubkey.as_deref()
-            && account::stored_account_mode(&state, spark_pubkey).await? == Some(AccountMode::Anon)
-        {
-            trace!("invoice refused for anon-mode recipient");
-            return Err(lnurl_error(ERROR_RECIPIENT_NOT_RECEIVING));
+        if let Some(spark_pubkey) = public_recipient.recipient.spark_pubkey.as_deref() {
+            // Fail closed in the LNURL envelope: minting while unable to read
+            // the mode would break the promise anon makes.
+            let mode = account::stored_account_mode(&state, spark_pubkey)
+                .await
+                .map_err(|_| lnurl_error("internal server error"))?;
+            if mode == Some(AccountMode::Anon) {
+                trace!("invoice refused for anon-mode recipient");
+                return Err(lnurl_error(ERROR_RECIPIENT_NOT_RECEIVING));
+            }
         }
 
         let account_id = public_recipient.recipient.account_id.clone();
