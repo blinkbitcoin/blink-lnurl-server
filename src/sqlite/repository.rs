@@ -111,10 +111,8 @@ fn map_spark_account_mode(
     })
 }
 
-/// Create the account rows for a pubkey on first contact. `BEGIN IMMEDIATE`
-/// takes the write lock up front and `ON CONFLICT DO NOTHING` makes two
-/// simultaneous first requests safe: the loser sees the row it lost to and
-/// proceeds as a plain update instead of erroring.
+/// Create the account rows for a pubkey on first contact; `BEGIN IMMEDIATE`
+/// plus `ON CONFLICT DO NOTHING` keeps two simultaneous first requests safe.
 async fn ensure_spark_account(pool: &SqlitePool, pubkey: &str) -> Result<(), LnurlRepositoryError> {
     if sqlx::query_scalar::<_, String>("SELECT account_id FROM spark_accounts WHERE pubkey = $1")
         .bind(pubkey)
@@ -443,8 +441,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         ensure_spark_account(&self.pool, &update.pubkey).await?;
 
         let now = now();
-        // Anon clears country evidence in the same statement; enhanced rewrites
-        // it only when this request actually resolved a country.
+        // Anon clears country evidence in the same atomic statement.
         let country = match update.mode {
             AccountMode::Anon => None,
             AccountMode::Enhanced => update.country.clone(),
@@ -452,10 +449,8 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         let write_country = update.mode == AccountMode::Anon || country.is_some();
         let country_updated_at = country.as_ref().map(|_| now);
 
-        // One conditional statement: the monotonic check and the write are a
-        // single atomic operation, so two concurrent requests cannot both pass
-        // it. The route refuses future-dated timestamps, so the anchor stores
-        // the client timestamp verbatim.
+        // The monotonic check and the write are one atomic statement; the
+        // anchor stores the client timestamp verbatim.
         let updated = sqlx::query(
             "UPDATE spark_accounts
              SET mode = $2

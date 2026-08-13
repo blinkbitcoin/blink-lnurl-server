@@ -535,8 +535,6 @@ where
             Arc::new(country::CountryResolver::disabled())
         }
     };
-    // Only a local deployment has no edge to supply the trusted client-IP
-    // header; anywhere else an absent IP gets no budget.
     let ip_rate_limiter = Arc::new(rate_limit::PerIpRateLimiter::new(
         args.mode_requests_per_ip_per_minute,
         std::time::Duration::from_mins(1),

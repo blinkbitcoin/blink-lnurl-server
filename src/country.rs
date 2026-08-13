@@ -5,9 +5,8 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 use tracing::{trace, warn};
 
-/// The single trusted client-IP header. Deployment must guarantee the edge
-/// strips or overwrites any client-supplied value: a spoofable IP here poisons
-/// the country evidence this store exists to provide.
+/// The single trusted client-IP header; the edge must strip or overwrite any
+/// client-supplied value.
 const CLIENT_IP_HEADER: &str = "x-real-ip";
 
 pub const DEFAULT_PROXYCHECK_URL: &str = "https://proxycheck.io/v2";
@@ -21,8 +20,7 @@ pub fn client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-/// proxycheck.io client, the same vendor blink-core resolves session countries
-/// with. Consumes `isocode` only — proxy/risk/ASN fields are never read.
+/// proxycheck.io client. Consumes `isocode` only — proxy/risk/ASN are never read.
 #[derive(Clone)]
 pub struct CountryResolver {
     client: reqwest::Client,
@@ -87,10 +85,8 @@ impl CountryResolver {
             }
         };
 
-        // proxycheck answers HTTP 200 with a rejecting status when the key is
-        // bad or the quota is spent; without this an expired key would leave
-        // the evidence permanently NULL and silent. `warning` still carries a
-        // usable result, so it is logged but read.
+        // The vendor rejects inside an HTTP 200 (bad key, spent quota);
+        // `warning` still carries a usable result.
         if let Some(status) = body.get("status").and_then(Value::as_str)
             && !status.eq_ignore_ascii_case("ok")
         {
@@ -112,8 +108,7 @@ impl CountryResolver {
     }
 }
 
-/// The vendor may key its entry in a different textual form than the one we
-/// sent (IPv6 compression), so entries are matched as parsed addresses.
+/// The vendor may key its entry in another textual form (IPv6 compression).
 fn entry_for_ip(body: &Value, ip: IpAddr) -> Option<&Value> {
     body.as_object()?
         .iter()

@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 /// Fixed-window per-IP counter. In-process only: with several replicas the
 /// effective budget is per replica.
-/// Rate-limit key: IPv4 individually, IPv6 by /64. A single host commonly
-/// holds an entire /64, so per-address keying would make both budget rotation
-/// and table-filling free.
+/// IPv4 keys individually, IPv6 by /64 — one host commonly holds an entire /64.
 fn bucket(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
@@ -67,8 +65,6 @@ impl PerIpRateLimiter {
             // any flood reset every counter, its own included.
             counters.retain(|_, window| now.duration_since(window.started_at) < self.window);
             if counters.len() >= self.max_tracked_ips {
-                // Saturation denies every NEW ip, not the flood; make that
-                // state distinguishable from ordinary throttling.
                 tracing::warn!(
                     tracked_ips = counters.len(),
                     "per-ip limiter table saturated; refusing untracked ips"
@@ -90,9 +86,8 @@ impl PerIpRateLimiter {
     }
 }
 
-/// Fixed-window cap on aggregate lookup spending, guarding the shared vendor
-/// quota against a crowd of ips that each stay under the per-ip budget.
-/// In-process, so per replica like the per-ip limiter.
+/// Fixed-window cap on aggregate lookup spending. In-process, so per replica
+/// like the per-ip limiter.
 pub struct GlobalBudget {
     max: u32,
     window: Duration,

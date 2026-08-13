@@ -314,14 +314,11 @@ where
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
 
-        // Deactivation is derived here and nowhere else: the two minting
-        // handlers funnel through this helper. Step-1 discovery stays
-        // mode-invariant; a prober who already knows a username can still infer
-        // anon from a refused invoice, the residual the spec accepts as
-        // inherent to user-visible deactivation.
+        // Deactivation is derived here and nowhere else; both minting
+        // handlers funnel through this helper. Discovery stays mode-invariant.
         if let Some(spark_pubkey) = public_recipient.recipient.spark_pubkey.as_deref() {
-            // Fail closed in the LNURL envelope: minting while unable to read
-            // the mode would break the promise anon makes.
+            // Fail closed: minting while unable to read the mode breaks
+            // anon's promise.
             let mode = account::stored_account_mode(&state, spark_pubkey)
                 .await
                 .map_err(|_| lnurl_error("internal server error"))?;

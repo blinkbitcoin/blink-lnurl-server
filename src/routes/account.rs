@@ -273,9 +273,8 @@ where
         }
     }
 
-    /// `POST /lnurlpay/{pubkey}/mode` — the durable region-determination record.
-    /// The pubkey signature is the sole authorization; the client-certificate
-    /// middleware in front of this route is transport hygiene, not authz.
+    /// `POST /lnurlpay/{pubkey}/mode`. The pubkey signature is the sole
+    /// authorization; the client-certificate middleware is not authz.
     pub async fn set_mode(
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
@@ -310,9 +309,8 @@ where
                 Json(Value::String("invalid timestamp".into())),
             )
         })?;
-        // The anchor stores this value verbatim, so a future-dated request must
-        // be refused outright: a clamped anchor could be replayed past a later
-        // mode switch.
+        // Refused rather than clamped: a clamped anchor could be replayed
+        // past a later mode switch.
         if client_timestamp > crate::time::now().saturating_add(MODE_MAX_FUTURE_SKEW_SECS) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -437,13 +435,9 @@ async fn resolve_country<DB>(state: &State<DB>, request_ip: Option<IpAddr>) -> O
     state.country_resolver.resolve(request_ip).await
 }
 
-/// Refresh the stored country from an accepted end-user signed request. A
-/// vendor lookup happens only when the account is already Enhanced — an anon or
-/// untyped request never determines a region at all — and only within the same
-/// per-IP budget the mode route spends, so routine register/recover traffic
-/// cannot drive the paid vendor quota. Over budget, the evidence simply keeps
-/// its previous value. Spawned fire-and-forget: the caller never observes the
-/// result, so the vendor timeout must not sit on the response path.
+/// Refresh the stored country of an already-Enhanced account, within the same
+/// per-IP budget the mode route spends. Fire-and-forget: the vendor timeout
+/// must not sit on the register/recover response path.
 fn spawn_country_evidence_refresh<DB>(
     state: &State<DB>,
     pubkey: &str,
@@ -764,7 +758,6 @@ pub(super) fn spark_transfer_error(
                 Json(Value::String("name already taken".into())),
             )
         }
-        // Same meaning on every route that can surface it.
         LnurlRepositoryError::StaleModeTimestamp => (
             StatusCode::CONFLICT,
             Json(Value::String(ERROR_MODE_REQUEST_NOT_NEWER.into())),
@@ -1508,9 +1501,8 @@ mod tests {
         .expect("the anon switch is accepted");
         let anchored = repo.spark_mode(&pubkey).expect("record exists");
 
-        // Same-signature replay of the accepted anon switch: indistinguishable
-        // from the client retrying after a dropped response, so it reads as
-        // success — and must change nothing.
+        // Replaying the accepted anon switch is indistinguishable from a
+        // retry after a dropped response: reads as success, changes nothing.
         let replayed = post_mode(&state, &pubkey, switch, HeaderMap::new())
             .await
             .expect("a replay of the accepted request is idempotent");

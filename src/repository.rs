@@ -104,9 +104,8 @@ impl WalletKind {
     }
 }
 
-/// Region-determination mode of a self-custodial account. Absent (`NULL` in the
-/// database) means untyped: the account predates the mode contract and is
-/// treated as unrestricted.
+/// Region-determination mode. `NULL`/absent means untyped: predates the mode
+/// contract, treated as unrestricted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountMode {
     Enhanced,
@@ -172,18 +171,16 @@ pub struct SparkAccountMode {
 pub struct SparkModeUpdate {
     pub pubkey: String,
     pub mode: AccountMode,
-    /// Client-supplied timestamp of this request. Accepted only when strictly
-    /// greater than the stored `mode_last_timestamp`; what gets stored is
-    /// `min(client_timestamp, server now)`, so a client clock running fast
-    /// cannot anchor the account in the future and lock out later requests.
+    /// Accepted only when strictly greater than the stored
+    /// `mode_last_timestamp`; stored verbatim (the route refuses future-dated
+    /// timestamps).
     pub client_timestamp: i64,
     /// Server-resolved country, set only for an accepted `enhanced` request.
     pub country: Option<String>,
 }
 
-/// Classify a mode write the monotonic guard refused. Re-sending the exact
-/// request that was last accepted (a retry after a dropped response) is
-/// idempotent; anything older or different is stale.
+/// Re-sending the exact last-accepted request (a retry after a dropped
+/// response) is idempotent; anything older or different is stale.
 pub fn classify_refused_mode_write(
     record: Option<&SparkAccountMode>,
     update: &SparkModeUpdate,
@@ -426,11 +423,8 @@ pub trait LnurlRepository {
     }
 
     /// Record a signed mode request, creating the account on first contact.
-    /// Rejects with `StaleModeTimestamp` when the client timestamp is not newer
-    /// than the last accepted one (an identical retry is idempotent), and
-    /// clears country evidence in the same statement on a switch to `anon`.
-    /// The check and the write must be one atomic operation: concurrent
-    /// requests may never both pass the monotonic guard.
+    /// The monotonic check and the write must be one atomic operation, and a
+    /// switch to `anon` clears country evidence in the same statement.
     async fn upsert_spark_mode(
         &self,
         _update: &SparkModeUpdate,
@@ -2649,10 +2643,8 @@ pub mod shared_tests {
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
-        // The route bounds how far ahead a timestamp may sit; the repository
-        // stores whatever was accepted, verbatim. A clamped anchor would sit
-        // below the timestamp of the request that wrote it, letting that
-        // request be replayed past a later mode switch.
+        // The repository stores what was accepted, verbatim: a clamped
+        // anchor could be replayed past a later mode switch.
         let pubkey = "spark_mode_anchor_verbatim_pubkey";
         let sent_at = crate::time::now().saturating_sub(120);
 

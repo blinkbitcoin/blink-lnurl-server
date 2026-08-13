@@ -128,9 +128,8 @@ pub struct RecoverLnurlPayRequest {
     pub timestamp: u64,
 }
 
-/// The address fields are absent for a mode-only account (a mode record can
-/// exist before, or without, any username). `mode` is always present; `null`
-/// means untyped.
+/// Address fields are absent for a mode-only account; `mode` is always
+/// present, `null` meaning untyped.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecoverLnurlPayResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
