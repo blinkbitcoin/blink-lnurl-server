@@ -1357,19 +1357,33 @@ mod tests {
         assert_eq!(body, Value::String(code.to_string()));
     }
 
-    /// A proxycheck.io stand-in that echoes a fixed isocode and counts lookups.
+    /// A proxycheck.io stand-in that echoes a fixed isocode and counts
+    /// lookups. Like the real vendor it withholds the isocode unless the
+    /// query carries `asn=1`.
     async fn start_country_mock(iso_code: &'static str) -> (String, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_route = Arc::clone(&calls);
         let app = Router::new().route(
             "/{ip}",
-            get(move |Path(ip): Path<String>| {
-                let calls = Arc::clone(&calls_for_route);
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({ "status": "ok", ip: { "isocode": iso_code, "proxy": "yes", "risk": 100 } }))
-                }
-            }),
+            get(
+                move |Path(ip): Path<String>,
+                      axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                    let calls = Arc::clone(&calls_for_route);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let has_asn_flag = query
+                            .as_deref()
+                            .unwrap_or("")
+                            .split('&')
+                            .any(|pair| pair == "asn=1");
+                        if has_asn_flag {
+                            Json(json!({ "status": "ok", ip: { "isocode": iso_code, "proxy": "yes", "risk": 100 } }))
+                        } else {
+                            Json(json!({ "status": "ok", ip: { "proxy": "yes", "risk": 100 } }))
+                        }
+                    }
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

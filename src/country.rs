@@ -55,7 +55,11 @@ impl CountryResolver {
         let base_url = self.base_url.as_deref()?;
         let ip = ip?;
 
-        let mut request = self.client.get(format!("{base_url}/{ip}"));
+        // Without asn=1 the vendor omits every geo field, isocode included.
+        let mut request = self
+            .client
+            .get(format!("{base_url}/{ip}"))
+            .query(&[("asn", "1")]);
         if let Some(api_key) = self.api_key.as_deref() {
             request = request.query(&[("key", api_key)]);
         }
@@ -164,12 +168,29 @@ mod tests {
         );
     }
 
-    /// A proxycheck.io stand-in that answers every path with `body`.
+    /// A proxycheck.io stand-in that answers every path with `body`. Like the
+    /// real vendor it withholds geo fields unless the query carries `asn=1`.
     async fn start_vendor_mock(body: serde_json::Value) -> CountryResolver {
-        let app = axum::Router::new().fallback(move || {
-            let body = body.clone();
-            async move { axum::Json(body) }
-        });
+        let app = axum::Router::new().fallback(
+            move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                let mut body = body.clone();
+                async move {
+                    let has_asn_flag = query
+                        .as_deref()
+                        .unwrap_or("")
+                        .split('&')
+                        .any(|pair| pair == "asn=1");
+                    if !has_asn_flag && let Some(entries) = body.as_object_mut() {
+                        for entry in entries.values_mut() {
+                            if let Some(entry) = entry.as_object_mut() {
+                                entry.remove("isocode");
+                            }
+                        }
+                    }
+                    axum::Json(body)
+                }
+            },
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock listener should bind");
