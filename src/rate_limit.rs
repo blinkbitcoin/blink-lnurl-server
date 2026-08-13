@@ -5,6 +5,20 @@ use std::time::{Duration, Instant};
 
 /// Fixed-window per-IP counter. In-process only: with several replicas the
 /// effective budget is per replica.
+/// Rate-limit key: IPv4 individually, IPv6 by /64. A single host commonly
+/// holds an entire /64, so per-address keying would make both budget rotation
+/// and table-filling free.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(octets.into())
+        }
+    }
+}
+
 pub struct PerIpRateLimiter {
     max_requests: u32,
     window: Duration,
@@ -41,6 +55,7 @@ impl PerIpRateLimiter {
         let Some(ip) = ip else {
             return self.allow_untrusted;
         };
+        let ip = bucket(ip);
         let now = Instant::now();
         let mut counters = match self.counters.lock() {
             Ok(counters) => counters,
@@ -106,6 +121,21 @@ mod tests {
         assert!(
             limiter.check(Some(ip(1))),
             "an expired window must grant a fresh budget"
+        );
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_budget_per_64_prefix() {
+        let limiter = PerIpRateLimiter::new(1, Duration::from_mins(1), 1_000, false);
+
+        assert!(limiter.check(Some("2001:db8:1:2:aaaa::1".parse().unwrap())));
+        assert!(
+            !limiter.check(Some("2001:db8:1:2:bbbb::2".parse().unwrap())),
+            "addresses in one /64 must share a budget"
+        );
+        assert!(
+            limiter.check(Some("2001:db8:1:3::1".parse().unwrap())),
+            "a different /64 gets its own budget"
         );
     }
 
