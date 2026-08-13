@@ -90,6 +90,43 @@ impl PerIpRateLimiter {
     }
 }
 
+/// Fixed-window cap on aggregate lookup spending, guarding the shared vendor
+/// quota against a crowd of ips that each stay under the per-ip budget.
+/// In-process, so per replica like the per-ip limiter.
+pub struct GlobalBudget {
+    max: u32,
+    window: Duration,
+    state: Mutex<Window>,
+}
+
+impl GlobalBudget {
+    pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            state: Mutex::new(Window {
+                started_at: Instant::now(),
+                count: 0,
+            }),
+        }
+    }
+
+    /// Returns `true` when a unit of budget was available and is now spent.
+    pub fn spend(&self) -> bool {
+        let now = Instant::now();
+        let mut window = match self.state.lock() {
+            Ok(window) => window,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if now.duration_since(window.started_at) >= self.window {
+            window.started_at = now;
+            window.count = 0;
+        }
+        window.count = window.count.saturating_add(1);
+        window.count <= self.max
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +157,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(
             limiter.check(Some(ip(1))),
+            "an expired window must grant a fresh budget"
+        );
+    }
+
+    #[test]
+    fn global_budget_spends_to_the_cap_then_refuses() {
+        let budget = GlobalBudget::new(2, Duration::from_mins(1));
+
+        assert!(budget.spend());
+        assert!(budget.spend());
+        assert!(!budget.spend());
+    }
+
+    #[test]
+    fn global_budget_refills_after_the_window() {
+        let budget = GlobalBudget::new(1, Duration::from_millis(20));
+
+        assert!(budget.spend());
+        assert!(!budget.spend());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            budget.spend(),
             "an expired window must grant a fresh budget"
         );
     }

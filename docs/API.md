@@ -303,6 +303,6 @@ The public LUD-21 verify endpoint always returns JSON with `status`: `OK` or `ER
 
 ## Rate Limits
 
-`POST /lnurlpay/{pubkey}/mode` is limited per client IP (`x-real-ip`) by `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE`, and the same budget also covers the paid country lookup that `POST /lnurlpay/{pubkey}` and `POST /lnurlpay/{pubkey}/recover` perform for an Enhanced account: over budget, those two routes still succeed, they just leave the stored country at its previous value.
+`POST /lnurlpay/{pubkey}/mode` is limited per client IP (`x-real-ip`) by `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE`, and the same budget also covers the paid country lookup that `POST /lnurlpay/{pubkey}` and `POST /lnurlpay/{pubkey}/recover` perform for an Enhanced account: over budget, those two routes still succeed, they just leave the stored country at its previous value. IPv6 clients are keyed by /64 prefix. Lookups are additionally capped in aggregate by `LNURL_COUNTRY_LOOKUPS_PER_DAY`; past that budget, mode requests still succeed but store no country until the daily window resets.
 
 Outside `DEPLOYMENT_ENV=local`, a request carrying no trusted `x-real-ip` has no budget at all — the mode route returns `429` and the country lookup is skipped. Deployment must therefore guarantee the edge sets that header. The counter is in-process, so the effective budget is per replica. No other route has application-level rate limiting. The Axum router enforces a maximum request body size of 1,000,000 bytes (`src/main.rs`).

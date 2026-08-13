@@ -176,6 +176,11 @@ struct Args {
     /// per minute.
     #[arg(long, default_value = "10")]
     pub mode_requests_per_ip_per_minute: u32,
+
+    /// Daily cap on country lookups across all client IPs. Over budget, mode
+    /// writes still succeed and stored evidence stops refreshing.
+    #[arg(long, default_value = "5000")]
+    pub country_lookups_per_day: u32,
 }
 
 /// Bound on the limiter's in-process key set. Per replica, and filled by every
@@ -539,6 +544,11 @@ where
         runtime_config.local_env,
     ));
 
+    let country_lookup_budget = Arc::new(rate_limit::GlobalBudget::new(
+        args.country_lookups_per_day,
+        std::time::Duration::from_hours(24),
+    ));
+
     let state = State {
         db: repository,
         spark_client,
@@ -546,6 +556,7 @@ where
         internal_auth,
         country_resolver,
         ip_rate_limiter,
+        country_lookup_budget,
         scheme: args.scheme,
         callback_domain: args.callback_domain,
         min_sendable: args.min_sendable,

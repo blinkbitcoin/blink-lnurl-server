@@ -425,6 +425,15 @@ where
 }
 
 async fn resolve_country<DB>(state: &State<DB>, request_ip: Option<IpAddr>) -> Option<String> {
+    if !state.country_resolver.is_enabled() || request_ip.is_none() {
+        return None;
+    }
+    // The per-ip budget bounds one address; this bounds the aggregate, so a
+    // crowd of in-budget ips cannot drain the shared vendor plan.
+    if !state.country_lookup_budget.spend() {
+        warn!("global country lookup budget exhausted; evidence not refreshed");
+        return None;
+    }
     state.country_resolver.resolve(request_ip).await
 }
 
@@ -1839,6 +1848,54 @@ mod tests {
             spark_mode_error(LnurlRepositoryError::StaleModeTimestamp);
         assert_eq!(mode_status, status);
         assert_eq!(mode_body, body);
+    }
+
+    #[tokio::test]
+    async fn a_spent_global_budget_stops_lookups_but_not_mode_writes() {
+        let (secret, pubkey) = mode_key(29);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let mut state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+        state.country_lookup_budget = Arc::new(crate::rate_limit::GlobalBudget::new(
+            1,
+            std::time::Duration::from_hours(24),
+        ));
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64() - 1),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        .expect("the in-budget enhanced request is accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().country.as_deref(),
+            Some("SV")
+        );
+
+        let (secret2, pubkey2) = mode_key(30);
+        let _ = post_mode(
+            &state,
+            &pubkey2,
+            mode_request(&secret2, &pubkey2, "enhanced", now_u64()),
+            headers_with_request_ip("203.0.113.8"),
+        )
+        .await
+        .expect("a spent global budget must not block the mode write");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "over the global budget, the vendor is never called"
+        );
+        let stored = repo.spark_mode(&pubkey2).unwrap();
+        assert_eq!(stored.mode, Some(AccountMode::Enhanced));
+        assert!(stored.country.is_none());
     }
 
     #[tokio::test]

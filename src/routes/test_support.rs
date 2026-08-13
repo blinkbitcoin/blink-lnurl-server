@@ -702,6 +702,10 @@ pub(super) async fn internal_route_test_state_full(
             1_000,
             true,
         )),
+        country_lookup_budget: Arc::new(crate::rate_limit::GlobalBudget::new(
+            1_000_000,
+            std::time::Duration::from_hours(24),
+        )),
         scheme: "http".to_string(),
         callback_domain: None,
         min_sendable: 1_000,
