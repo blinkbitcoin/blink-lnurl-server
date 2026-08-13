@@ -1,4 +1,4 @@
-.PHONY: audit build check-code e2e release-check reset-deps start start-deps stop-deps test-e2e test-in-ci test-integration test-rust
+.PHONY: audit build check-code e2e release-check reset-deps start start-deps stop-deps subgraph-generate subgraph-check test-e2e test-in-ci test-integration test-rust
 
 build:
 	cargo build --locked --all-targets
@@ -6,6 +6,12 @@ build:
 check-code:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
+
+subgraph-generate:
+	cargo run --locked --bin write_sdl > subgraph/schema.graphql
+
+subgraph-check:
+	@cargo run --locked --bin write_sdl | diff - subgraph/schema.graphql > /dev/null || (echo "subgraph/schema.graphql is stale; run 'make subgraph-generate'" && exit 1)
 
 audit:
 	cargo audit

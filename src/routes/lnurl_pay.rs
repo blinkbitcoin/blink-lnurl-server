@@ -109,6 +109,93 @@ fn public_recipient_wallet(public_recipient: &PublicRecipient) -> Option<WalletK
         .or(public_recipient.recipient.default_wallet)
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers for the federated GraphQL subgraph (crate::ln_address).
+// These expose the same internal behavior the public LNURL routes use, without
+// an HTTP round-trip or a second verify store.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn resolve_min_sendable_for_recipient<DB>(
+    state: &State<DB>,
+    recipient: &ResolvedRecipient,
+) -> u64
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    let wrapper = PublicRecipient {
+        recipient: recipient.clone(),
+        wallet: recipient.default_wallet,
+        callback_identifier: recipient.identifier.clone(),
+    };
+    resolve_min_sendable_msat(state, &wrapper).await
+}
+
+pub(crate) fn metadata_for_recipient(recipient: &ResolvedRecipient, identifier: &str) -> String {
+    get_metadata_for_recipient(recipient, identifier)
+}
+
+pub(crate) fn verify_url_for<DB>(state: &State<DB>, domain: &str, payment_hash: &str) -> String {
+    build_verify_url(state, domain, payment_hash)
+}
+
+/// If the invoice is a pending Blink invoice, poll Blink core and persist the
+/// preimage. Returns the preimage if settled (Some) or still pending (None).
+/// Spark invoices are never polled here — they settle via the SSP webhook and
+/// are read from the store by the caller. `Err(())` signals an internal error.
+async fn settle_pending_blink_invoice<DB>(
+    state: &State<DB>,
+    invoice: &crate::repository::Invoice,
+) -> Result<Option<String>, ()>
+where
+    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
+{
+    if invoice.preimage.is_none()
+        && invoice.expired_at.is_none()
+        && invoice.provider == Some(AccountProvider::Blink)
+    {
+        match webhook::settle_blink_invoice_by_payment_hash(state, &invoice.payment_hash, None)
+            .await
+        {
+            Ok(preimage) => return Ok(preimage),
+            Err(e) => {
+                error!(
+                    "Failed to settle Blink invoice during verify for {}: {}",
+                    invoice.payment_hash, e
+                );
+                return Err(());
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Settlement status for the GraphQL status query.
+/// Blink: settle-on-read. Spark: read-from-store (webhook-driven).
+/// Returns `Err(())` if the payment hash is unknown.
+pub(crate) async fn invoice_settlement_status<DB>(
+    state: &State<DB>,
+    payment_hash: &str,
+) -> Result<(bool, Option<String>), ()>
+where
+    DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
+{
+    let invoice = match state.db.get_invoice_by_payment_hash(payment_hash).await {
+        Ok(Some(invoice)) => invoice,
+        Ok(None) => return Err(()),
+        Err(e) => {
+            error!("Failed to get invoice by payment hash: {}", e);
+            return Err(());
+        }
+    };
+
+    let preimage = match settle_pending_blink_invoice(state, &invoice).await {
+        Ok(preimage) => preimage.or(invoice.preimage),
+        Err(()) => invoice.preimage,
+    };
+
+    Ok((preimage.is_some(), preimage))
+}
+
 fn is_blink_usd_recipient(public_recipient: &PublicRecipient) -> bool {
     public_recipient.recipient.provider == AccountProvider::Blink
         && public_recipient_wallet(public_recipient) == Some(WalletKind::Usd)
@@ -525,7 +612,7 @@ where
         Path(payment_hash): Path<String>,
         Extension(state): Extension<State<DB>>,
     ) -> impl IntoResponse {
-        let mut invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
+        let invoice = match state.db.get_invoice_by_payment_hash(&payment_hash).await {
             Ok(Some(invoice)) => invoice,
             Ok(None) => {
                 return Json(json!({
@@ -542,33 +629,21 @@ where
             }
         };
 
-        if invoice.preimage.is_none()
-            && invoice.expired_at.is_none()
-            && invoice.provider == Some(AccountProvider::Blink)
-        {
-            match webhook::settle_blink_invoice_by_payment_hash(&state, &payment_hash, None).await {
-                Ok(Some(preimage)) => {
-                    invoice.preimage = Some(preimage);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    error!(
-                        "Failed to settle Blink invoice during public verify for {}: {}",
-                        payment_hash, e
-                    );
-                    return Json(json!({
-                        "status": "ERROR",
-                        "reason": "Internal server error"
-                    }));
-                }
+        let settled_preimage = match settle_pending_blink_invoice(&state, &invoice).await {
+            Ok(preimage) => preimage.or(invoice.preimage.clone()),
+            Err(()) => {
+                return Json(json!({
+                    "status": "ERROR",
+                    "reason": "Internal server error"
+                }));
             }
-        }
+        };
 
-        let settled = invoice.preimage.is_some();
+        let settled = settled_preimage.is_some();
         Json(json!({
             "status": "OK",
             "settled": settled,
-            "preimage": invoice.preimage,
+            "preimage": settled_preimage,
             "pr": invoice.invoice
         }))
     }

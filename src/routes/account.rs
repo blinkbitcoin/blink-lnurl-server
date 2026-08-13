@@ -218,10 +218,10 @@ where
 
         match user {
             Some(user) => {
-                let lnurl = format!("lnurlp://{}/lnurlp/{}", &user.domain, user.username);
+                let lnurl = format!("lnurlp://{}/lnurlp/{}", user.domain, user.username);
                 Ok(Json(RecoverLnurlPayResponse {
                     lnurl,
-                    lightning_address: format!("{}@{}", user.username, &user.domain),
+                    lightning_address: format!("{}@{}", user.username, user.domain),
                     username: user.username,
                     description: user.description,
                 }))
