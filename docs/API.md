@@ -158,7 +158,7 @@ Mode response:
 }
 ```
 
-Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a transfer are both refused while the stored mode is `anon`. Only the client timestamp of an accepted request is stored, clamped to server time, so a client clock running fast cannot lock the account out of later requests.
+Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a user-initiated transfer are both refused while the stored mode is `anon`. The server-initiated migration transfer is the deliberate exception: it completes even for an `anon` destination, and the address stays dormant (no invoices are minted) until the account switches to `enhanced` — failing the migration would be the harsher outcome for a state only the account holder can create. Only the client timestamp of an accepted request is stored, clamped to server time, so a client clock running fast cannot lock the account out of later requests.
 
 Successful `DELETE`, `/invoice-paid`, and `/invoices-paid` responses have an empty body.
 

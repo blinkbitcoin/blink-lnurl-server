@@ -102,7 +102,9 @@ where
             .map_err(|e| internal_transfer_to_spark_error(e, &domain, &identifier))?;
 
         // Server-initiated: fills an unset mode only. The caller's IP is
-        // blink-core's, so no country is ever resolved here.
+        // blink-core's, so no country is ever resolved here. An anon
+        // destination is accepted deliberately - the address parks dormant
+        // rather than failing the user's migration.
         if let Err(e) = state
             .db
             .set_spark_mode_enhanced_if_unset(&destination_spark_pubkey)
