@@ -21,10 +21,14 @@ use crate::{
         HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
         handle_invoices_paid,
     },
-    models::{CheckUsernameAvailableResponse, InvoicePaidRequest, InvoicesPaidRequest},
+    models::{
+        CheckUsernameAvailableResponse, ERROR_RECIPIENT_NOT_RECEIVING, InvoicePaidRequest,
+        InvoicesPaidRequest,
+    },
     providers::{CreateInvoiceRequest, ProviderError},
     repository::{
-        AccountProvider, LnurlRepository, LnurlSenderComment, ResolvedRecipient, WalletKind,
+        AccountMode, AccountProvider, LnurlRepository, LnurlSenderComment, ResolvedRecipient,
+        WalletKind,
     },
     state::State,
     time::now_millis,
@@ -309,6 +313,21 @@ where
         let Some(public_recipient) = public_recipient else {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         };
+
+        // Deactivation is derived here and nowhere else; both minting
+        // handlers funnel through this helper. Discovery stays mode-invariant.
+        if let Some(spark_pubkey) = public_recipient.recipient.spark_pubkey.as_deref() {
+            // Fail closed: minting while unable to read the mode breaks
+            // anon's promise.
+            let mode = account::stored_account_mode(&state, spark_pubkey)
+                .await
+                .map_err(|_| lnurl_error("internal server error"))?;
+            if mode == Some(AccountMode::Anon) {
+                trace!("invoice refused for anon-mode recipient");
+                return Err(lnurl_error(ERROR_RECIPIENT_NOT_RECEIVING));
+            }
+        }
+
         let account_id = public_recipient.recipient.account_id.clone();
         let legacy_user_pubkey = public_recipient
             .recipient
@@ -1903,5 +1922,118 @@ mod tests {
             assert!(body.get("provider").is_none());
             assert!(body.get("account_id").is_none());
         }
+    }
+
+    // -- Region-determination mode gate ----------------------------------------
+
+    async fn mode_gate_state(mode: Option<AccountMode>) -> (MockRepository, State<MockRepository>) {
+        let recipient = spark_resolved_recipient();
+        let pubkey = recipient
+            .spark_pubkey
+            .clone()
+            .expect("spark recipient has a pubkey");
+        let repo = MockRepository::default()
+            .with_resolved_recipient(recipient)
+            .with_spark_mode(&pubkey, mode);
+        let state = internal_route_test_state(repo.clone(), None).await;
+        (repo, state)
+    }
+
+    #[tokio::test]
+    async fn invoice_minting_is_refused_for_an_anon_owner_on_both_routes() {
+        let (_repo, state) = mode_gate_state(Some(AccountMode::Anon)).await;
+
+        assert_lnurl_error(
+            get_public_invoice(
+                state.clone(),
+                "bob",
+                LnurlPayCallbackParams {
+                    amount: Some(2_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            ERROR_RECIPIENT_NOT_RECEIVING,
+        );
+
+        let mut callback_state = state;
+        callback_state.callback_domain = Some("callback.example.com".to_string());
+        assert_lnurl_error(
+            get_public_invoice_for_domain(
+                callback_state,
+                "example.com",
+                "bob",
+                LnurlPayCallbackParams {
+                    amount: Some(2_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+            )
+            .await,
+            ERROR_RECIPIENT_NOT_RECEIVING,
+        );
+    }
+
+    #[tokio::test]
+    async fn invoice_minting_proceeds_past_the_gate_for_enhanced_and_untyped_owners() {
+        // A missing amount is the next check after the gate: seeing it proves the
+        // gate let the request through without minting anything.
+        for mode in [Some(AccountMode::Enhanced), None] {
+            let (_repo, state) = mode_gate_state(mode).await;
+
+            assert_lnurl_error(
+                get_public_invoice(state, "bob", LnurlPayCallbackParams::default()).await,
+                "missing amount",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_and_availability_are_mode_invariant() {
+        let mut discovery = Vec::new();
+        let mut availability = Vec::new();
+
+        for mode in [Some(AccountMode::Anon), Some(AccountMode::Enhanced), None] {
+            let (_repo, state) = mode_gate_state(mode).await;
+
+            let Json(pay_response) = LnurlServer::handle_lnurl_pay(
+                Host("example.com".to_string()),
+                Path("bob".to_string()),
+                Extension(state.clone()),
+            )
+            .await
+            .expect("step-1 discovery must resolve regardless of mode");
+            discovery.push(serde_json::to_value(&pay_response).expect("discovery serializes"));
+
+            let Json(available) = LnurlServer::available(
+                Host("example.com".to_string()),
+                Path("bob".to_string()),
+                Extension(state),
+            )
+            .await
+            .expect("availability must answer regardless of mode");
+            availability.push(available.available);
+        }
+
+        assert_eq!(
+            discovery[0], discovery[1],
+            "anon and enhanced owners must produce byte-identical metadata"
+        );
+        assert_eq!(discovery[1], discovery[2]);
+        assert_eq!(
+            availability,
+            vec![false, false, false],
+            "a claimed username reads as taken in every mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn custodial_recipients_are_never_mode_gated() {
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state(repo, None).await;
+
+        assert_lnurl_error(
+            get_public_invoice(state, "alice", LnurlPayCallbackParams::default()).await,
+            "missing amount",
+        );
     }
 }

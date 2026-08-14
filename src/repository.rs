@@ -27,6 +27,10 @@ pub enum LnurlRepositoryError {
     NameTaken,
     #[error("source user does not own this username")]
     SourceNotOwner,
+    #[error("invalid account mode")]
+    InvalidAccountMode,
+    #[error("mode request is not newer than the last accepted one")]
+    StaleModeTimestamp,
     #[error("database error: {0}")]
     General(anyhow::Error),
 }
@@ -97,6 +101,99 @@ impl WalletKind {
             "usd" => Ok(Self::Usd),
             _ => Err(LnurlRepositoryError::InvalidOwnership),
         }
+    }
+}
+
+/// Region-determination mode. `NULL`/absent means untyped: predates the mode
+/// contract, treated as unrestricted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountMode {
+    Enhanced,
+    Anon,
+}
+
+impl AccountMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enhanced => "enhanced",
+            Self::Anon => "anon",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
+        match value {
+            "enhanced" => Ok(Self::Enhanced),
+            "anon" => Ok(Self::Anon),
+            _ => Err(LnurlRepositoryError::InvalidAccountMode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeSource {
+    Signup,
+    Switch,
+    Migration,
+}
+
+impl ModeSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Signup => "signup",
+            Self::Switch => "switch",
+            Self::Migration => "migration",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Result<Self, LnurlRepositoryError> {
+        match value {
+            "signup" => Ok(Self::Signup),
+            "switch" => Ok(Self::Switch),
+            "migration" => Ok(Self::Migration),
+            _ => Err(LnurlRepositoryError::InvalidAccountMode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkAccountMode {
+    pub account_id: String,
+    pub pubkey: String,
+    pub mode: Option<AccountMode>,
+    pub mode_source: Option<ModeSource>,
+    pub mode_updated_at: Option<i64>,
+    pub mode_last_timestamp: Option<i64>,
+    pub country: Option<String>,
+    pub country_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkModeUpdate {
+    pub pubkey: String,
+    pub mode: AccountMode,
+    /// Accepted only when strictly greater than the stored
+    /// `mode_last_timestamp`; stored verbatim (the route refuses future-dated
+    /// timestamps).
+    pub client_timestamp: i64,
+    /// Server-resolved country, set only for an accepted `enhanced` request.
+    pub country: Option<String>,
+}
+
+/// Re-sending the exact last-accepted request (a retry after a dropped
+/// response) is idempotent; anything older or different is stale.
+pub fn classify_refused_mode_write(
+    record: Option<&SparkAccountMode>,
+    update: &SparkModeUpdate,
+) -> Result<(), LnurlRepositoryError> {
+    match record {
+        Some(record)
+            if record.mode == Some(update.mode)
+                && record.mode_last_timestamp == Some(update.client_timestamp) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(LnurlRepositoryError::StaleModeTimestamp),
+        None => Err(LnurlRepositoryError::AccountNotFound),
     }
 }
 
@@ -318,6 +415,42 @@ pub trait LnurlRepository {
         Err(provider_neutral_not_implemented())
     }
 
+    async fn get_spark_account_mode(
+        &self,
+        _pubkey: &str,
+    ) -> Result<Option<SparkAccountMode>, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// Record a signed mode request, creating the account on first contact.
+    /// The monotonic check and the write must be one atomic operation, and a
+    /// switch to `anon` clears country evidence in the same statement.
+    async fn upsert_spark_mode(
+        &self,
+        _update: &SparkModeUpdate,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// Refresh the stored country of an already-`enhanced` account. A no-op for
+    /// any other mode.
+    async fn refresh_spark_country_evidence(
+        &self,
+        _pubkey: &str,
+        _country: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// Server-initiated transfer paths only: fill `enhanced` into an unset mode
+    /// without ever overwriting a user-set one, and without storing a country.
+    async fn set_spark_mode_enhanced_if_unset(
+        &self,
+        _pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
     async fn create_blink_account(
         &self,
         _account: &NewBlinkAccount,
@@ -484,9 +617,10 @@ pub struct WebhookPayloadData {
 #[cfg(test)]
 pub mod shared_tests {
     use super::{
-        AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer, IdentifierTransfer,
-        Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment, NewAccountIdentifier,
-        NewBlinkAccount, NewSparkRegistration, WalletKind, generate_account_id,
+        AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
+        IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment,
+        ModeSource, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration, SparkModeUpdate,
+        WalletKind, generate_account_id,
     };
     use crate::zap::Zap;
 
@@ -2410,6 +2544,384 @@ pub mod shared_tests {
             Err(LnurlRepositoryError::InvalidOwnership)
         ));
     }
+
+    // -- Region-determination mode -------------------------------------------
+
+    fn mode_update(pubkey: &str, mode: AccountMode, timestamp: i64) -> SparkModeUpdate {
+        SparkModeUpdate {
+            pubkey: pubkey.to_string(),
+            mode,
+            client_timestamp: timestamp,
+            country: None,
+        }
+    }
+
+    pub async fn mode_upsert_creates_address_less_account<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // A pubkey that never registered an address still gets a durable mode
+        // record, created on first contact with mode_source 'signup'.
+        let pubkey = "spark_mode_first_contact_pubkey";
+        assert!(db.get_spark_account_mode(pubkey).await.unwrap().is_none());
+
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, 1_700_000_000))
+            .await
+            .unwrap();
+
+        let record = db
+            .get_spark_account_mode(pubkey)
+            .await
+            .unwrap()
+            .expect("first contact must create the mode record");
+        assert_eq!(record.mode, Some(AccountMode::Anon));
+        assert_eq!(record.mode_source, Some(ModeSource::Signup));
+        assert_eq!(record.mode_last_timestamp, Some(1_700_000_000));
+        assert!(record.mode_updated_at.is_some());
+        assert!(record.country.is_none());
+        assert!(
+            db.get_account_by_spark_pubkey(pubkey)
+                .await
+                .unwrap()
+                .is_some(),
+            "the provider-neutral account row must exist for recover"
+        );
+        assert!(
+            db.get_spark_username_by_pubkey("mode.example.com", pubkey)
+                .await
+                .unwrap()
+                .is_none(),
+            "the mode record must be address-independent"
+        );
+    }
+
+    pub async fn mode_rejects_replay_and_rollback<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // The monotonic anchor rejects an identical replay AND any captured
+        // older-but-still-fresh request, so a mode can never be rolled back.
+        let pubkey = "spark_mode_replay_pubkey";
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Enhanced, 1_700_000_000))
+            .await
+            .unwrap();
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, 1_700_000_100))
+            .await
+            .unwrap();
+
+        let anchored = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+
+        for (label, replayed) in [
+            ("same-signature replay", 1_700_000_100),
+            ("captured older request", 1_700_000_050),
+            ("the very first request", 1_700_000_000),
+        ] {
+            let result = db
+                .upsert_spark_mode(&mode_update(pubkey, AccountMode::Enhanced, replayed))
+                .await;
+            assert!(
+                matches!(result, Err(LnurlRepositoryError::StaleModeTimestamp)),
+                "{label} must be rejected"
+            );
+            assert_eq!(
+                db.get_spark_account_mode(pubkey).await.unwrap().unwrap(),
+                anchored,
+                "{label} must leave mode and both timestamps untouched"
+            );
+        }
+
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Enhanced, 1_700_000_101))
+            .await
+            .expect("a strictly newer request is accepted");
+        let switched = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+        assert_eq!(switched.mode, Some(AccountMode::Enhanced));
+        assert_eq!(switched.mode_source, Some(ModeSource::Switch));
+        assert_eq!(switched.mode_last_timestamp, Some(1_700_000_101));
+    }
+
+    pub async fn mode_anchor_stores_the_client_timestamp_verbatim<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // The repository stores what was accepted, verbatim: a clamped
+        // anchor could be replayed past a later mode switch.
+        let pubkey = "spark_mode_anchor_verbatim_pubkey";
+        let sent_at = crate::time::now().saturating_sub(120);
+
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, sent_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_spark_account_mode(pubkey)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode_last_timestamp,
+            Some(sent_at),
+            "the anchor must equal the accepted timestamp exactly"
+        );
+
+        // The guard holds exactly at the anchor: the same timestamp with a
+        // different mode is refused, one second later passes.
+        assert!(matches!(
+            db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Enhanced, sent_at))
+                .await,
+            Err(LnurlRepositoryError::StaleModeTimestamp)
+        ));
+        db.upsert_spark_mode(&mode_update(
+            pubkey,
+            AccountMode::Enhanced,
+            sent_at.saturating_add(1),
+        ))
+        .await
+        .expect("a strictly newer request must pass");
+    }
+
+    pub async fn mode_retry_of_the_same_request_is_idempotent<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // A client that retries after a dropped response sends the identical
+        // request; that must read as success, not as a replay.
+        let pubkey = "spark_mode_retry_pubkey";
+        let request = SparkModeUpdate {
+            country: Some("SV".to_string()),
+            ..mode_update(pubkey, AccountMode::Enhanced, 1_700_000_000)
+        };
+        db.upsert_spark_mode(&request).await.unwrap();
+        let accepted = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+
+        db.upsert_spark_mode(&request)
+            .await
+            .expect("an identical retry is idempotent");
+        assert_eq!(
+            db.get_spark_account_mode(pubkey).await.unwrap().unwrap(),
+            accepted,
+            "the retry must not rewrite anything"
+        );
+
+        // Same timestamp, different mode: a captured request, not a retry.
+        assert!(matches!(
+            db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, 1_700_000_000))
+                .await,
+            Err(LnurlRepositoryError::StaleModeTimestamp)
+        ));
+    }
+
+    pub async fn mode_concurrent_requests_cannot_roll_back<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // Two simultaneous first-contact requests for one pubkey: neither may
+        // fail on the unique pubkey, and the older may never end up stored.
+        for round in 0..8 {
+            let pubkey = format!("spark_mode_race_pubkey_{round}");
+            let newer = db.clone();
+            let older = db.clone();
+            let newer_pubkey = pubkey.clone();
+            let older_pubkey = pubkey.clone();
+
+            let (newer_result, older_result) = tokio::join!(
+                tokio::spawn(async move {
+                    newer
+                        .upsert_spark_mode(&mode_update(
+                            &newer_pubkey,
+                            AccountMode::Anon,
+                            1_700_000_100,
+                        ))
+                        .await
+                }),
+                tokio::spawn(async move {
+                    older
+                        .upsert_spark_mode(&mode_update(
+                            &older_pubkey,
+                            AccountMode::Enhanced,
+                            1_700_000_000,
+                        ))
+                        .await
+                }),
+            );
+
+            newer_result
+                .expect("task should not panic")
+                .expect("the newer request is always accepted");
+            match older_result.expect("task should not panic") {
+                Ok(()) | Err(LnurlRepositoryError::StaleModeTimestamp) => {}
+                Err(e) => panic!("a concurrent first contact must not error: {e}"),
+            }
+
+            let record = db.get_spark_account_mode(&pubkey).await.unwrap().unwrap();
+            assert_eq!(
+                record.mode,
+                Some(AccountMode::Anon),
+                "the older request must never be the one that survives"
+            );
+            assert_eq!(record.mode_last_timestamp, Some(1_700_000_100));
+        }
+    }
+
+    pub async fn mode_stores_country_on_enhanced_and_clears_it_on_anon<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let pubkey = "spark_mode_country_pubkey";
+        db.upsert_spark_mode(&SparkModeUpdate {
+            country: Some("SV".to_string()),
+            ..mode_update(pubkey, AccountMode::Enhanced, 1_700_000_000)
+        })
+        .await
+        .unwrap();
+
+        let stored = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+        assert_eq!(stored.country.as_deref(), Some("SV"));
+        assert!(stored.country_updated_at.is_some());
+
+        db.refresh_spark_country_evidence(pubkey, "CO")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_spark_account_mode(pubkey)
+                .await
+                .unwrap()
+                .unwrap()
+                .country
+                .as_deref(),
+            Some("CO"),
+            "a later signed request refreshes to the most recent country"
+        );
+
+        db.upsert_spark_mode(&mode_update(pubkey, AccountMode::Anon, 1_700_000_001))
+            .await
+            .unwrap();
+
+        let cleared = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+        assert_eq!(cleared.mode, Some(AccountMode::Anon));
+        assert!(cleared.country.is_none());
+        assert!(cleared.country_updated_at.is_none());
+
+        db.refresh_spark_country_evidence(pubkey, "US")
+            .await
+            .unwrap();
+        assert!(
+            db.get_spark_account_mode(pubkey)
+                .await
+                .unwrap()
+                .unwrap()
+                .country
+                .is_none(),
+            "country must never be stored for an anon account"
+        );
+    }
+
+    pub async fn internal_transfer_fills_only_an_unset_mode<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // A server-initiated call fills NULL with enhanced but never overwrites
+        // a user-set mode, and never resolves a country.
+        let untyped = "spark_mode_migration_untyped_pubkey";
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
+            pubkey: untyped.to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "migration.example.com".to_string(),
+                identifier: "untyped".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "untyped".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        db.set_spark_mode_enhanced_if_unset(untyped).await.unwrap();
+
+        let filled = db.get_spark_account_mode(untyped).await.unwrap().unwrap();
+        assert_eq!(filled.mode, Some(AccountMode::Enhanced));
+        assert_eq!(filled.mode_source, Some(ModeSource::Migration));
+        assert!(filled.mode_last_timestamp.is_none());
+        assert!(
+            filled.country.is_none(),
+            "internal callers' IPs are never resolved"
+        );
+
+        let anon = "spark_mode_migration_anon_pubkey";
+        db.upsert_spark_mode(&mode_update(anon, AccountMode::Anon, 1_700_000_000))
+            .await
+            .unwrap();
+        db.set_spark_mode_enhanced_if_unset(anon).await.unwrap();
+        assert_eq!(
+            db.get_spark_account_mode(anon).await.unwrap().unwrap().mode,
+            Some(AccountMode::Anon),
+            "a server-initiated call must never overwrite a user-set mode"
+        );
+    }
+
+    pub async fn register_after_mode_attaches_to_the_same_account<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // Mode-first: the username must attach to the row the mode upsert
+        // created, never fork a second account for the same pubkey.
+        let pubkey = "spark_mode_then_register_pubkey";
+        db.upsert_spark_mode(&SparkModeUpdate {
+            country: Some("SV".to_string()),
+            ..mode_update(pubkey, AccountMode::Enhanced, 1_700_000_000)
+        })
+        .await
+        .unwrap();
+        let created = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
+            pubkey: pubkey.to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "mode-first.example.com".to_string(),
+                identifier: "modefirst".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "mode first".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let recipient = db
+            .resolve_recipient_by_identifier("mode-first.example.com", "modefirst")
+            .await
+            .unwrap()
+            .expect("the claimed username resolves");
+        assert_eq!(recipient.account_id, created.account_id);
+        assert_eq!(recipient.spark_pubkey.as_deref(), Some(pubkey));
+
+        let after = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+        assert_eq!(after.mode, created.mode, "register carries no mode field");
+        assert_eq!(after.mode_last_timestamp, created.mode_last_timestamp);
+        assert_eq!(after.country, created.country);
+    }
+
+    pub async fn registration_leaves_mode_untyped<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        // Register carries no mode field: claiming a username must not type an
+        // account, so the fail-open rollout stays intact.
+        let pubkey = "spark_mode_registration_pubkey";
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
+            pubkey: pubkey.to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "register-mode.example.com".to_string(),
+                identifier: "grandfathered".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "grandfathered".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let record = db.get_spark_account_mode(pubkey).await.unwrap().unwrap();
+        assert!(record.mode.is_none());
+        assert!(record.country.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2452,8 +2964,24 @@ pub mod provider_neutral_schema_tests {
         },
         TableExpectation {
             name: "spark_accounts",
-            required_columns: &["account_id", "pubkey", "created_at", "updated_at"],
-            forbidden_columns: &["deleted_at"],
+            required_columns: &[
+                "account_id",
+                "pubkey",
+                "created_at",
+                "updated_at",
+                "mode",
+                "mode_source",
+                "mode_updated_at",
+                "mode_last_timestamp",
+                "country",
+                "country_updated_at",
+            ],
+            forbidden_columns: &[
+                "deleted_at",
+                "mode_last_signature",
+                "deactivated",
+                "country_source",
+            ],
         },
         TableExpectation {
             name: "blink_accounts",
@@ -2528,6 +3056,22 @@ pub mod provider_neutral_schema_tests {
         assert_sqlite_check_contains(pool, "account_identifiers", "'phone'").await;
         assert_sqlite_check_contains(pool, "blink_accounts", "'btc'").await;
         assert_sqlite_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_sqlite_check_contains(pool, "spark_accounts", "'enhanced'").await;
+        assert_sqlite_check_contains(pool, "spark_accounts", "'anon'").await;
+        for column in [
+            "mode",
+            "mode_source",
+            "mode_updated_at",
+            "mode_last_timestamp",
+            "country",
+            "country_updated_at",
+        ] {
+            assert_eq!(
+                sqlite_column(pool, "spark_accounts", column).await.notnull,
+                0,
+                "spark_accounts.{column} must be nullable so NULL means untyped"
+            );
+        }
         assert_sqlite_check_contains(pool, "invoices", "'spark'").await;
         assert_sqlite_check_contains(pool, "invoices", "'blink'").await;
         assert_sqlite_check_contains(pool, "invoices", "'btc'").await;
@@ -2570,6 +3114,21 @@ pub mod provider_neutral_schema_tests {
         assert_postgres_check_contains(pool, "account_identifiers", "'phone'").await;
         assert_postgres_check_contains(pool, "blink_accounts", "'btc'").await;
         assert_postgres_check_contains(pool, "blink_accounts", "'usd'").await;
+        assert_postgres_check_contains(pool, "spark_accounts", "'enhanced'").await;
+        assert_postgres_check_contains(pool, "spark_accounts", "'anon'").await;
+        for column in [
+            "mode",
+            "mode_source",
+            "mode_updated_at",
+            "mode_last_timestamp",
+            "country",
+            "country_updated_at",
+        ] {
+            assert!(
+                postgres_column_is_nullable(pool, "spark_accounts", column).await,
+                "spark_accounts.{column} must be nullable so NULL means untyped"
+            );
+        }
         assert_postgres_check_contains(pool, "invoices", "'spark'").await;
         assert_postgres_check_contains(pool, "invoices", "'blink'").await;
         assert_postgres_check_contains(pool, "invoices", "'btc'").await;

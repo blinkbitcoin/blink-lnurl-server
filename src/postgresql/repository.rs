@@ -2,9 +2,10 @@ use crate::models::ListMetadataMetadata;
 use sqlx::{PgPool, Row};
 
 use crate::repository::{
-    Account, AccountIdentifierKind, AccountProvider, BlinkToSparkIdentifierTransfer,
-    IdentifierTransfer, Invoice, LnurlSenderComment, NewBlinkAccount, NewSparkRegistration,
-    PendingZapReceipt, ResolvedRecipient, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
+    IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
+    NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
+    UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
     generate_account_id,
 };
 use crate::webhooks::repository::{
@@ -87,6 +88,81 @@ fn map_account(row: &sqlx::postgres::PgRow) -> Result<Account, LnurlRepositoryEr
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+fn map_spark_account_mode(
+    row: &sqlx::postgres::PgRow,
+) -> Result<SparkAccountMode, LnurlRepositoryError> {
+    Ok(SparkAccountMode {
+        account_id: row.try_get("account_id")?,
+        pubkey: row.try_get("pubkey")?,
+        mode: row
+            .try_get::<Option<String>, _>("mode")?
+            .map(|mode| AccountMode::from_database_value(&mode))
+            .transpose()?,
+        mode_source: row
+            .try_get::<Option<String>, _>("mode_source")?
+            .map(|source| ModeSource::from_database_value(&source))
+            .transpose()?,
+        mode_updated_at: row.try_get("mode_updated_at")?,
+        mode_last_timestamp: row.try_get("mode_last_timestamp")?,
+        country: row.try_get("country")?,
+        country_updated_at: row.try_get("country_updated_at")?,
+    })
+}
+
+/// Create the account rows for a pubkey on first contact; `ON CONFLICT DO
+/// NOTHING` keeps two simultaneous first requests safe.
+async fn ensure_spark_account(pool: &PgPool, pubkey: &str) -> Result<(), LnurlRepositoryError> {
+    if sqlx::query_scalar::<_, String>("SELECT account_id FROM spark_accounts WHERE pubkey = $1")
+        .bind(pubkey)
+        .fetch_optional(pool)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let now = now();
+    let account_id = generate_account_id(AccountProvider::Spark);
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+    sqlx::query(
+        "INSERT INTO accounts (account_id, provider, created_at, updated_at)
+         VALUES ($1, $2, $3, $3)",
+    )
+    .bind(&account_id)
+    .bind(AccountProvider::Spark.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO spark_accounts (account_id, pubkey, created_at, updated_at)
+         VALUES ($1, $2, $3, $3)
+         ON CONFLICT (pubkey) DO NOTHING",
+    )
+    .bind(&account_id)
+    .bind(pubkey)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    if inserted.rows_affected() == 0 {
+        // A concurrent first contact won: drop this transaction's unused
+        // account row rather than orphan it.
+        tx.rollback()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        return Ok(());
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -338,6 +414,115 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         tx.commit()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn get_spark_account_mode(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<SparkAccountMode>, LnurlRepositoryError> {
+        sqlx::query(
+            "SELECT account_id, pubkey, mode, mode_source, mode_updated_at, mode_last_timestamp
+             ,      country, country_updated_at
+             FROM spark_accounts
+             WHERE pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| map_spark_account_mode(&row))
+        .transpose()
+    }
+
+    async fn upsert_spark_mode(
+        &self,
+        update: &SparkModeUpdate,
+    ) -> Result<(), LnurlRepositoryError> {
+        ensure_spark_account(&self.pool, &update.pubkey).await?;
+
+        let now = now();
+        // Anon clears country evidence in the same atomic statement.
+        let country = match update.mode {
+            AccountMode::Anon => None,
+            AccountMode::Enhanced => update.country.clone(),
+        };
+        let write_country = update.mode == AccountMode::Anon || country.is_some();
+        let country_updated_at = country.as_ref().map(|_| now);
+
+        // The monotonic check and the write are one atomic statement; the
+        // anchor stores the client timestamp verbatim.
+        let updated = sqlx::query(
+            "UPDATE spark_accounts
+             SET mode = $2
+             ,   mode_source = CASE WHEN mode IS NULL THEN $3::text ELSE $4::text END
+             ,   mode_updated_at = $5
+             ,   mode_last_timestamp = $6
+             ,   country = CASE WHEN $7::boolean THEN $8::text ELSE country END
+             ,   country_updated_at = CASE WHEN $7::boolean THEN $9::bigint ELSE country_updated_at END
+             ,   updated_at = $5
+             WHERE pubkey = $1
+             AND (mode_last_timestamp IS NULL OR mode_last_timestamp < $10)",
+        )
+        .bind(&update.pubkey)
+        .bind(update.mode.as_str())
+        .bind(ModeSource::Signup.as_str())
+        .bind(ModeSource::Switch.as_str())
+        .bind(now)
+        .bind(update.client_timestamp)
+        .bind(write_country)
+        .bind(country.as_deref())
+        .bind(country_updated_at)
+        .bind(update.client_timestamp)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            let record = self.get_spark_account_mode(&update.pubkey).await?;
+            return classify_refused_mode_write(record.as_ref(), update);
+        }
+        Ok(())
+    }
+
+    async fn refresh_spark_country_evidence(
+        &self,
+        pubkey: &str,
+        country: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now();
+        sqlx::query(
+            "UPDATE spark_accounts
+             SET country = $2
+             ,   country_updated_at = $3
+             ,   updated_at = $3
+             WHERE pubkey = $1 AND mode = 'enhanced'",
+        )
+        .bind(pubkey)
+        .bind(country)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_spark_mode_enhanced_if_unset(
+        &self,
+        pubkey: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now();
+        sqlx::query(
+            "UPDATE spark_accounts
+             SET mode = $2
+             ,   mode_source = $3
+             ,   mode_updated_at = $4
+             ,   updated_at = $4
+             WHERE pubkey = $1 AND mode IS NULL",
+        )
+        .bind(pubkey)
+        .bind(AccountMode::Enhanced.as_str())
+        .bind(ModeSource::Migration.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2173,5 +2358,77 @@ mod provider_neutral_tests {
             .username,
             "primary"
         );
+    }
+
+    #[tokio::test]
+    async fn mode_upsert_creates_address_less_account() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_upsert_creates_address_less_account(&db).await;
+    }
+
+    #[tokio::test]
+    async fn mode_rejects_replay_and_rollback() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_rejects_replay_and_rollback(&db).await;
+    }
+
+    #[tokio::test]
+    async fn mode_anchor_stores_the_client_timestamp_verbatim() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_anchor_stores_the_client_timestamp_verbatim(&db).await;
+    }
+
+    #[tokio::test]
+    async fn mode_retry_of_the_same_request_is_idempotent() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_retry_of_the_same_request_is_idempotent(&db).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mode_concurrent_requests_cannot_roll_back() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_concurrent_requests_cannot_roll_back(&db).await;
+    }
+
+    #[tokio::test]
+    async fn mode_stores_country_on_enhanced_and_clears_it_on_anon() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::mode_stores_country_on_enhanced_and_clears_it_on_anon(&db).await;
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_fills_only_an_unset_mode() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::internal_transfer_fills_only_an_unset_mode(&db).await;
+    }
+
+    #[tokio::test]
+    async fn registration_leaves_mode_untyped() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::registration_leaves_mode_untyped(&db).await;
+    }
+
+    #[tokio::test]
+    async fn register_after_mode_attaches_to_the_same_account() {
+        let Some((_pool, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::register_after_mode_attaches_to_the_same_account(&db).await;
     }
 }

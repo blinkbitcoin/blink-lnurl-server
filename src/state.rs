@@ -1,13 +1,21 @@
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{RwLock, watch};
 
+use crate::country::CountryResolver;
 use crate::providers::ProviderRegistry;
+use crate::rate_limit::{GlobalBudget, PerIpRateLimiter};
 
 pub struct State<DB> {
     pub db: DB,
     pub spark_client: spark_client::Client,
     pub providers: Arc<ProviderRegistry>,
     pub internal_auth: Option<Arc<crate::internal_auth::InternalAuthState>>,
+    pub country_resolver: Arc<CountryResolver>,
+    /// Shared per-IP budget for the mode route and for the paid country
+    /// lookups the signed-request handlers make.
+    pub ip_rate_limiter: Arc<PerIpRateLimiter>,
+    /// Aggregate daily cap on vendor lookups, shared by every route.
+    pub country_lookup_budget: Arc<GlobalBudget>,
     pub scheme: String,
     pub callback_domain: Option<String>,
     pub min_sendable: u64,
@@ -32,6 +40,9 @@ where
             spark_client: self.spark_client.clone(),
             providers: Arc::clone(&self.providers),
             internal_auth: self.internal_auth.as_ref().map(Arc::clone),
+            country_resolver: Arc::clone(&self.country_resolver),
+            ip_rate_limiter: Arc::clone(&self.ip_rate_limiter),
+            country_lookup_budget: Arc::clone(&self.country_lookup_budget),
             scheme: self.scheme.clone(),
             callback_domain: self.callback_domain.clone(),
             min_sendable: self.min_sendable,

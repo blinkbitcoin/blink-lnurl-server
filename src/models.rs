@@ -10,6 +10,13 @@ pub const INTERNAL_ERROR_INVALID_DOMAIN: &str = "invalid_domain";
 pub const INTERNAL_ERROR_NOT_FOUND: &str = "not_found";
 pub const INTERNAL_ERROR_PROVIDER_DISABLED: &str = "provider_disabled";
 
+pub const ERROR_INVALID_MODE: &str = "invalid_mode";
+pub const ERROR_ENHANCED_MODE_REQUIRED: &str = "enhanced_mode_required";
+pub const ERROR_MODE_REQUEST_NOT_NEWER: &str = "mode_request_not_newer";
+pub const ERROR_MODE_TIMESTAMP_IN_FUTURE: &str = "mode_timestamp_in_future";
+pub const ERROR_RATE_LIMITED: &str = "rate_limited";
+pub const ERROR_RECIPIENT_NOT_RECEIVING: &str = "recipient not accepting payments";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateBlinkAccountRequest {
     pub domain: String,
@@ -121,12 +128,31 @@ pub struct RecoverLnurlPayRequest {
     pub timestamp: u64,
 }
 
+/// Address fields are absent for a mode-only account; `mode` is always
+/// present, `null` meaning untyped.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecoverLnurlPayResponse {
-    pub lnurl: String,
-    pub lightning_address: String,
-    pub username: String,
-    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lnurl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lightning_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetLnurlPayModeRequest {
+    pub mode: String,
+    pub signature: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetLnurlPayModeResponse {
+    pub mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

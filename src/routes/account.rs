@@ -1,26 +1,31 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use axum_extra::extract::Host;
 use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
 use serde_json::Value;
+use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    country::client_ip,
     identifier::{
         IdentifierError, WalletModifier, canonical_spark_username, parse_public_identifier,
     },
     models::{
-        ListMetadataRequest, ListMetadataResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
-        RegisterLnurlPayRequest, RegisterLnurlPayResponse, TransferLnurlPayRequest,
-        TransferLnurlPayResponse, UnregisterLnurlPayRequest, sanitize_username,
+        ERROR_ENHANCED_MODE_REQUIRED, ERROR_INVALID_MODE, ERROR_MODE_REQUEST_NOT_NEWER,
+        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, ListMetadataRequest,
+        ListMetadataResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
+        RegisterLnurlPayRequest, RegisterLnurlPayResponse, SetLnurlPayModeRequest,
+        SetLnurlPayModeResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
+        UnregisterLnurlPayRequest, sanitize_username,
     },
     repository::{
-        AccountIdentifierKind, AccountProvider, IdentifierTransfer, LnurlRepository,
+        AccountIdentifierKind, AccountMode, AccountProvider, IdentifierTransfer, LnurlRepository,
         LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
-        WalletKind,
+        SparkModeUpdate, WalletKind,
     },
     state::State,
     time::now_u64,
@@ -30,14 +35,22 @@ use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRec
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
 
+// Bounds how far ahead of the stored anchor an accepted mode request can sit,
+// which bounds the cross-device lockout after a fast-clock request.
+const MODE_MAX_FUTURE_SKEW_SECS: i64 = 30;
+
 impl<DB> LnurlServer<DB>
 where
     DB: LnurlRepository + crate::webhooks::WebhookRepository + Clone + Send + Sync + 'static,
 {
+    /// Unlike both transfer paths, claiming a username deliberately never
+    /// records a mode: registering a name is not consent to IP region checks,
+    /// so the account stays untyped until its owner declares one.
     pub async fn register(
         Host(host): Host,
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
         Json(payload): Json<RegisterLnurlPayRequest>,
     ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
         require_spark_provider_enabled(&state)?;
@@ -54,6 +67,11 @@ where
         validate_description(&payload.description)?;
         let domain = sanitize_domain(&state, &host).await?;
 
+        let stored_mode = stored_account_mode(&state, &pubkey.to_string()).await?;
+        if stored_mode == Some(AccountMode::Anon) {
+            return Err(enhanced_mode_required());
+        }
+
         let registration = NewSparkRegistration {
             account_id: None,
             pubkey: pubkey.to_string(),
@@ -68,6 +86,8 @@ where
         if let Err(e) = state.db.upsert_spark_registration(&registration).await {
             return Err(spark_registration_error(e, &username));
         }
+
+        spawn_country_evidence_refresh(&state, &pubkey.to_string(), stored_mode, &headers);
 
         debug!("registered user '{username}' for pubkey {pubkey}");
         let lnurl = format!("lnurlp://{domain}/lnurlp/{username}");
@@ -112,6 +132,10 @@ where
         let from_pubkey = from_pk.to_string();
         let to_pubkey = to_pk.to_string();
 
+        if stored_account_mode(&state, &to_pubkey).await? == Some(AccountMode::Anon) {
+            return Err(enhanced_mode_required());
+        }
+
         let source_recipient = state
             .db
             .resolve_recipient_by_identifier(&domain, &username)
@@ -138,6 +162,10 @@ where
             .await
         {
             return Err(spark_transfer_error(e, &username));
+        }
+
+        if let Err(e) = state.db.set_spark_mode_enhanced_if_unset(&to_pubkey).await {
+            error!("failed to backfill mode after transfer: {e}");
         }
 
         debug!("transferred '{username}' from {from_pk} to {to_pk}");
@@ -186,6 +214,7 @@ where
         Host(host): Host,
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
         Json(payload): Json<RecoverLnurlPayRequest>,
     ) -> Result<Json<RecoverLnurlPayResponse>, (StatusCode, Json<Value>)> {
         let pubkey = validate(
@@ -210,27 +239,108 @@ where
             ));
         }
 
+        let mode = stored_account_mode(&state, &pubkey.to_string()).await?;
+        spawn_country_evidence_refresh(&state, &pubkey.to_string(), mode, &headers);
+
         let user = state
             .db
             .get_spark_username_by_pubkey(&domain, &pubkey.to_string())
             .await
             .map_err(storage_error)?;
+        let mode = mode.map(|mode| mode.as_str().to_string());
 
-        match user {
-            Some(user) => {
-                let lnurl = format!("lnurlp://{}/lnurlp/{}", &user.domain, user.username);
-                Ok(Json(RecoverLnurlPayResponse {
-                    lnurl,
-                    lightning_address: format!("{}@{}", user.username, &user.domain),
-                    username: user.username,
-                    description: user.description,
-                }))
-            }
-            None => Err((
+        // An account with a mode but no username is legitimate: mode is recorded
+        // before any address can exist.
+        match (user, mode.as_ref()) {
+            (Some(user), _) => Ok(Json(RecoverLnurlPayResponse {
+                lnurl: Some(format!(
+                    "lnurlp://{}/lnurlp/{}",
+                    &user.domain, user.username
+                )),
+                lightning_address: Some(format!("{}@{}", user.username, &user.domain)),
+                username: Some(user.username),
+                description: Some(user.description),
+                mode,
+            })),
+            (None, Some(_)) => Ok(Json(RecoverLnurlPayResponse {
+                lnurl: None,
+                lightning_address: None,
+                username: None,
+                description: None,
+                mode,
+            })),
+            (None, None) => Err((
                 StatusCode::NOT_FOUND,
                 Json(Value::String("user not found".into())),
             )),
         }
+    }
+
+    /// `POST /lnurlpay/{pubkey}/mode`. The pubkey signature is the sole
+    /// authorization; the client-certificate middleware is not authz.
+    pub async fn set_mode(
+        Path(pubkey): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
+        Json(payload): Json<SetLnurlPayModeRequest>,
+    ) -> Result<Json<SetLnurlPayModeResponse>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
+        let mode = parse_account_mode(&payload.mode)?;
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+
+        // "mode:" domain-separates from every other signed message; a colon is
+        // illegal in usernames, so no register/unregister signature can reach here.
+        let message = format!("mode:{}:{}", mode.as_str(), pubkey);
+        let pubkey = validate(
+            &pubkey,
+            &payload.signature,
+            &message,
+            payload.timestamp,
+            &state,
+        )
+        .await?;
+        let client_timestamp = i64::try_from(payload.timestamp).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid timestamp".into())),
+            )
+        })?;
+        // Refused rather than clamped: a clamped anchor could be replayed
+        // past a later mode switch.
+        if client_timestamp > crate::time::now().saturating_add(MODE_MAX_FUTURE_SKEW_SECS) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String(ERROR_MODE_TIMESTAMP_IN_FUTURE.into())),
+            ));
+        }
+
+        let country = match mode {
+            AccountMode::Enhanced => resolve_country(&state, request_ip).await,
+            AccountMode::Anon => None,
+        };
+
+        state
+            .db
+            .upsert_spark_mode(&SparkModeUpdate {
+                pubkey: pubkey.to_string(),
+                mode,
+                client_timestamp,
+                country,
+            })
+            .await
+            .map_err(spark_mode_error)?;
+
+        debug!("set mode '{}' for pubkey {pubkey}", mode.as_str());
+        Ok(Json(SetLnurlPayModeResponse {
+            mode: mode.as_str().to_string(),
+        }))
     }
 
     pub async fn list_metadata(
@@ -261,6 +371,111 @@ where
             })?;
         Ok(Json(ListMetadataResponse { metadata }))
     }
+}
+
+/// Wire parsing is deliberately separate from the storage decoder: a variant
+/// added later for storage must not become accepted from untrusted input.
+pub(super) fn parse_account_mode(mode: &str) -> Result<AccountMode, (StatusCode, Json<Value>)> {
+    match mode.trim() {
+        "enhanced" => Ok(AccountMode::Enhanced),
+        "anon" => Ok(AccountMode::Anon),
+        _ => {
+            trace!("invalid mode value");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String(ERROR_INVALID_MODE.into())),
+            ))
+        }
+    }
+}
+
+pub(super) fn enhanced_mode_required() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(Value::String(ERROR_ENHANCED_MODE_REQUIRED.into())),
+    )
+}
+
+pub(super) fn spark_mode_error(error: LnurlRepositoryError) -> (StatusCode, Json<Value>) {
+    match error {
+        LnurlRepositoryError::StaleModeTimestamp => (
+            StatusCode::CONFLICT,
+            Json(Value::String(ERROR_MODE_REQUEST_NOT_NEWER.into())),
+        ),
+        LnurlRepositoryError::AccountNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(Value::String("user not found".into())),
+        ),
+        error => storage_error(error),
+    }
+}
+
+pub(super) async fn stored_account_mode<DB>(
+    state: &State<DB>,
+    pubkey: &str,
+) -> Result<Option<AccountMode>, (StatusCode, Json<Value>)>
+where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    Ok(state
+        .db
+        .get_spark_account_mode(pubkey)
+        .await
+        .map_err(storage_error)?
+        .and_then(|record| record.mode))
+}
+
+async fn resolve_country<DB>(state: &State<DB>, request_ip: Option<IpAddr>) -> Option<String> {
+    if !state.country_resolver.is_enabled() || request_ip.is_none() {
+        return None;
+    }
+    // The per-ip budget bounds one address; this bounds the aggregate, so a
+    // crowd of in-budget ips cannot drain the shared vendor plan.
+    if !state.country_lookup_budget.spend() {
+        warn!("global country lookup budget exhausted; evidence not refreshed");
+        return None;
+    }
+    state.country_resolver.resolve(request_ip).await
+}
+
+/// Refresh the stored country of an already-Enhanced account, within the same
+/// per-IP budget the mode route spends. Fire-and-forget: the vendor timeout
+/// must not sit on the register/recover response path.
+fn spawn_country_evidence_refresh<DB>(
+    state: &State<DB>,
+    pubkey: &str,
+    mode: Option<AccountMode>,
+    headers: &HeaderMap,
+) where
+    DB: LnurlRepository + Clone + Send + Sync + 'static,
+{
+    if mode != Some(AccountMode::Enhanced) {
+        return;
+    }
+    // A disabled resolver must cost nothing: the budget is shared with the
+    // mode route, so spending it on impossible lookups would 429 that route.
+    if !state.country_resolver.is_enabled() {
+        return;
+    }
+    let state = state.clone();
+    let pubkey = pubkey.to_string();
+    let request_ip = client_ip(headers);
+    tokio::spawn(async move {
+        if !state.ip_rate_limiter.check(request_ip) {
+            debug!("country evidence refresh skipped: per-IP budget spent");
+            return;
+        }
+        let Some(country) = resolve_country(&state, request_ip).await else {
+            return;
+        };
+        if let Err(e) = state
+            .db
+            .refresh_spark_country_evidence(&pubkey, &country)
+            .await
+        {
+            error!("failed to refresh country evidence: {e}");
+        }
+    });
 }
 
 pub(super) fn canonical_spark_username_for_route(
@@ -546,6 +761,10 @@ pub(super) fn spark_transfer_error(
                 Json(Value::String("name already taken".into())),
             )
         }
+        LnurlRepositoryError::StaleModeTimestamp => (
+            StatusCode::CONFLICT,
+            Json(Value::String(ERROR_MODE_REQUEST_NOT_NEWER.into())),
+        ),
         LnurlRepositoryError::General(err) => {
             error!("failed to execute transfer query: {err}");
             (
@@ -557,7 +776,8 @@ pub(super) fn spark_transfer_error(
         | LnurlRepositoryError::AccountNotFound
         | LnurlRepositoryError::InvalidOwnership
         | LnurlRepositoryError::InvalidProvider
-        | LnurlRepositoryError::InvalidIdentifierKind => {
+        | LnurlRepositoryError::InvalidIdentifierKind
+        | LnurlRepositoryError::InvalidAccountMode => {
             error!("unexpected provider-neutral transfer error: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -821,6 +1041,7 @@ mod tests {
             Host("example.com".to_string()),
             Path("not-a-pubkey".to_string()),
             Extension(state),
+            HeaderMap::new(),
             Json(RegisterLnurlPayRequest {
                 username: "alice".to_string(),
                 signature: "00".to_string(),
@@ -1111,5 +1332,910 @@ mod tests {
                 "signature must not verify against a different message: {other}"
             );
         }
+    }
+
+    // -- Region-determination mode ---------------------------------------------
+
+    use crate::country::CountryResolver;
+
+    fn mode_key(seed: u8) -> (SecretKey, String) {
+        let (secret, public) = transfer_key(seed);
+        (secret, hex::encode(public.serialize()))
+    }
+
+    fn sign_hex(secret: &SecretKey, message: &str) -> String {
+        hex::encode(sign(secret, message).serialize_der())
+    }
+
+    fn mode_request(
+        secret: &SecretKey,
+        pubkey: &str,
+        mode: &str,
+        timestamp: u64,
+    ) -> SetLnurlPayModeRequest {
+        SetLnurlPayModeRequest {
+            mode: mode.to_string(),
+            signature: sign_hex(secret, &format!("mode:{mode}:{pubkey}-{timestamp}")),
+            timestamp,
+        }
+    }
+
+    fn headers_with_request_ip(ip: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", ip.parse().expect("test IP header parses"));
+        headers
+    }
+
+    async fn post_mode(
+        state: &State<MockRepository>,
+        pubkey: &str,
+        payload: SetLnurlPayModeRequest,
+        headers: HeaderMap,
+    ) -> Result<SetLnurlPayModeResponse, (StatusCode, Json<Value>)> {
+        LnurlServer::set_mode(
+            Path(pubkey.to_string()),
+            Extension(state.clone()),
+            headers,
+            Json(payload),
+        )
+        .await
+        .map(|Json(response)| response)
+    }
+
+    fn assert_conflict(result: Result<impl Sized, (StatusCode, Json<Value>)>, code: &str) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected a {code} conflict");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, Value::String(code.to_string()));
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Long enough for a spawned refresh task to have run if it was going to.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A proxycheck.io stand-in that echoes a fixed isocode and counts
+    /// lookups. Like the real vendor it withholds the isocode unless the
+    /// query carries `asn=1`.
+    async fn start_country_mock(iso_code: &'static str) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/{ip}",
+            get(
+                move |Path(ip): Path<String>,
+                      axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                    let calls = Arc::clone(&calls_for_route);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let has_asn_flag = query
+                            .as_deref()
+                            .unwrap_or("")
+                            .split('&')
+                            .any(|pair| pair == "asn=1");
+                        if has_asn_flag {
+                            Json(json!({ "status": "ok", ip: { "isocode": iso_code, "proxy": "yes", "risk": 100 } }))
+                        } else {
+                            Json(json!({ "status": "ok", ip: { "proxy": "yes", "risk": 100 } }))
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock listener should have addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock proxycheck server should serve");
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    #[tokio::test]
+    async fn mode_route_records_a_signed_mode_on_first_contact() {
+        let (secret, pubkey) = mode_key(11);
+        let repo = MockRepository::default();
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        let timestamp = now_u64();
+
+        let response = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", timestamp),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("a validly signed mode request is accepted");
+
+        assert_eq!(response.mode, "anon");
+        let record = repo.spark_mode(&pubkey).expect("mode record is created");
+        assert_eq!(record.mode, Some(AccountMode::Anon));
+        assert_eq!(record.mode_source, Some(ModeSource::Signup));
+        assert_eq!(
+            record.mode_last_timestamp,
+            Some(i64::try_from(timestamp).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_route_rejects_replay_and_captured_older_requests() {
+        let (secret, pubkey) = mode_key(12);
+        let repo = MockRepository::default();
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+
+        // A captured Enhanced request, still well inside the +/-600s window.
+        let captured_at = now_u64() - 100;
+        let captured = mode_request(&secret, &pubkey, "enhanced", captured_at);
+        let _ = post_mode(&state, &pubkey, captured, HeaderMap::new())
+            .await
+            .expect("the original enhanced request is accepted");
+
+        let switched_at = now_u64();
+        let switch = mode_request(&secret, &pubkey, "anon", switched_at);
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            SetLnurlPayModeRequest {
+                mode: switch.mode.clone(),
+                signature: switch.signature.clone(),
+                timestamp: switch.timestamp,
+            },
+            HeaderMap::new(),
+        )
+        .await
+        .expect("the anon switch is accepted");
+        let anchored = repo.spark_mode(&pubkey).expect("record exists");
+
+        // Replaying the accepted anon switch is indistinguishable from a
+        // retry after a dropped response: reads as success, changes nothing.
+        let replayed = post_mode(&state, &pubkey, switch, HeaderMap::new())
+            .await
+            .expect("a replay of the accepted request is idempotent");
+        assert_eq!(replayed.mode, "anon");
+        // The rollback case: a *different*, older, still-fresh, validly signed
+        // request that would undo the anon consent.
+        assert_conflict(
+            post_mode(
+                &state,
+                &pubkey,
+                mode_request(&secret, &pubkey, "enhanced", captured_at),
+                HeaderMap::new(),
+            )
+            .await,
+            ERROR_MODE_REQUEST_NOT_NEWER,
+        );
+
+        assert_eq!(
+            repo.spark_mode(&pubkey).expect("record exists"),
+            anchored,
+            "mode, mode_updated_at and mode_last_timestamp must all be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_route_rejects_a_stale_or_forged_request() {
+        let (secret, pubkey) = mode_key(13);
+        let (other_secret, _) = mode_key(14);
+        let repo = MockRepository::default();
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+
+        let stale_timestamp = now_u64() - 601;
+        assert!(
+            post_mode(
+                &state,
+                &pubkey,
+                mode_request(&secret, &pubkey, "anon", stale_timestamp),
+                HeaderMap::new()
+            )
+            .await
+            .is_err(),
+            "a request outside the freshness window must be rejected"
+        );
+
+        let timestamp = now_u64();
+        assert!(
+            post_mode(
+                &state,
+                &pubkey,
+                mode_request(&other_secret, &pubkey, "anon", timestamp),
+                HeaderMap::new()
+            )
+            .await
+            .is_err(),
+            "a signature from another key must be rejected"
+        );
+
+        // A signature over "enhanced" must not be replayable as "anon".
+        let mut tampered = mode_request(&secret, &pubkey, "enhanced", timestamp);
+        tampered.mode = "anon".to_string();
+        assert!(
+            post_mode(&state, &pubkey, tampered, HeaderMap::new())
+                .await
+                .is_err(),
+            "the signed message binds the mode value"
+        );
+
+        let mut bad_mode = mode_request(&secret, &pubkey, "anon", timestamp);
+        bad_mode.mode = "hidden".to_string();
+        let Err((status, Json(body))) =
+            post_mode(&state, &pubkey, bad_mode, HeaderMap::new()).await
+        else {
+            panic!("an unknown mode value must be rejected");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String(ERROR_INVALID_MODE.to_string()));
+
+        assert!(repo.spark_mode(&pubkey).is_none());
+    }
+
+    #[tokio::test]
+    async fn mode_route_resolves_a_country_only_when_storing_enhanced_evidence() {
+        let (secret, pubkey) = mode_key(15);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, Some("test-key".to_string())).expect("resolver builds"),
+        )
+        .await;
+        let headers = headers_with_request_ip("203.0.113.7");
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", now_u64() - 10),
+            headers.clone(),
+        )
+        .await
+        .expect("anon upsert is accepted");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an anon request must never trigger a vendor lookup"
+        );
+        assert!(repo.spark_mode(&pubkey).unwrap().country.is_none());
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64()),
+            headers.clone(),
+        )
+        .await
+        .expect("enhanced switch is accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stored = repo.spark_mode(&pubkey).unwrap();
+        assert_eq!(stored.country.as_deref(), Some("SV"));
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", now_u64() + 1),
+            headers,
+        )
+        .await
+        .expect("anon switch back is accepted");
+        let cleared = repo.spark_mode(&pubkey).unwrap();
+        assert_eq!(cleared.mode, Some(AccountMode::Anon));
+        assert!(cleared.country.is_none());
+        assert!(cleared.country_updated_at.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "switching away from enhanced must not resolve anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_route_ignores_untrusted_ip_headers() {
+        let (secret, pubkey) = mode_key(16);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64()),
+            headers,
+        )
+        .await
+        .expect("enhanced upsert is accepted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            repo.spark_mode(&pubkey).unwrap().country.is_none(),
+            "only x-real-ip may feed the evidence store"
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_route_is_rate_limited_per_ip() {
+        let (secret, pubkey) = mode_key(17);
+        let repo = MockRepository::default();
+        let mut state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        state.ip_rate_limiter = Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1,
+            std::time::Duration::from_mins(1),
+            16,
+            false,
+        ));
+        let headers = headers_with_request_ip("203.0.113.7");
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", now_u64()),
+            headers.clone(),
+        )
+        .await
+        .expect("the first request is within budget");
+
+        let Err((status, Json(body))) = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64() + 1),
+            headers,
+        )
+        .await
+        else {
+            panic!("the second request must be throttled");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, Value::String(ERROR_RATE_LIMITED.to_string()));
+
+        // No trusted header means no budget outside a local deployment: the
+        // signature-verification RPC must not be reachable without one.
+        let Err((status, _)) = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", now_u64() + 2),
+            HeaderMap::new(),
+        )
+        .await
+        else {
+            panic!("a request with no trusted client IP must be throttled");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn an_identical_mode_request_retried_after_a_dropped_response_succeeds() {
+        let (secret, pubkey) = mode_key(27);
+        let repo = MockRepository::default();
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        let timestamp = now_u64();
+        let request = mode_request(&secret, &pubkey, "anon", timestamp);
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", timestamp),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("the first attempt is accepted");
+        let accepted = repo.spark_mode(&pubkey).unwrap();
+
+        let response = post_mode(&state, &pubkey, request, HeaderMap::new())
+            .await
+            .expect("the retry of a request that did land must read as success");
+        assert_eq!(response.mode, "anon");
+        assert_eq!(repo.spark_mode(&pubkey).unwrap(), accepted);
+
+        // A captured request at the same timestamp but another mode is not a
+        // retry, and is still refused.
+        assert_conflict(
+            post_mode(
+                &state,
+                &pubkey,
+                mode_request(&secret, &pubkey, "enhanced", timestamp),
+                HeaderMap::new(),
+            )
+            .await,
+            ERROR_MODE_REQUEST_NOT_NEWER,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_country_refresh_path_spends_the_same_per_ip_budget() {
+        // Recover is a routine app-restore call: it must not be able to drive
+        // the paid vendor quota beyond the per-IP budget.
+        let (secret, pubkey) = mode_key(28);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let mut state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+        state.ip_rate_limiter = Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1,
+            std::time::Duration::from_mins(1),
+            16,
+            false,
+        ));
+        let headers = headers_with_request_ip("203.0.113.7");
+
+        for attempt in 0..3 {
+            let timestamp = now_u64() + attempt;
+            let _ = LnurlServer::recover(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state.clone()),
+                headers.clone(),
+                Json(RecoverLnurlPayRequest {
+                    signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                    timestamp,
+                }),
+            )
+            .await
+            .expect("recover keeps working while over budget");
+        }
+
+        wait_until("the one in-budget refresh to reach the vendor", || {
+            calls.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        settle().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the in-budget recover may reach the vendor"
+        );
+    }
+
+    #[test]
+    fn wire_mode_values_are_parsed_independently_of_the_storage_decoder() {
+        assert_eq!(
+            parse_account_mode(" enhanced ").ok(),
+            Some(AccountMode::Enhanced)
+        );
+        assert_eq!(parse_account_mode("anon").ok(), Some(AccountMode::Anon));
+
+        for invalid in ["", "ENHANCED", "hidden", "signup", "ip", "null"] {
+            let Err((status, Json(body))) = parse_account_mode(invalid) else {
+                panic!("wire value '{invalid}' must be rejected");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, Value::String(ERROR_INVALID_MODE.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_stale_mode_timestamp_is_a_conflict_on_every_route() {
+        let (status, Json(body)) =
+            spark_transfer_error(LnurlRepositoryError::StaleModeTimestamp, "alice");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            Value::String(ERROR_MODE_REQUEST_NOT_NEWER.to_string())
+        );
+
+        let (mode_status, Json(mode_body)) =
+            spark_mode_error(LnurlRepositoryError::StaleModeTimestamp);
+        assert_eq!(mode_status, status);
+        assert_eq!(mode_body, body);
+    }
+
+    #[tokio::test]
+    async fn a_spent_global_budget_stops_lookups_but_not_mode_writes() {
+        let (secret, pubkey) = mode_key(29);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let mut state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+        state.country_lookup_budget = Arc::new(crate::rate_limit::GlobalBudget::new(
+            1,
+            std::time::Duration::from_hours(24),
+        ));
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64() - 1),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        .expect("the in-budget enhanced request is accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().country.as_deref(),
+            Some("SV")
+        );
+
+        let (secret2, pubkey2) = mode_key(30);
+        let _ = post_mode(
+            &state,
+            &pubkey2,
+            mode_request(&secret2, &pubkey2, "enhanced", now_u64()),
+            headers_with_request_ip("203.0.113.8"),
+        )
+        .await
+        .expect("a spent global budget must not block the mode write");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "over the global budget, the vendor is never called"
+        );
+        let stored = repo.spark_mode(&pubkey2).unwrap();
+        assert_eq!(stored.mode, Some(AccountMode::Enhanced));
+        assert!(stored.country.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_resolver_spends_no_register_or_recover_budget() {
+        let (secret, pubkey) = mode_key(27);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let mut state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        state.ip_rate_limiter = Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1,
+            std::time::Duration::from_mins(1),
+            10,
+            true,
+        ));
+        let timestamp = now_u64();
+
+        let _ = LnurlServer::recover(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state.clone()),
+            headers_with_request_ip("203.0.113.7"),
+            Json(RecoverLnurlPayRequest {
+                signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                timestamp,
+            }),
+        )
+        .await
+        .expect("an enhanced account recovers");
+        settle().await;
+
+        let _ = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "anon", timestamp),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        .expect("recover with a disabled resolver must not spend the mode route's budget");
+    }
+
+    #[tokio::test]
+    async fn a_future_dated_mode_request_is_rejected_before_any_lookup() {
+        let (secret, pubkey) = mode_key(26);
+        let (base_url, calls) = start_country_mock("SV").await;
+        let repo = MockRepository::default();
+        let state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+
+        let Err((status, Json(body))) = post_mode(
+            &state,
+            &pubkey,
+            mode_request(&secret, &pubkey, "enhanced", now_u64() + 120),
+            headers_with_request_ip("203.0.113.7"),
+        )
+        .await
+        else {
+            panic!("a future-dated mode request must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            Value::String(ERROR_MODE_TIMESTAMP_IN_FUTURE.to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(repo.spark_mode(&pubkey).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_is_refused_while_anon_and_allowed_while_untyped() {
+        let (secret, pubkey) = mode_key(18);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        let timestamp = now_u64();
+
+        let request = RegisterLnurlPayRequest {
+            username: "alice".to_string(),
+            signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+            timestamp,
+            description: "Alice".to_string(),
+        };
+        assert_conflict(
+            LnurlServer::register(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state.clone()),
+                HeaderMap::new(),
+                Json(request),
+            )
+            .await,
+            ERROR_ENHANCED_MODE_REQUIRED,
+        );
+        assert_eq!(repo.spark_registration_count(), 0);
+
+        let untyped_repo = MockRepository::default();
+        let untyped_state = route_test_state_with_country_resolver(
+            untyped_repo.clone(),
+            CountryResolver::disabled(),
+        )
+        .await;
+        let _ = LnurlServer::register(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(untyped_state),
+            HeaderMap::new(),
+            Json(RegisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+                timestamp,
+                description: "Alice".to_string(),
+            }),
+        )
+        .await
+        .expect("an untyped account keeps its grandfathered registration");
+        assert_eq!(untyped_repo.spark_registration_count(), 1);
+        assert!(
+            untyped_repo.spark_mode(&pubkey).is_none(),
+            "register must not type an account"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_refreshes_country_evidence_only_while_enhanced() {
+        let (secret, pubkey) = mode_key(19);
+        let (base_url, calls) = start_country_mock("CO").await;
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let state = route_test_state_with_country_resolver(
+            repo.clone(),
+            CountryResolver::new(&base_url, None).expect("resolver builds"),
+        )
+        .await;
+        let timestamp = now_u64();
+
+        let _ = LnurlServer::register(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state),
+            headers_with_request_ip("203.0.113.7"),
+            Json(RegisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+                timestamp,
+                description: "Alice".to_string(),
+            }),
+        )
+        .await
+        .expect("an enhanced account may claim a username");
+
+        wait_until("the spawned refresh to store the country", || {
+            repo.spark_mode(&pubkey)
+                .unwrap()
+                .country
+                .as_deref()
+                .is_some()
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().country.as_deref(),
+            Some("CO")
+        );
+    }
+
+    #[tokio::test]
+    async fn register_and_recover_never_resolve_for_anon_or_untyped_accounts() {
+        for mode in [Some(AccountMode::Anon), None] {
+            let (secret, pubkey) = mode_key(22);
+            let (base_url, calls) = start_country_mock("CO").await;
+            let repo = MockRepository::default().with_spark_mode(&pubkey, mode);
+            let state = route_test_state_with_country_resolver(
+                repo.clone(),
+                CountryResolver::new(&base_url, None).expect("resolver builds"),
+            )
+            .await;
+            let timestamp = now_u64();
+
+            let recovered = LnurlServer::recover(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state.clone()),
+                headers_with_request_ip("203.0.113.7"),
+                Json(RecoverLnurlPayRequest {
+                    signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                    timestamp,
+                }),
+            )
+            .await;
+            match mode {
+                Some(_) => {
+                    let _ = recovered.expect("an anon account recovers its mode");
+                }
+                // No username and no mode leaves nothing to recover; the 404
+                // must still happen after the (skipped) evidence refresh.
+                None => assert!(recovered.is_err()),
+            }
+
+            let _ = LnurlServer::register(
+                Host("example.com".to_string()),
+                Path(pubkey.clone()),
+                Extension(state),
+                headers_with_request_ip("203.0.113.7"),
+                Json(RegisterLnurlPayRequest {
+                    username: "alice".to_string(),
+                    signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+                    timestamp,
+                    description: "Alice".to_string(),
+                }),
+            )
+            .await;
+            settle().await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a non-enhanced account's ip must never reach the vendor (mode: {mode:?})"
+            );
+            assert!(
+                repo.spark_mode(&pubkey)
+                    .is_none_or(|record| record.country.is_none()),
+                "no country evidence may appear for mode: {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_returns_the_mode_and_tolerates_address_less_accounts() {
+        let (secret, pubkey) = mode_key(20);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        let timestamp = now_u64();
+
+        let Json(response) = LnurlServer::recover(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state),
+            HeaderMap::new(),
+            Json(RecoverLnurlPayRequest {
+                signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                timestamp,
+            }),
+        )
+        .await
+        .expect("a mode-only account must recover");
+
+        assert_eq!(response.mode.as_deref(), Some("anon"));
+        assert!(response.username.is_none());
+        assert!(response.lightning_address.is_none());
+        let body = serde_json::to_value(&response).expect("response serializes");
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["mode"],
+            "address fields stay absent rather than null for a mode-only account"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_404s_for_a_pubkey_with_no_record() {
+        let (secret, pubkey) = mode_key(21);
+        let state = route_test_state_with_country_resolver(
+            MockRepository::default(),
+            CountryResolver::disabled(),
+        )
+        .await;
+        let timestamp = now_u64();
+
+        let Err((status, _)) = LnurlServer::recover(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state),
+            HeaderMap::new(),
+            Json(RecoverLnurlPayRequest {
+                signature: sign_hex(&secret, &format!("{pubkey}-{timestamp}")),
+                timestamp,
+            }),
+        )
+        .await
+        else {
+            panic!("an unknown pubkey must still 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn run_user_transfer(
+        repo: MockRepository,
+        from: &SecretKey,
+        from_pubkey: &str,
+        to: &SecretKey,
+        to_pubkey: &str,
+    ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        let state = route_test_state_with_country_resolver(repo, CountryResolver::disabled()).await;
+        let message = format!("transfer:alice-{to_pubkey}");
+        LnurlServer::transfer(
+            Host("example.com".to_string()),
+            Path(to_pubkey.to_string()),
+            Extension(state),
+            Json(TransferLnurlPayRequest {
+                username: "alice".to_string(),
+                description: "Alice".to_string(),
+                from_pubkey: from_pubkey.to_string(),
+                from_signature: sign_hex(from, &message),
+                to_signature: sign_hex(to, &message),
+            }),
+        )
+        .await
+    }
+
+    fn transfer_source_recipient(from_pubkey: &str) -> ResolvedRecipient {
+        ResolvedRecipient {
+            spark_pubkey: Some(from_pubkey.to_string()),
+            ..spark_resolved_recipient()
+        }
+    }
+
+    #[tokio::test]
+    async fn user_transfer_is_refused_when_the_destination_is_anon() {
+        let (from, from_pubkey) = mode_key(22);
+        let (to, to_pubkey) = mode_key(23);
+        let repo = MockRepository::default()
+            .with_resolved_recipient(transfer_source_recipient(&from_pubkey))
+            .with_spark_mode(&to_pubkey, Some(AccountMode::Anon));
+
+        assert_conflict(
+            run_user_transfer(repo.clone(), &from, &from_pubkey, &to, &to_pubkey).await,
+            ERROR_ENHANCED_MODE_REQUIRED,
+        );
+    }
+
+    #[tokio::test]
+    async fn user_transfer_backfills_an_unset_destination_mode() {
+        let (from, from_pubkey) = mode_key(24);
+        let (to, to_pubkey) = mode_key(25);
+        let repo = MockRepository::default()
+            .with_resolved_recipient(transfer_source_recipient(&from_pubkey));
+
+        let _ = run_user_transfer(repo.clone(), &from, &from_pubkey, &to, &to_pubkey)
+            .await
+            .expect("an untyped destination may receive the identifier");
+
+        let record = repo.spark_mode(&to_pubkey).expect("mode record is created");
+        assert_eq!(record.mode, Some(AccountMode::Enhanced));
+        assert_eq!(record.mode_source, Some(ModeSource::Migration));
+        assert!(record.country.is_none());
     }
 }

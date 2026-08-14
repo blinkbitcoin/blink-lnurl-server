@@ -26,7 +26,8 @@ The API uses different authentication mechanisms by route group:
 | `POST` | `/lnurlpay/{pubkey}` | Register a Spark LNURL username. | Spark signature; optional client certificate |
 | `DELETE` | `/lnurlpay/{pubkey}` | Unregister a Spark LNURL username. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/transfer` | Transfer a Spark username from one Spark pubkey to another. | Spark signatures; optional client certificate |
-| `POST` | `/lnurlpay/{pubkey}/recover` | Recover the registered LNURL and Lightning Address for a Spark pubkey. | Spark signature; optional client certificate |
+| `POST` | `/lnurlpay/{pubkey}/recover` | Recover the mode, and the registered LNURL and Lightning Address, for a Spark pubkey. | Spark signature; optional client certificate |
+| `POST` | `/lnurlpay/{pubkey}/mode` | Set the region-determination mode (`enhanced` or `anon`) for a Spark pubkey, creating the account on first contact. | Spark signature; optional client certificate; per-IP rate limit |
 | `GET` | `/lnurlpay/{pubkey}/metadata` | List sender comments, zap requests, zap receipts, preimages, and update times for a Spark pubkey. | Spark signature query parameters; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/metadata/{payment_hash}/zap` | Publish and persist a NIP-57 zap receipt for a stored zap request. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/invoice-paid` | Legacy single-invoice paid notification with a preimage. | Spark signature; optional client certificate |
@@ -126,6 +127,38 @@ Batch invoice-paid request:
   ]
 }
 ```
+
+Recover response. `mode` is always present; `null` means the account has never chosen one. The address fields are absent for an account that has a mode but no username:
+
+```json
+{
+  "lnurl": "lnurlp://example.com/lnurlp/alice",
+  "lightning_address": "alice@example.com",
+  "username": "alice",
+  "description": "Alice wallet",
+  "mode": "enhanced"
+}
+```
+
+Mode request. The signed message is `mode:{mode}:{pubkey}-{timestamp}`; `timestamp` must be within 600 seconds of server time, at most 30 seconds ahead of it, AND strictly newer than the last accepted mode request for this pubkey. Re-sending the exact request that was last accepted (same mode, same timestamp — a retry after a dropped response) succeeds without changing anything; any other older request is refused:
+
+```json
+{
+  "mode": "enhanced",
+  "signature": "<der-signature-hex>",
+  "timestamp": 1710000000
+}
+```
+
+Mode response:
+
+```json
+{
+  "mode": "enhanced"
+}
+```
+
+Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a user-initiated transfer are both refused while the stored mode is `anon`. The server-initiated migration transfer is the deliberate exception: it completes even for an `anon` destination, and the address stays dormant (no invoices are minted) until the account switches to `enhanced` — failing the migration would be the harsher outcome for a state only the account holder can create. The accepted timestamp is stored verbatim as the monotonic anchor; a timestamp more than 30 seconds ahead of server time is refused with `mode_timestamp_in_future` rather than clamped — a clamped anchor would sit below the timestamp of the request that wrote it, letting a captured request be replayed past a later mode switch. The refusal caps any fast-clock cross-device lockout at 30 seconds.
 
 Successful `DELETE`, `/invoice-paid`, and `/invoices-paid` responses have an empty body.
 
@@ -249,11 +282,12 @@ Blink `/webhook/blink` body:
 | Status | Shape | Meaning |
 |---:|---|---|
 | `200` | `{ "status": "ERROR", "reason": "..." }` | Public LNURL protocol errors such as missing amount, unsupported wallet, invalid zap request, expired policy, or invoice creation failure. |
-| `400` | JSON string or `{ "error": "..." }` | Invalid usernames, invalid signatures, invalid timestamps, malformed JSON, invalid preimages/invoices, invalid internal request fields, or zap receipt validation failures. |
+| `400` | JSON string or `{ "error": "..." }` | Invalid usernames, invalid signatures, invalid timestamps, `mode_timestamp_in_future` for a mode request more than 30 seconds ahead of server time, malformed JSON, invalid preimages/invoices, invalid internal request fields, or zap receipt validation failures. |
 | `401` | Empty body or JSON string | Missing/invalid client certificate, missing/invalid internal bearer JWT, or invalid Spark webhook signature. |
 | `403` | `{ "error": "forbidden" }` or `{ "error": "unauthorized" }` | Internal JWT lacks the required scope, or a zap receipt is being published by the wrong Spark pubkey. |
 | `404` | JSON string, `{ "error": "not_found" }`, or empty string | User, invoice, zap, account, or identifier was not found. |
-| `409` | JSON string or `{ "error": "identifier_conflict" }` | Username or identifier conflict, or invalid provider ownership for transfer. |
+| `409` | JSON string or `{ "error": "identifier_conflict" }` | Username or identifier conflict, invalid provider ownership for transfer, `enhanced_mode_required` when a username is claimed or received while the stored mode is `anon`, or `mode_request_not_newer` when a mode request would roll the mode back. |
+| `429` | JSON string `"rate_limited"` | More mode requests than `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE` from one client IP, or a mode request with no trusted `x-real-ip` outside `DEPLOYMENT_ENV=local`. |
 | `500` | JSON string or `{ "error": "internal_server_error" }` | Repository failure, provider state failure, malformed configured keys/certificates, or unexpected invoice/provider state. |
 
 The public LUD-21 verify endpoint always returns JSON with `status`: `OK` or `ERROR`:
@@ -269,4 +303,6 @@ The public LUD-21 verify endpoint always returns JSON with `status`: `OK` or `ER
 
 ## Rate Limits
 
-No application-level rate limiting middleware or rate-limit dependency is configured in this repository. The Axum router does enforce a maximum request body size of 1,000,000 bytes (`src/main.rs`).
+`POST /lnurlpay/{pubkey}/mode` is limited per client IP (`x-real-ip`) by `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE`, and the same budget also covers the paid country lookup that `POST /lnurlpay/{pubkey}` and `POST /lnurlpay/{pubkey}/recover` perform for an Enhanced account: over budget, those two routes still succeed, they just leave the stored country at its previous value. IPv6 clients are keyed by /64 prefix. Lookups are additionally capped in aggregate by `LNURL_COUNTRY_LOOKUPS_PER_DAY`; past that budget, mode requests still succeed but store no country until the daily window resets.
+
+Outside `DEPLOYMENT_ENV=local`, a request carrying no trusted `x-real-ip` has no budget at all — the mode route returns `429` and the country lookup is skipped. Deployment must therefore guarantee the edge sets that header. The counter is in-process, so the effective budget is per replica. No other route has application-level rate limiting. The Axum router enforces a maximum request body size of 1,000,000 bytes (`src/main.rs`).
