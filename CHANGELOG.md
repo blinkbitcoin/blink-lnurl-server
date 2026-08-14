@@ -1,3 +1,14 @@
+# [blink-lnurl-server release v0.8.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.8.0)
+
+
+### Bug Fixes
+
+- Drop redundant borrows in recover response format! args (#40)
+
+### Features
+
+- Persist account mode and gate invoice issuance according to mode (#36)
+
 # [blink-lnurl-server release v0.7.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.7.0)
 
 
