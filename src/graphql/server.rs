@@ -127,3 +127,79 @@ fn extract_auth_subject(
         "invalid token".to_string()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{providers::ProviderRegistry, sqlite};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::{collections::HashSet, sync::Arc};
+    use tokio::sync::{RwLock, watch};
+
+    // Regression guard for the listener-lifecycle bug: the subgraph router must
+    // actually accept connections and serve responses once bound.
+    #[tokio::test]
+    async fn graphql_listener_accepts_connections() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool");
+        sqlite::run_migrations(&pool).await.expect("migrations");
+        let repository = sqlite::LnurlRepository::new(pool);
+
+        let spark_client = spark_client::Client::new(spark_client::ClientConfig::new(
+            spark_client::Network::Regtest,
+            [7_u8; 32],
+        ))
+        .await
+        .expect("spark client");
+        let (invoice_paid_trigger, _rx) = watch::channel(());
+        let state = State {
+            db: repository,
+            spark_client: spark_client.clone(),
+            providers: Arc::new(ProviderRegistry::new(spark_client, None, None, true, true)),
+            internal_auth: None,
+            scheme: "http".to_string(),
+            callback_domain: None,
+            min_sendable: 1_000,
+            max_sendable: 4_000_000_000,
+            include_spark_address: false,
+            domains: Arc::new(RwLock::new(HashSet::new())),
+            nostr_keys: None,
+            ca_cert: None,
+            crl_url: None,
+            crl: HashSet::new(),
+            invoice_paid_trigger,
+            webhook_secret: "test-secret".to_string(),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let router = router(state, None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .expect("serve");
+        });
+
+        // No gateway JWT => handler must reject with a GraphQL error body, which
+        // proves the listener accepted the connection and ran the handler
+        // (vs. connection-refused when the listener is not alive).
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/graphql"))
+            .json(&serde_json::json!({"query": "{ __typename }"}))
+            .send()
+            .await
+            .expect("request reaches the listener");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let message = body["errors"][0]["message"].as_str().unwrap_or("");
+        assert_eq!(message, "unauthenticated");
+
+        server.abort();
+    }
+}

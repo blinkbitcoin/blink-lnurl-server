@@ -621,7 +621,7 @@ where
     // Federated GraphQL subgraph on its own, non-ingress listener.
     let graphql_router = graphql::server::router(state.clone(), graphql_auth);
     let graphql_addr = args.graphql_address;
-    let graphql_server = tokio::spawn(async move {
+    let mut graphql_server = tokio::spawn(async move {
         if let Err(e) = graphql::server::serve::<DB>(graphql_addr, graphql_router).await {
             error!("graphql subgraph listener failed: {e}");
         }
@@ -636,11 +636,19 @@ where
             .expect("failed to create Ctrl+C shutdown signal");
     });
 
-    graphql_server.abort();
-
-    // Await the server to receive the shutdown signal
-    if let Err(e) = graceful.await {
-        error!("shutdown error: {e}");
+    // Keep both listeners alive until shutdown; if either exits first (e.g. a
+    // bind failure on the GraphQL port), bring the process down loudly instead
+    // of serving with the subgraph silently gone.
+    tokio::select! {
+        res = graceful => {
+            if let Err(e) = res {
+                error!("shutdown error: {e}");
+            }
+            graphql_server.abort();
+        }
+        res = &mut graphql_server => {
+            error!("graphql subgraph listener exited unexpectedly: {res:?}");
+        }
     }
 
     info!("lnurl server stopped");
