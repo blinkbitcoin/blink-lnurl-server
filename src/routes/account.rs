@@ -253,11 +253,8 @@ where
         // before any address can exist.
         match (user, mode.as_ref()) {
             (Some(user), _) => Ok(Json(RecoverLnurlPayResponse {
-                lnurl: Some(format!(
-                    "lnurlp://{}/lnurlp/{}",
-                    &user.domain, user.username
-                )),
-                lightning_address: Some(format!("{}@{}", user.username, &user.domain)),
+                lnurl: Some(format!("lnurlp://{}/lnurlp/{}", user.domain, user.username)),
+                lightning_address: Some(format!("{}@{}", user.username, user.domain)),
                 username: Some(user.username),
                 description: Some(user.description),
                 mode,
