@@ -1,6 +1,3 @@
-use crate::{
-    providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
-};
 use anyhow::anyhow;
 use axum::{
     Extension, Router,
@@ -15,6 +12,9 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use lnurl::{
+    providers::ProviderRegistry, repository::LnurlRepository, routes::LnurlServer, state::State,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
@@ -26,23 +26,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-mod auth;
-mod domains;
-mod error;
-mod identifier;
-mod internal_auth;
-mod invoice_paid;
-mod models;
-mod postgresql;
-mod providers;
-mod repository;
-mod routes;
-mod sqlite;
-mod state;
-mod time;
-mod webhook_notify;
-mod webhooks;
-mod zap;
+use lnurl::{auth, domains, graphql, internal_auth, postgresql, sqlite, webhooks, zap};
 
 #[derive(Clone, Parser, Debug, Serialize, Deserialize)]
 #[command(version, about, long_about = None)]
@@ -51,6 +35,11 @@ struct Args {
     /// Address the lnurl server will listen on.
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub address: core::net::SocketAddr,
+
+    /// Address the internal GraphQL subgraph will listen on (Apollo Router
+    /// routes to this port; separate from the public REST/ingress listener).
+    #[arg(long, default_value = "0.0.0.0:8081")]
+    pub graphql_address: core::net::SocketAddr,
 
     #[arg(long, default_value = "lnurl.conf")]
     pub config: PathBuf,
@@ -160,6 +149,20 @@ struct Args {
     /// Expected audience for Blink Core internal-auth JWTs.
     #[arg(long)]
     pub internal_jwt_audience: Option<String>,
+
+    /// URL to fetch the gateway (Oathkeeper) JWKS for the federated GraphQL
+    /// subgraph from at startup. The gateway `id_token` is issuer `galoy.io`
+    /// with no audience claim.
+    #[arg(long)]
+    pub graphql_jwks_url: Option<String>,
+
+    /// Local path to read the gateway JWKS from at startup.
+    #[arg(long)]
+    pub graphql_jwks_path: Option<String>,
+
+    /// Expected issuer for the gateway `id_token` JWTs forwarded to the subgraph.
+    #[arg(long, default_value = "galoy.io")]
+    pub graphql_jwt_issuer: String,
 }
 
 #[derive(Debug)]
@@ -415,6 +418,7 @@ where
     let domains = domains::start(repository.clone()).await?;
 
     let internal_auth = load_internal_auth_state(&args).await;
+    let graphql_auth = load_gateway_auth_state(&args).await;
 
     let ca_cert = args
         .ca_cert
@@ -605,7 +609,7 @@ where
         .route("/webhook", post(LnurlServer::<DB>::webhook))
         .route("/webhook/blink", post(LnurlServer::<DB>::blink_webhook))
         .route("/health", get(|| async { StatusCode::OK }))
-        .layer(Extension(state))
+        .layer(Extension(state.clone()))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -613,6 +617,15 @@ where
                 .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS]),
         )
         .layer(DefaultBodyLimit::max(1_000_000));
+
+    // Federated GraphQL subgraph on its own, non-ingress listener.
+    let graphql_router = graphql::server::router(state.clone(), graphql_auth);
+    let graphql_addr = args.graphql_address;
+    let mut graphql_server = tokio::spawn(async move {
+        if let Err(e) = graphql::server::serve::<DB>(graphql_addr, graphql_router).await {
+            error!("graphql subgraph listener failed: {e}");
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(args.address).await?;
     let server = axum::serve(listener, server_router.into_make_service());
@@ -623,9 +636,19 @@ where
             .expect("failed to create Ctrl+C shutdown signal");
     });
 
-    // Await the server to receive the shutdown signal
-    if let Err(e) = graceful.await {
-        error!("shutdown error: {e}");
+    // Keep both listeners alive until shutdown; if either exits first (e.g. a
+    // bind failure on the GraphQL port), bring the process down loudly instead
+    // of serving with the subgraph silently gone.
+    tokio::select! {
+        res = graceful => {
+            if let Err(e) = res {
+                error!("shutdown error: {e}");
+            }
+            graphql_server.abort();
+        }
+        res = &mut graphql_server => {
+            error!("graphql subgraph listener exited unexpectedly: {res:?}");
+        }
     }
 
     info!("lnurl server stopped");
@@ -672,6 +695,45 @@ async fn load_internal_auth_state(args: &Args) -> Option<Arc<internal_auth::Inte
         Ok(state) => Some(Arc::new(state)),
         Err(e) => {
             error!("failed to parse internal JWKS; /internal fails closed: {e}");
+            None
+        }
+    }
+}
+
+async fn load_gateway_auth_state(args: &Args) -> Option<graphql::auth::GatewayAuthState> {
+    let issuer = args.graphql_jwt_issuer.clone();
+
+    let jwks_json = if let Some(path) = &args.graphql_jwks_path {
+        match std::fs::read_to_string(path) {
+            Ok(jwks) => Some(jwks),
+            Err(e) => {
+                error!("failed to read gateway JWKS from {path}: {e}");
+                None
+            }
+        }
+    } else if let Some(url) = &args.graphql_jwks_url {
+        match reqwest::Client::new().get(url).send().await {
+            Ok(response) => match response.text().await {
+                Ok(jwks) => Some(jwks),
+                Err(e) => {
+                    error!("failed to read gateway JWKS response body from {url}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                error!("failed to fetch gateway JWKS from {url}: {e}");
+                None
+            }
+        }
+    } else {
+        debug!("gateway JWKS source not configured; GraphQL mutation fails closed");
+        None
+    }?;
+
+    match graphql::auth::GatewayAuthState::from_jwks_json(&jwks_json, issuer) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            error!("failed to parse gateway JWKS; GraphQL mutation fails closed: {e}");
             None
         }
     }

@@ -1,0 +1,119 @@
+type AccountIdentifier {
+	"""
+	Whether a Blink account exists for the given username.
+	"""
+	exists: Boolean!
+	"""
+	The backing provider of the account (blink or spark). Null when the
+	account does not exist.
+	"""
+	provider: AccountProvider
+}
+
+enum AccountProvider {
+	BLINK
+	SPARK
+}
+
+"""
+Application error surfaced in a mutation payload (mirrors the shape clients
+expect from the blinkbitcoin/blink#767 reference without sharing the core
+subgraph's `Error` interface).
+"""
+type LnAddressErrorObject {
+	code: String
+	message: String!
+}
+
+type LnAddressInvoice {
+	paymentHash: PaymentHash!
+	"""
+	BOLT-11 payment request to be paid to the lightning address.
+	"""
+	paymentRequest: LnPaymentRequest!
+	"""
+	LUD-21 verify url. Prefer the `lnAddressInvoicePaymentStatus` query with
+	the paymentHash to check settlement.
+	"""
+	verify: String!
+}
+
+input LnAddressInvoiceCreateInput {
+	"""
+	Blink lightning address to create an invoice for (user@domain).
+	"""
+	lnAddress: String!
+	"""
+	Amount in satoshis.
+	"""
+	amount: SatAmount!
+}
+
+type LnAddressInvoicePayload {
+	errors: [LnAddressErrorObject!]!
+	invoice: LnAddressInvoice
+}
+
+type LnAddressInvoicePaymentStatus {
+	"""
+	Whether the invoice has been paid.
+	"""
+	settled: Boolean!
+	"""
+	Payment preimage, present once the invoice is settled.
+	"""
+	preimage: LnPaymentPreImage
+}
+
+input LnAddressInvoicePaymentStatusInput {
+	"""
+	Payment hash of the invoice created via `lnAddressInvoiceCreate`.
+	"""
+	paymentHash: PaymentHash!
+}
+
+scalar LnPaymentPreImage
+
+scalar LnPaymentRequest
+
+type Mutation {
+	"""
+	Returns a lightning invoice for a Blink lightning address. Works for
+	both custodial and non-custodial (Spark) recipients. Requires an
+	authenticated session or an API/OAuth token with `receive` or `write`.
+	"""
+	lnAddressInvoiceCreate(input: LnAddressInvoiceCreateInput!): LnAddressInvoicePayload!
+}
+
+scalar PaymentHash
+
+type Query {
+	"""
+	Settlement status of an invoice created via `lnAddressInvoiceCreate`.
+	Blink recipients settle-on-read; Spark recipients read-from-store
+	(settlement is SSP-webhook-driven). Available on the signed anonymous
+	gateway path.
+	"""
+	lnAddressInvoicePaymentStatus(input: LnAddressInvoicePaymentStatusInput!): LnAddressInvoicePaymentStatus!
+	"""
+	Resolve a Blink lightning address username to `{ exists, provider }`.
+	"""
+	accountIdentifier(username: Username!): AccountIdentifier!
+}
+
+scalar SatAmount
+
+scalar Username
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+extend schema @link(
+	url: "https://specs.apollo.dev/federation/v2.3",
+	import: ["@key", "@tag", "@shareable", "@inaccessible", "@override", "@external", "@provides", "@requires", "@composeDirective", "@interfaceObject"]
+)

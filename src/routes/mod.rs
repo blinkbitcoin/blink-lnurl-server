@@ -7,6 +7,10 @@ mod webhook;
 mod zap;
 #[allow(unused_imports)]
 pub use lnurl_pay::{LnurlPayCallbackParams, PayResponse, Tag};
+pub(crate) use lnurl_pay::{
+    invoice_settlement_status, metadata_for_recipient, resolve_min_sendable_for_recipient,
+    verify_url_for,
+};
 use std::marker::PhantomData;
 #[cfg(test)]
 #[allow(unused_imports)]
