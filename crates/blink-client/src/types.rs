@@ -28,6 +28,9 @@ pub struct CreateInvoiceRequest<'a> {
     pub wallet_id: &'a str,
     pub amount_sat: u64,
     pub description_hash_hex: Option<String>,
+    /// Invoice memo. Blink stores this outside the BOLT11, so it survives even
+    /// when `description_hash_hex` owns the payment request's description field.
+    pub memo: Option<&'a str>,
     pub expires_in_minutes: Option<u32>,
     pub webhook_url: Option<&'a str>,
 }

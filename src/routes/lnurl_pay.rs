@@ -362,6 +362,16 @@ where
             return Err(lnurl_error("comment too long"));
         }
 
+        // The LUD-12 comment is also sent as the invoice memo. The BOLT11 carries only
+        // the description hash, so the provider-stored memo is the sole place the text
+        // survives into the recipient's transaction history -- for both external
+        // Lightning settlement and Blink-internal intraledger settlement.
+        let sender_comment = params
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty());
+
         let nostr_pubkey = state
             .nostr_keys
             .as_ref()
@@ -420,6 +430,7 @@ where
                 wallet: public_recipient.wallet,
                 amount_sat: amount_msat / 1000,
                 description_hash: desc_hash.to_byte_array(),
+                memo: sender_comment,
                 expiry,
                 include_spark_address: state.include_spark_address,
             })
@@ -491,23 +502,20 @@ where
             }
         }
 
-        if let Some(comment) = params.comment {
-            let comment = comment.trim();
-            if !comment.is_empty()
-                && let Err(e) = state
-                    .db
-                    .insert_lnurl_sender_comment(&LnurlSenderComment {
-                        account_id: Some(account_id.clone()),
-                        comment: comment.to_string(),
-                        payment_hash: payment_hash.clone(),
-                        user_pubkey: legacy_user_pubkey.clone(),
-                        updated_at,
-                    })
-                    .await
-            {
-                error!("Failed to insert lnurl sender comment: {:?}", e);
-                return Err(lnurl_error("internal server error"));
-            }
+        if let Some(comment) = sender_comment
+            && let Err(e) = state
+                .db
+                .insert_lnurl_sender_comment(&LnurlSenderComment {
+                    account_id: Some(account_id.clone()),
+                    comment: comment.to_string(),
+                    payment_hash: payment_hash.clone(),
+                    user_pubkey: legacy_user_pubkey.clone(),
+                    updated_at,
+                })
+                .await
+        {
+            error!("Failed to insert lnurl sender comment: {:?}", e);
+            return Err(lnurl_error("internal server error"));
         }
 
         // Store invoice for LUD-21 verify support and webhook delivery
@@ -1668,6 +1676,70 @@ mod tests {
             body["variables"]["input"]["webhookUrl"],
             "http://127.0.0.1/webhook/blink"
         );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_sends_lud12_comment_as_invoice_memo() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(94);
+        let (endpoint, _calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let _ = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(21_000),
+                comment: Some("  till 3  ".to_string()),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("commented invoice must be created");
+
+        let body = bodies
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("provider body captured");
+        // Trimmed, and sent alongside descriptionHash rather than instead of it. Without
+        // this the comment reaches neither an external nor an intraledger recipient,
+        // because the BOLT11 carries only the hash.
+        assert_eq!(body["variables"]["input"]["memo"], "till 3");
+        assert!(
+            body["variables"]["input"]["descriptionHash"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_omits_memo_for_blank_comment() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(95);
+        let (endpoint, _calls, bodies) = start_blink_invoice_mock_server(bolt11, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+        let _ = get_public_invoice(
+            state,
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(21_000),
+                comment: Some("   ".to_string()),
+                ..LnurlPayCallbackParams::default()
+            },
+        )
+        .await
+        .expect("blank comment must not block invoice creation");
+
+        let body = bodies
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("provider body captured");
+        assert!(body["variables"]["input"].get("memo").is_none());
     }
 
     #[tokio::test]

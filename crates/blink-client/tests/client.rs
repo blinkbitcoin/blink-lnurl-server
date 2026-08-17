@@ -11,6 +11,7 @@ fn invoice_request(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
         wallet_id,
         amount_sat: 21_000,
         description_hash_hex: Some("f".repeat(64)),
+        memo: None,
         expires_in_minutes: Some(30),
         webhook_url: Some("https://lnurl.example/webhook/blink"),
     }
@@ -21,6 +22,7 @@ fn invoice_request_without_webhook(wallet_id: &'static str) -> CreateInvoiceRequ
         wallet_id,
         amount_sat: 21_000,
         description_hash_hex: Some("f".repeat(64)),
+        memo: None,
         expires_in_minutes: Some(30),
         webhook_url: None,
     }
@@ -176,6 +178,80 @@ async fn creates_btc_invoice_with_selected_wallet() {
             payment_hash: "hash123".to_string(),
         }
     );
+}
+
+#[tokio::test]
+async fn serializes_memo_into_invoice_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+                return false;
+            };
+            body.pointer("/variables/input/memo")
+                .and_then(Value::as_str)
+                == Some("till 3")
+                && body
+                    .pointer("/variables/input/descriptionHash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| hash.len() == 64)
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoiceCreateOnBehalfOfRecipient": {
+                    "invoice": {
+                        "paymentRequest": "lnbc1mocked",
+                        "paymentHash": "hash123"
+                    },
+                    "errors": []
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    let mut request = invoice_request("btc-wallet-id");
+    request.memo = Some("till 3");
+    client
+        .create_btc_invoice(request)
+        .await
+        .expect("memo must be accepted alongside descriptionHash");
+}
+
+#[tokio::test]
+async fn omits_memo_key_when_not_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(|request: &Request| {
+            let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+                return false;
+            };
+            body.pointer("/variables/input/memo").is_none()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "lnInvoiceCreateOnBehalfOfRecipient": {
+                    "invoice": {
+                        "paymentRequest": "lnbc1mocked",
+                        "paymentHash": "hash123"
+                    },
+                    "errors": []
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+    client
+        .create_btc_invoice(invoice_request("btc-wallet-id"))
+        .await
+        .expect("absent memo must omit the key entirely");
 }
 
 #[tokio::test]
