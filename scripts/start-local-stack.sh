@@ -78,7 +78,7 @@ if [ "${RESET_DB}" = "true" ]; then
   docker compose down --volumes --remove-orphans
 fi
 
-docker compose up -d postgres
+docker compose up -d postgres otel-agent
 if ! wait_for_postgres; then
   echo "postgres did not become ready" >&2
   exit 1
@@ -108,6 +108,9 @@ fi
 
 LNURL_SSP_AUTH_SEED="${LNURL_SSP_AUTH_SEED:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   DEPLOYMENT_ENV="${EFFECTIVE_DEPLOYMENT_ENV}" \
+  OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-blink-lnurl-server-dev}" \
+  OTEL_TRACES_EXPORTER="${OTEL_TRACES_EXPORTER:-}" \
+  OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
   "${LNURL_BIN}" \
     --address "${BIND_ADDR}" \
     --auto-migrate \

@@ -14,7 +14,7 @@ test-rust:
 	env -u LNURL_TEST_POSTGRES_URL cargo test --locked
 
 start-deps:
-	docker compose up -d postgres
+	docker compose up -d postgres otel-agent
 
 stop-deps:
 	docker compose down --remove-orphans
@@ -26,7 +26,7 @@ start:
 
 test-e2e:
 	cargo build --locked --bin lnurl-server --bin e2e_auth --bin blink_graphql_mock --bin e2e_zap_request
-	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} bats --abort -t bats
+	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} bats -t bats
 
 e2e: test-e2e
 

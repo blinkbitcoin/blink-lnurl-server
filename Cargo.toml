@@ -33,9 +33,13 @@ spark-client = { path = "crates/spark-client" }
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "signal"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+opentelemetry = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = "0.32.1"
 x509-parser = { version = "0.18.0", features = ["verify"] }
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 
