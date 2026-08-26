@@ -86,6 +86,13 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub blink_enabled: bool,
 
+    /// Let Anon-mode accounts register Lightning Addresses and receive payments.
+    /// Upstream refuses both while an account is Anon (the address goes dormant);
+    /// deployments that want an anon-friendly server — no country evidence is ever
+    /// recorded for Anon either way — can lift the dormancy with this flag.
+    #[arg(long, default_value_t = false)]
+    pub allow_anon_addresses: bool,
+
     /// Scheme prefix for lnurl urls.
     #[arg(long, default_value = "https")]
     pub scheme: String,
@@ -557,6 +564,7 @@ where
         country_lookup_budget,
         scheme: args.scheme,
         callback_domain: args.callback_domain,
+        allow_anon_addresses: args.allow_anon_addresses,
         min_sendable: args.min_sendable,
         max_sendable: args.max_sendable,
         include_spark_address: {
@@ -619,6 +627,14 @@ where
         )
         .route("/lnurlpay/{pubkey}/mode", post(LnurlServer::<DB>::set_mode))
         .route(
+            "/lnurlpay/{pubkey}/grant",
+            post(LnurlServer::<DB>::grant_delegated_key),
+        )
+        .route(
+            "/lnurlpay/{pubkey}/grant/{delegated_pubkey}",
+            delete(LnurlServer::<DB>::revoke_delegated_key),
+        )
+        .route(
             "/lnurlpay/{pubkey}/metadata",
             get(LnurlServer::<DB>::list_metadata),
         )
@@ -653,6 +669,10 @@ where
         .route(
             "/lnurlp/{identifier}/invoice",
             get(LnurlServer::<DB>::handle_invoice),
+        )
+        .route(
+            "/lnurlp/{identifier}/invoice/signed",
+            post(LnurlServer::<DB>::handle_signed_invoice),
         )
         .route("/verify/{payment_hash}", get(LnurlServer::<DB>::verify))
         .route("/webhook", post(LnurlServer::<DB>::webhook))

@@ -5,7 +5,7 @@ use axum::{
 };
 use axum_extra::extract::Host;
 use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
 
@@ -16,16 +16,17 @@ use crate::{
     },
     models::{
         ERROR_ENHANCED_MODE_REQUIRED, ERROR_INVALID_MODE, ERROR_MODE_REQUEST_NOT_NEWER,
-        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, ListMetadataRequest,
-        ListMetadataResponse, RecoverLnurlPayRequest, RecoverLnurlPayResponse,
-        RegisterLnurlPayRequest, RegisterLnurlPayResponse, SetLnurlPayModeRequest,
+        ERROR_MODE_TIMESTAMP_IN_FUTURE, ERROR_RATE_LIMITED, GrantDelegatedKeyRequest,
+        GrantDelegatedKeyResponse, ListMetadataRequest, ListMetadataResponse,
+        RecoverLnurlPayRequest, RecoverLnurlPayResponse, RegisterLnurlPayRequest,
+        RegisterLnurlPayResponse, RevokeDelegatedKeyParams, SetLnurlPayModeRequest,
         SetLnurlPayModeResponse, TransferLnurlPayRequest, TransferLnurlPayResponse,
         UnregisterLnurlPayRequest, sanitize_username,
     },
     repository::{
         AccountIdentifierKind, AccountMode, AccountProvider, IdentifierTransfer, LnurlRepository,
-        LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
-        SparkModeUpdate, WalletKind,
+        LnurlRepositoryError, NewAccountIdentifier, NewDelegatedGrant, NewSparkRegistration,
+        ResolvedRecipient, SparkModeUpdate, WalletKind,
     },
     state::State,
     time::now_u64,
@@ -34,6 +35,13 @@ use crate::{
 use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
+
+fn internal_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(Value::String("internal server error".into())),
+    )
+}
 
 // Bounds how far ahead of the stored anchor an accepted mode request can sit,
 // which bounds the cross-device lockout after a fast-clock request.
@@ -68,7 +76,9 @@ where
         let domain = sanitize_domain(&state, &host).await?;
 
         let stored_mode = stored_account_mode(&state, &pubkey.to_string()).await?;
-        if stored_mode == Some(AccountMode::Anon) {
+        // Upstream dormancy: an Anon account holds no registrable address. A deployment
+        // running with --allow-anon-addresses lifts this (fork-only; see Args).
+        if !state.allow_anon_addresses && stored_mode == Some(AccountMode::Anon) {
             return Err(enhanced_mode_required());
         }
 
@@ -132,7 +142,11 @@ where
         let from_pubkey = from_pk.to_string();
         let to_pubkey = to_pk.to_string();
 
-        if stored_account_mode(&state, &to_pubkey).await? == Some(AccountMode::Anon) {
+        // Same dormancy rule as registration, applied to the transfer's target account
+        // (fork: lifted by --allow-anon-addresses).
+        if !state.allow_anon_addresses
+            && stored_account_mode(&state, &to_pubkey).await? == Some(AccountMode::Anon)
+        {
             return Err(enhanced_mode_required());
         }
 
@@ -338,6 +352,177 @@ where
         Ok(Json(SetLnurlPayModeResponse {
             mode: mode.as_str().to_string(),
         }))
+    }
+
+    /// D2 (blink-wip#1158): authorize an auxiliary secp256k1 key to request
+    /// invoices on this account's behalf. The owner signs
+    /// `"grant:{delegated_pubkey}:{expiry_secs}"`; expiry caps at one year
+    /// and the grant is revocable at any time. Grants confer invoice-request
+    /// authority only — never spend authority.
+    pub async fn grant_delegated_key(
+        Path(pubkey): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
+        Json(payload): Json<GrantDelegatedKeyRequest>,
+    ) -> Result<Json<GrantDelegatedKeyResponse>, (StatusCode, Json<Value>)> {
+        const MAX_GRANT_EXPIRY_SECS: u64 = 365 * 24 * 3600;
+
+        require_spark_provider_enabled(&state)?;
+
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+
+        let delegated = parse_pubkey(&payload.delegated_pubkey).map_err(|_| {
+            trace!("grant: invalid delegated pubkey");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid pubkey".into())),
+            )
+        })?;
+        if delegated.to_string()
+            == parse_pubkey(&pubkey)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(Value::String("invalid pubkey".into())),
+                    )
+                })?
+                .to_string()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("cannot delegate to the identity key".into())),
+            ));
+        }
+
+        let now = now_u64();
+        if payload.expiry_secs == 0 || payload.expiry_secs > MAX_GRANT_EXPIRY_SECS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid expiry".into())),
+            ));
+        }
+
+        let message = format!("grant:{}:{}", payload.delegated_pubkey, payload.expiry_secs);
+        let owner = validate(
+            &pubkey,
+            &payload.signature,
+            &message,
+            payload.timestamp,
+            &state,
+        )
+        .await?;
+
+        // The granting key must belong to a registered Spark account.
+        let account = state
+            .db
+            .get_account_by_spark_pubkey(&owner.to_string())
+            .await
+            .map_err(|_| internal_error())?;
+        let Some(account) = account else {
+            return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
+        };
+        if account.provider != AccountProvider::Spark {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String(SPARK_PROVIDER_DISABLED_MESSAGE.into())),
+            ));
+        }
+
+        let expires_at =
+            i64::try_from(now.saturating_add(payload.expiry_secs)).map_err(|_| internal_error())?;
+        let grant = state
+            .db
+            .upsert_delegated_grant(&NewDelegatedGrant {
+                delegated_pubkey: delegated.to_string(),
+                account_id: account.account_id.clone(),
+                owner_pubkey: owner.to_string(),
+                created_at: i64::try_from(now).unwrap_or_default(),
+                expires_at,
+            })
+            .await
+            .map_err(|e| match e {
+                LnurlRepositoryError::DelegatedGrantConflict => (
+                    StatusCode::CONFLICT,
+                    Json(Value::String(
+                        "delegated key already granted by a different account".into(),
+                    )),
+                ),
+                e => {
+                    error!("failed to store delegated grant: {e:?}");
+                    internal_error()
+                }
+            })?;
+
+        debug!(
+            "granted invoice authority for account {} to {} until {}",
+            grant.account_id, grant.delegated_pubkey, grant.expires_at
+        );
+        Ok(Json(GrantDelegatedKeyResponse {
+            delegated_pubkey: grant.delegated_pubkey,
+            expires_at: grant.expires_at,
+        }))
+    }
+
+    /// D2: revoke a previously granted auxiliary key. The owner signs
+    /// `"revoke:{delegated_pubkey}"`.
+    pub async fn revoke_delegated_key(
+        Path((pubkey, delegated_pubkey)): Path<(String, String)>,
+        Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
+        Query(params): Query<RevokeDelegatedKeyParams>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        require_spark_provider_enabled(&state)?;
+
+        let request_ip = client_ip(&headers);
+        if !state.ip_rate_limiter.check(request_ip) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(Value::String(ERROR_RATE_LIMITED.into())),
+            ));
+        }
+        if parse_pubkey(&delegated_pubkey).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(Value::String("invalid pubkey".into())),
+            ));
+        }
+        // Grants are stored under the normalized (compressed) pubkey form;
+        // the lookup must normalize too or a non-compressed encoding of the
+        // same key would silently match nothing.
+        let delegated_normalized = parse_pubkey(&delegated_pubkey)?.to_string();
+
+        let message = format!("revoke:{delegated_pubkey}");
+        let owner = validate(
+            &pubkey,
+            &params.signature,
+            &message,
+            params.timestamp,
+            &state,
+        )
+        .await?;
+
+        let now = now_u64();
+        let revoked = state
+            .db
+            .revoke_delegated_grant(
+                &owner.to_string(),
+                &delegated_normalized,
+                i64::try_from(now).unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| {
+                error!("failed to revoke delegated grant: {e:?}");
+                internal_error()
+            })?;
+
+        debug!("revoked delegated key {delegated_pubkey}: found={revoked}");
+        Ok(Json(json!({ "revoked": revoked })))
     }
 
     pub async fn list_metadata(
@@ -774,7 +959,8 @@ pub(super) fn spark_transfer_error(
         | LnurlRepositoryError::InvalidOwnership
         | LnurlRepositoryError::InvalidProvider
         | LnurlRepositoryError::InvalidIdentifierKind
-        | LnurlRepositoryError::InvalidAccountMode => {
+        | LnurlRepositoryError::InvalidAccountMode
+        | LnurlRepositoryError::DelegatedGrantConflict => {
             error!("unexpected provider-neutral transfer error: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -866,7 +1052,7 @@ mod tests {
     use crate::invoice_paid::create_provider_invoice_for_account;
     use crate::routes::test_support::*;
     use lightning_invoice::Bolt11Invoice;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::str::FromStr;
 
     fn assert_spark_provider_disabled(result: Result<impl Sized, (StatusCode, Json<Value>)>) {
@@ -2013,6 +2199,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_is_allowed_while_anon_when_allow_anon_addresses_is_set() {
+        let (secret, pubkey) = mode_key(18);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let mut state =
+            route_test_state_with_country_resolver(repo.clone(), CountryResolver::disabled()).await;
+        state.allow_anon_addresses = true;
+        let timestamp = now_u64();
+
+        let request = RegisterLnurlPayRequest {
+            username: "alice".to_string(),
+            signature: sign_hex(&secret, &format!("alice-{timestamp}")),
+            timestamp,
+            description: "Alice".to_string(),
+        };
+        let _ = LnurlServer::register(
+            Host("example.com".to_string()),
+            Path(pubkey.clone()),
+            Extension(state),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .expect("the flag lifts the anon registration refusal");
+        assert_eq!(repo.spark_registration_count(), 1);
+        // The privacy property is untouched: registration must not re-type the account.
+        assert_eq!(
+            repo.spark_mode(&pubkey).unwrap().mode,
+            Some(AccountMode::Anon)
+        );
+    }
+
+    #[tokio::test]
     async fn register_refreshes_country_evidence_only_while_enhanced() {
         let (secret, pubkey) = mode_key(19);
         let (base_url, calls) = start_country_mock("CO").await;
@@ -2234,5 +2452,52 @@ mod tests {
         assert_eq!(record.mode, Some(AccountMode::Enhanced));
         assert_eq!(record.mode_source, Some(ModeSource::Migration));
         assert!(record.country.is_none());
+    }
+
+    // -- D2 delegated-grant ownership (blink-wip#1158) ----------------------
+
+    fn new_grant(delegated: &str, owner: &str) -> NewDelegatedGrant {
+        NewDelegatedGrant {
+            delegated_pubkey: delegated.to_string(),
+            account_id: format!("acct_of_{owner}"),
+            owner_pubkey: owner.to_string(),
+            created_at: 1_700_000_000,
+            expires_at: 1_800_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_upsert_allows_the_same_owner_to_rotate() {
+        let repo = MockRepository::default();
+        repo.upsert_delegated_grant(&new_grant("02aa", "owner_a"))
+            .await
+            .expect("initial grant");
+        let rotated = repo
+            .upsert_delegated_grant(&new_grant("02aa", "owner_a"))
+            .await
+            .expect("same-owner re-grant is a rotation, not a conflict");
+        assert_eq!(rotated.owner_pubkey, "owner_a");
+    }
+
+    #[tokio::test]
+    async fn grant_upsert_rejects_rebinding_to_a_different_owner() {
+        let repo = MockRepository::default();
+        repo.upsert_delegated_grant(&new_grant("02bb", "owner_a"))
+            .await
+            .expect("initial grant");
+        let hijack = repo
+            .upsert_delegated_grant(&new_grant("02bb", "owner_b"))
+            .await;
+        assert!(
+            matches!(hijack, Err(LnurlRepositoryError::DelegatedGrantConflict)),
+            "a different owner must not rebind the delegated key: {hijack:?}"
+        );
+        // and the original binding is untouched
+        let row = repo
+            .get_delegated_grant("acct_of_owner_a", "02bb")
+            .await
+            .expect("lookup")
+            .expect("row still bound to the original account");
+        assert_eq!(row.owner_pubkey, "owner_a");
     }
 }

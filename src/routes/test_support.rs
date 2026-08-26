@@ -70,6 +70,8 @@ pub(crate) struct MockRepository {
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
     pub(super) spark_modes: std::sync::Arc<Mutex<HashMap<String, SparkAccountMode>>>,
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
+    pub(super) delegated_grants:
+        std::sync::Arc<Mutex<HashMap<String, crate::repository::DelegatedGrant>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +156,64 @@ pub(super) fn empty_spark_mode_record(pubkey: &str) -> SparkAccountMode {
 
 #[async_trait::async_trait]
 impl LnurlRepository for MockRepository {
+    async fn upsert_delegated_grant(
+        &self,
+        grant: &crate::repository::NewDelegatedGrant,
+    ) -> Result<crate::repository::DelegatedGrant, LnurlRepositoryError> {
+        if let Some(existing) = self
+            .delegated_grants
+            .lock()
+            .unwrap()
+            .get(&grant.delegated_pubkey)
+            && existing.owner_pubkey != grant.owner_pubkey
+        {
+            return Err(LnurlRepositoryError::DelegatedGrantConflict);
+        }
+        let record = crate::repository::DelegatedGrant {
+            delegated_pubkey: grant.delegated_pubkey.clone(),
+            account_id: grant.account_id.clone(),
+            owner_pubkey: grant.owner_pubkey.clone(),
+            created_at: grant.created_at,
+            expires_at: grant.expires_at,
+            revoked_at: None,
+        };
+        self.delegated_grants
+            .lock()
+            .unwrap()
+            .insert(grant.delegated_pubkey.clone(), record.clone());
+        Ok(record)
+    }
+
+    async fn revoke_delegated_grant(
+        &self,
+        owner_pubkey: &str,
+        delegated_pubkey: &str,
+        revoked_at_secs: i64,
+    ) -> Result<bool, LnurlRepositoryError> {
+        let mut grants = self.delegated_grants.lock().unwrap();
+        match grants.get_mut(delegated_pubkey) {
+            Some(g) if g.owner_pubkey == owner_pubkey && g.revoked_at.is_none() => {
+                g.revoked_at = Some(revoked_at_secs);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn get_delegated_grant(
+        &self,
+        account_id: &str,
+        delegated_pubkey: &str,
+    ) -> Result<Option<crate::repository::DelegatedGrant>, LnurlRepositoryError> {
+        Ok(self
+            .delegated_grants
+            .lock()
+            .unwrap()
+            .get(delegated_pubkey)
+            .filter(|g| g.account_id == account_id)
+            .cloned())
+    }
+
     async fn get_spark_username_by_name(
         &self,
         _: &str,
@@ -708,6 +768,8 @@ pub(super) async fn internal_route_test_state_full(
         )),
         scheme: "http".to_string(),
         callback_domain: None,
+        // Tests flip this field directly (pub) for the flag-on variants.
+        allow_anon_addresses: false,
         min_sendable: 1_000,
         max_sendable: 4_000_000_000,
         include_spark_address: false,

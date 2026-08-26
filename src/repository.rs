@@ -31,6 +31,8 @@ pub enum LnurlRepositoryError {
     InvalidAccountMode,
     #[error("mode request is not newer than the last accepted one")]
     StaleModeTimestamp,
+    #[error("delegated key is already granted by a different account")]
+    DelegatedGrantConflict,
     #[error("database error: {0}")]
     General(anyhow::Error),
 }
@@ -372,6 +374,38 @@ pub struct PendingZapReceipt {
     pub next_retry_at: i64,
 }
 
+/// D2 delegated receive grant (blink-wip#1158): binds an auxiliary
+/// secp256k1 key to a Spark account so it can sign invoice requests
+/// (including description-hash invoices) without holding the account's
+/// identity key. Grants expire and are revocable; they never confer
+/// spend authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedGrant {
+    pub delegated_pubkey: String,
+    pub account_id: String,
+    pub owner_pubkey: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+impl DelegatedGrant {
+    /// A grant authorizes invoice requests only while unrevoked and
+    /// unexpired. Timestamps are unix seconds.
+    pub fn active_at(&self, now_secs: i64) -> bool {
+        self.revoked_at.is_none() && self.expires_at > now_secs
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDelegatedGrant {
+    pub delegated_pubkey: String,
+    pub account_id: String,
+    pub owner_pubkey: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 #[async_trait::async_trait]
 pub trait LnurlRepository {
     async fn get_spark_username_by_name(
@@ -490,6 +524,41 @@ pub trait LnurlRepository {
     }
 
     async fn upsert_zap(&self, zap: &Zap) -> Result<(), LnurlRepositoryError>;
+
+    /// D2: insert or replace a delegated receive grant. Replacement is
+    /// owner-signed so rotating/expiring grants is the owner's choice.
+    /// Returns [`LnurlRepositoryError::DelegatedGrantConflict`] when the
+    /// delegated key is already bound to a *different* owner: without that
+    /// guard any registered account could rebind (and thereby disable)
+    /// another account's grant, since the delegated pubkey is the PK.
+    async fn upsert_delegated_grant(
+        &self,
+        _grant: &NewDelegatedGrant,
+    ) -> Result<DelegatedGrant, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// D2: mark a grant revoked. Returns whether an active row owned by
+    /// `owner_pubkey` was found and revoked.
+    async fn revoke_delegated_grant(
+        &self,
+        _owner_pubkey: &str,
+        _delegated_pubkey: &str,
+        _revoked_at_secs: i64,
+    ) -> Result<bool, LnurlRepositoryError> {
+        Err(provider_neutral_not_implemented())
+    }
+
+    /// D2: fetch the grant binding `delegated_pubkey` to `account_id`, if one
+    /// exists; callers decide activeness via [`DelegatedGrant::active_at`].
+    async fn get_delegated_grant(
+        &self,
+        _account_id: &str,
+        _delegated_pubkey: &str,
+    ) -> Result<Option<DelegatedGrant>, LnurlRepositoryError> {
+        Ok(None)
+    }
+
     async fn get_zap_by_payment_hash(
         &self,
         payment_hash: &str,

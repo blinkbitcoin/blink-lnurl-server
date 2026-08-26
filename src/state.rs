@@ -18,6 +18,10 @@ pub struct State<DB> {
     pub country_lookup_budget: Arc<GlobalBudget>,
     pub scheme: String,
     pub callback_domain: Option<String>,
+    /// Upstream refuses Lightning Address registration and invoice minting while an
+    /// account is Anon (dormant address). When this is set, Anon accounts may register
+    /// and receive — the no-country-evidence promise is untouched.
+    pub allow_anon_addresses: bool,
     pub min_sendable: u64,
     pub max_sendable: u64,
     pub include_spark_address: bool,
@@ -45,6 +49,7 @@ where
             country_lookup_budget: Arc::clone(&self.country_lookup_budget),
             scheme: self.scheme.clone(),
             callback_domain: self.callback_domain.clone(),
+            allow_anon_addresses: self.allow_anon_addresses,
             min_sendable: self.min_sendable,
             max_sendable: self.max_sendable,
             include_spark_address: self.include_spark_address,
