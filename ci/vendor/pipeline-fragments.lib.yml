@@ -52,26 +52,12 @@ source:
 
 #@ def slack_failure_notification():
 #@ fail_url = "<$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME| :face_with_symbols_on_mouth: $BUILD_JOB_NAME> failed!"
-#@ if not data.values.disable_notifications:
 put: slack
 params:
   channel:  #@ data.values.slack_channel
   username: concourse
   icon_url: https://cl.ly/2F421Y300u07/concourse-logo-blue-transparent.png
   text:    #@ fail_url
-#@ else:
-task: notification
-config:
-  platform: linux
-  image_resource:
-    type: registry-image
-    source:
-      repository: busybox
-  run:
-    path: echo
-    args:
-    - #@ "=== SLACK NOTIFICATIONS DISABLED === Skipping failure notification"
-#@ end
 #@ end
 
 #@ def check_code():
