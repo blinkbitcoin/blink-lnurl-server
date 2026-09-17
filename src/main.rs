@@ -120,6 +120,13 @@ struct Args {
     #[arg(long)]
     pub nsec: Option<String>,
 
+    /// JSON object of statically-served NIP-05 names mapping local-part to
+    /// lowercase hex nostr pubkey, e.g. `{"_":"8fe5...","team":"4ffb..."}`.
+    /// Served before the dynamic registry; use for the domain root `_` and
+    /// official accounts. Invalid keys or values abort startup.
+    #[arg(long)]
+    pub nostr_static_names: Option<String>,
+
     /// Base64 encoded DER format CA certificate without begin/end certificate markers.
     /// If set, the server will use this certificate to validate api keys.
     #[arg(long)]
@@ -176,6 +183,12 @@ struct Args {
     /// per minute.
     #[arg(long, default_value = "10")]
     pub mode_requests_per_ip_per_minute: u32,
+
+    /// Maximum public NIP-05 nostr.json lookups accepted per client IP per
+    /// minute. Verification traffic is read-only and cheap, so this budget is
+    /// deliberately generous and independent of the signed-request budget.
+    #[arg(long, default_value = "60")]
+    pub nostr_json_requests_per_ip_per_minute: u32,
 
     /// Daily cap on country lookups across all client IPs. Over budget, mode
     /// writes still succeed and stored evidence stops refreshing.
@@ -332,6 +345,32 @@ fn build_blink_webhook_url(args: &Args) -> Result<String, anyhow::Error> {
     ))
 }
 
+/// Parse and validate the static NIP-05 overlay config: a JSON object of
+/// `local-part -> lowercase hex nostr pubkey`. Names must use the NIP-05
+/// local-part charset; values must be 64-char lowercase hex. Fail fast on
+/// bad config — a typo'd overlay must never take down verification at
+/// runtime.
+fn parse_nostr_static_names(
+    raw: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let Some(raw) = raw else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let parsed: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(raw).map_err(|e| anyhow!("invalid nostr_static_names JSON: {e:?}"))?;
+    for (name, pubkey) in &parsed {
+        if !routes::nostr::is_valid_nip05_local_part(name)
+            || !routes::nostr::is_canonical_nostr_pubkey(pubkey)
+        {
+            return Err(anyhow!(
+                "invalid nostr_static_names entry '{name}': names must match the NIP-05 \
+                 local-part charset and pubkeys must be 64-char lowercase hex"
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
 fn resolve_runtime_config(
     deployment_env: Option<&str>,
     configured_spark_network: Option<spark_client::Network>,
@@ -479,9 +518,10 @@ where
         })
         .transpose()?;
 
+    let nostr_static_names = parse_nostr_static_names(args.nostr_static_names.as_deref())?;
+
     // Create watch channel for triggering background processing
     let (invoice_paid_trigger, invoice_paid_rx) = watch::channel(());
-
     // Create a shared HTTP client for webhook delivery. reqwest's default pool
     // settings keep connections warm and HTTP/2 multiplexes requests per host.
     let http_client = reqwest::Client::new();
@@ -541,6 +581,16 @@ where
         RATE_LIMIT_TRACKED_IPS,
         runtime_config.local_env,
     ));
+    let nostr_json_rate_limiter = Arc::new(rate_limit::PerIpRateLimiter::new(
+        args.nostr_json_requests_per_ip_per_minute,
+        std::time::Duration::from_mins(1),
+        RATE_LIMIT_TRACKED_IPS,
+        // Same trusted-header posture as the signed-request limiter (review
+        // M2): production rejects requests without a trusted client-IP header
+        // (direct-to-origin traffic or a misconfigured edge gets no unlimited
+        // DB-backed lookups); local/dev stays permissive for shell testing.
+        runtime_config.local_env,
+    ));
 
     let country_lookup_budget = Arc::new(rate_limit::GlobalBudget::new(
         args.country_lookups_per_day,
@@ -571,6 +621,8 @@ where
         },
         domains,
         nostr_keys,
+        nostr_static_names: Arc::new(nostr_static_names),
+        nostr_json_rate_limiter,
         ca_cert,
         crl_url: args.crl_url,
         crl,
@@ -627,6 +679,10 @@ where
             post(LnurlServer::<DB>::publish_zap_receipt),
         )
         .route(
+            "/lnurlpay/{pubkey}/nostr",
+            post(LnurlServer::<DB>::register_nostr),
+        )
+        .route(
             "/lnurlpay/{pubkey}/invoice-paid",
             post(LnurlServer::<DB>::invoice_paid),
         )
@@ -641,6 +697,14 @@ where
         .route(
             "/.well-known/lnurlp/{identifier}",
             get(LnurlServer::<DB>::handle_lnurl_pay),
+        )
+        .route(
+            "/.well-known/nostr.json",
+            get(LnurlServer::<DB>::handle_nostr_json),
+        )
+        .route(
+            "/nostr/blink",
+            post(LnurlServer::<DB>::register_nostr_blink),
         )
         .route(
             "/lnurlp/{identifier}",
@@ -764,8 +828,37 @@ fn register_webhook(spark_client: spark_client::Client, webhook_url: String, sec
 mod tests {
     use super::*;
 
+    const NOSTR_HEX: &str = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
+
     fn default_args() -> Args {
         Args::parse_from(["lnurl-server"])
+    }
+
+    #[test]
+    fn nostr_static_names_parses_valid_overlay() {
+        let raw = format!(r#"{{"_":"{NOSTR_HEX}","team":"{NOSTR_HEX}"}}"#);
+        let parsed = parse_nostr_static_names(Some(&raw)).expect("valid overlay parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["_"], NOSTR_HEX);
+    }
+
+    #[test]
+    fn nostr_static_names_rejects_invalid_entries_and_json() {
+        assert!(parse_nostr_static_names(Some("not json")).is_err());
+        // Uppercase name (not the NIP-05 local-part charset).
+        let upper_name = format!(r#"{{"Alice":"{NOSTR_HEX}"}}"#);
+        assert!(parse_nostr_static_names(Some(&upper_name)).is_err());
+        // Non-hex, short, and uppercase pubkeys.
+        assert!(parse_nostr_static_names(Some(r#"{"_":"zz"}"#)).is_err());
+        let short = format!(r#"{{"_":"{}"}}"#, &NOSTR_HEX[..63]);
+        assert!(parse_nostr_static_names(Some(&short)).is_err());
+        let upper = format!(r#"{{"_":"{}"}}"#, NOSTR_HEX.to_uppercase());
+        assert!(parse_nostr_static_names(Some(&upper)).is_err());
+    }
+
+    #[test]
+    fn nostr_static_names_none_is_empty() {
+        assert!(parse_nostr_static_names(None).unwrap().is_empty());
     }
 
     #[test]

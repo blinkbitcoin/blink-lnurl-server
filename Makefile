@@ -14,7 +14,7 @@ test-rust:
 	env -u LNURL_TEST_POSTGRES_URL cargo test --locked
 
 start-deps:
-	docker compose up -d postgres
+	docker compose up -d --wait postgres
 
 stop-deps:
 	docker compose down --remove-orphans

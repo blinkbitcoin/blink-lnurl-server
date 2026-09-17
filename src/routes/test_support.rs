@@ -54,6 +54,9 @@ pub(super) use tower::util::ServiceExt;
 
 // -- Mock repository -------------------------------------------------------
 
+type NostrIdentityMap =
+    std::sync::Arc<Mutex<HashMap<(String, String, String), crate::repository::NostrIdentity>>>;
+
 #[derive(Clone, Default)]
 pub(crate) struct MockRepository {
     pub(super) invoices: std::sync::Arc<Mutex<HashMap<String, Invoice>>>,
@@ -70,6 +73,19 @@ pub(crate) struct MockRepository {
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
     pub(super) spark_modes: std::sync::Arc<Mutex<HashMap<String, SparkAccountMode>>>,
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
+    /// (`account_id`, `domain`, `username`) -> nostr identity; records
+    /// NIP-05 upserts. Mirrors the real backends' per-proven-handle keying;
+    /// the ownership checks remain a MOCK of the SQL contract — the
+    /// real-backend shared suites are the authority (round-2 review smell).
+    pub(super) nostr_identities: NostrIdentityMap,
+    /// Preloaded identity returned by `get_nostr_identity_by_identifier`
+    /// (mirrors the `resolved_recipient` pattern).
+    pub(super) nostr_lookup: std::sync::Arc<Mutex<Option<crate::repository::NostrIdentity>>>,
+    pub(super) nostr_lookup_calls: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+    /// Injected failure for the next nostr upsert (storage-failure coverage).
+    pub(super) nostr_upsert_error: std::sync::Arc<Mutex<Option<LnurlRepositoryError>>>,
+    /// Injected failure for nostr lookups (storage-failure coverage).
+    pub(super) nostr_lookup_error: std::sync::Arc<Mutex<Option<LnurlRepositoryError>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +153,57 @@ impl MockRepository {
     pub(super) fn spark_registration_count(&self) -> usize {
         self.spark_registrations.lock().unwrap().len()
     }
+
+    pub(super) fn with_nostr_identity(
+        self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+    ) -> Self {
+        self.with_nostr_identity_for(account_id, domain, nostr_pubkey, "resolved-username")
+    }
+
+    pub(super) fn with_nostr_identity_for(
+        self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+        username: &str,
+    ) -> Self {
+        let identity = crate::repository::NostrIdentity {
+            account_id: account_id.to_string(),
+            domain: domain.to_string(),
+            nostr_pubkey: nostr_pubkey.to_string(),
+            username: username.to_string(),
+        };
+        self.nostr_identities.lock().unwrap().insert(
+            (
+                account_id.to_string(),
+                domain.to_string(),
+                username.to_string(),
+            ),
+            identity.clone(),
+        );
+        *self.nostr_lookup.lock().unwrap() = Some(identity);
+        self
+    }
+
+    pub(super) fn fail_next_nostr_upsert(&self, error: LnurlRepositoryError) {
+        *self.nostr_upsert_error.lock().unwrap() = Some(error);
+    }
+
+    pub(super) fn fail_nostr_lookups(&self, error: LnurlRepositoryError) {
+        *self.nostr_lookup_error.lock().unwrap() = Some(error);
+    }
+
+    pub(super) fn nostr_identity(&self, account_id: &str, domain: &str) -> Option<String> {
+        self.nostr_identities
+            .lock()
+            .unwrap()
+            .values()
+            .find(|identity| identity.account_id == account_id && identity.domain == domain)
+            .map(|identity| identity.nostr_pubkey.clone())
+    }
 }
 
 pub(super) fn empty_spark_mode_record(pubkey: &str) -> SparkAccountMode {
@@ -163,10 +230,25 @@ impl LnurlRepository for MockRepository {
     }
     async fn get_spark_username_by_pubkey(
         &self,
-        _: &str,
-        _: &str,
+        domain: &str,
+        pubkey: &str,
     ) -> Result<Option<SparkUsername>, LnurlRepositoryError> {
-        Ok(None)
+        Ok(self
+            .spark_registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|registration| {
+                registration.pubkey == pubkey
+                    && registration.identifier.domain == domain
+                    && registration.identifier.identifier_kind == AccountIdentifierKind::Username
+            })
+            .map(|registration| SparkUsername {
+                domain: registration.identifier.domain.clone(),
+                pubkey: registration.pubkey.clone(),
+                username: registration.identifier.identifier.clone(),
+                description: registration.identifier.description.clone(),
+            }))
     }
     async fn resolve_recipient_by_identifier(
         &self,
@@ -178,6 +260,71 @@ impl LnurlRepository for MockRepository {
             .unwrap()
             .push((domain.to_string(), identifier.to_string()));
         Ok(self.resolved_recipient.lock().unwrap().clone())
+    }
+    async fn upsert_nostr_identity(
+        &self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+        username: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        if let Some(error) = self.nostr_upsert_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        // Mirror the real backends' ownership contract: the write only lands
+        // while the account currently owns the exact username being proven.
+        let owned = self
+            .spark_registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|registration| {
+                registration.account_id.as_deref() == Some(account_id)
+                    && registration.identifier.domain == domain
+                    && registration.identifier.identifier == username
+            })
+            || self
+                .resolved_recipient
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|recipient| {
+                    recipient.account_id == account_id
+                        && recipient.domain == domain
+                        && recipient.identifier == username
+                });
+        if !owned {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
+        let mut identities = self.nostr_identities.lock().unwrap();
+        identities.insert(
+            (
+                account_id.to_string(),
+                domain.to_string(),
+                username.to_string(),
+            ),
+            crate::repository::NostrIdentity {
+                account_id: account_id.to_string(),
+                domain: domain.to_string(),
+                nostr_pubkey: nostr_pubkey.to_string(),
+                username: username.to_string(),
+            },
+        );
+        Ok(())
+    }
+    async fn get_nostr_identity_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<crate::repository::NostrIdentity>, LnurlRepositoryError> {
+        if let Some(error) = self.nostr_lookup_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        self.nostr_lookup_calls
+            .lock()
+            .unwrap()
+            .push((domain.to_string(), identifier.to_string()));
+        Ok(self.nostr_lookup.lock().unwrap().clone())
     }
     async fn get_account_by_spark_pubkey(
         &self,
@@ -713,6 +860,13 @@ pub(super) async fn internal_route_test_state_full(
         include_spark_address: false,
         domains: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         nostr_keys: None,
+        nostr_static_names: Arc::new(std::collections::BTreeMap::new()),
+        nostr_json_rate_limiter: Arc::new(crate::rate_limit::PerIpRateLimiter::new(
+            1_000,
+            std::time::Duration::from_mins(1),
+            1_000,
+            true,
+        )),
         ca_cert: None,
         crl_url: None,
         crl: std::collections::HashSet::new(),
@@ -938,6 +1092,77 @@ pub(super) async fn start_blink_fixed_invoice_mock_server(
             .expect("mock Blink server should serve");
     });
     (format!("http://{addr}/graphql"), calls, bodies)
+}
+
+/// Behaviour of the mocked `me` endpoint. Clone: axum handlers require
+/// Clone closures, so captured handler state must be Clone.
+#[derive(Clone, Copy)]
+pub(super) enum MeMock {
+    /// Successful account with this username.
+    Ok(&'static str),
+    /// Authenticated query resolving to `me: null`.
+    NullMe,
+    /// GraphQL-envelope failure (upstream error, not a credential signal).
+    GraphqlError,
+    /// Plain HTTP 401 from an edge/gateway in front of GraphQL.
+    HttpUnauthorized,
+    /// Plain HTTP 403 from an edge/gateway in front of GraphQL.
+    HttpForbidden,
+    /// HTTP 200 with a malformed envelope (no `data`, no errors).
+    Malformed200,
+}
+
+pub(super) async fn start_blink_me_mock_server(mode: MeMock) -> String {
+    let app = Router::new().route(
+        "/graphql",
+        post(move |headers: axum::http::HeaderMap| async move {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let (status, body) = match mode {
+                MeMock::HttpUnauthorized => (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    json!({ "error": "token rejected by gateway" }),
+                ),
+                MeMock::HttpForbidden => (
+                    axum::http::StatusCode::FORBIDDEN,
+                    json!({ "error": "forbidden by gateway" }),
+                ),
+                _ if auth != "Bearer good-token" => (
+                    axum::http::StatusCode::OK,
+                    json!({ "errors": [{"message": "unauthorized"}] }),
+                ),
+                MeMock::Ok(username) => (
+                    axum::http::StatusCode::OK,
+                    json!({ "data": { "me": { "id": "blink-account-1", "username": username } } }),
+                ),
+                MeMock::NullMe => (
+                    axum::http::StatusCode::OK,
+                    json!({ "data": { "me": null } }),
+                ),
+                MeMock::GraphqlError => (
+                    axum::http::StatusCode::OK,
+                    json!({ "errors": [{"message": "internal resolver failure"}] }),
+                ),
+                MeMock::Malformed200 => (axum::http::StatusCode::OK, json!({})),
+            };
+            (status, Json(body)).into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("mock listener should have addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock Blink me server should serve");
+    });
+    format!("http://{addr}/graphql")
 }
 
 pub(super) async fn start_blink_status_mock_server(

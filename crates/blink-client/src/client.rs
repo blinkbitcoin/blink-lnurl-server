@@ -4,7 +4,7 @@ use serde_json::json;
 use crate::error::{BlinkClientError, GraphqlError};
 use crate::types::{
     ClientConfig, CreateInvoiceRequest, CreatedInvoice, CurrencyConversionEstimate,
-    DisplayCurrency, PaymentStatus, PaymentStatusState,
+    DisplayCurrency, MeAccount, PaymentStatus, PaymentStatusState,
 };
 
 pub const PRODUCTION_GRAPHQL_ENDPOINT: &str = "https://api.blink.sv/graphql";
@@ -18,6 +18,7 @@ const PAYMENT_STATUS_OPERATION: &str =
     include_str!("../graphql/ln_invoice_payment_status_by_hash.graphql");
 const CURRENCY_CONVERSION_ESTIMATION_OPERATION: &str =
     include_str!("../graphql/currency_conversion_estimation.graphql");
+const ME_OPERATION: &str = include_str!("../graphql/nostr_me.graphql");
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -85,6 +86,40 @@ impl Client {
             .await?;
         data.currency_conversion_estimation
             .into_currency_conversion_estimate()
+    }
+
+    /// Resolve the account behind a user session token. Used to validate
+    /// forwarded Blink tokens (NIP-05 registration); the client itself
+    /// stays credential-free — auth rides on the forwarded bearer only.
+    /// A `me: null` response (no errors) is treated as unauthorized.
+    pub async fn me(&self, token: &str) -> Result<MeAccount, BlinkClientError> {
+        let response = self
+            .http_client
+            .post(self.config.endpoint())
+            .bearer_auth(token)
+            .json(&json!({ "query": ME_OPERATION }))
+            .send()
+            .await?;
+        // Preserve HTTP-level auth failures as auth errors (review L3): a
+        // 401/403 from the gateway must surface as unauthorized, not as an
+        // upstream outage. Transport and server failures stay what they are.
+        let status = response.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(BlinkClientError::Unauthorized);
+        }
+        let response = response.error_for_status()?;
+
+        let envelope = response.json::<GraphqlEnvelope<MeData>>().await?;
+        if !envelope.errors.is_empty() {
+            return Err(BlinkClientError::Graphql(envelope.errors));
+        }
+
+        let data = envelope
+            .data
+            .ok_or(BlinkClientError::MalformedResponse("missing GraphQL data"))?;
+        // `me: null` on an authenticated query is a definitive auth failure;
+        // a missing `data` object entirely is a malformed upstream response.
+        data.me.ok_or(BlinkClientError::Unauthorized)
     }
 
     async fn execute<T>(
@@ -170,6 +205,11 @@ struct GraphqlEnvelope<T> {
 #[serde(rename_all = "camelCase")]
 struct BtcInvoiceData {
     ln_invoice_create_on_behalf_of_recipient: InvoicePayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct MeData {
+    me: Option<MeAccount>,
 }
 
 #[derive(Debug, Deserialize)]
