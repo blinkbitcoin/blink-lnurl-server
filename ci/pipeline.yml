@@ -223,7 +223,6 @@ jobs:
       trigger: true
       passed: [ release-docker ]
     - get: charts-repo
-      params: { skip_download: true }
     - get: pipeline-tasks
   - task: bump-image-digest-in-values
     config:
