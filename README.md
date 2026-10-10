@@ -11,6 +11,28 @@ The server lets a user register a username and Spark public key. After registrat
 - Serve Lightning Address discovery at `/.well-known/lnurlp/{username}`.
 - Store invoice metadata for LUD-21 verification, sender comments, zaps, and webhook delivery.
 
+## NIP-05 (nostr verification)
+
+`username@domain` doubles as a verified nostr handle. Binding a nostr key to a
+handle requires **both** proofs, so a user can never claim a nostr key they do
+not control:
+
+- Account ownership: the standard Spark identity-key signature (same scheme
+  as the other `/lnurlpay/{pubkey}` routes), or — for blink custodial
+  accounts — a Blink session token validated server-side via GraphQL `me`.
+- Key control: a kind-22242 (or 27235) nostr event signed by the nostr key
+  carrying an `lnaddress` tag equal to the account's handle.
+
+`GET /.well-known/nostr.json?name=N` answers with exactly the queried name
+(static overlay entries like the domain root `_` first, then the registry) or
+a uniform 404. Bindings are deleted in the same transaction as username
+deletions and transfers, so a handle can never stay verified for a key whose
+owner no longer holds the username.
+
+Trust model: the endpoint is attestation by the domain operator, per the NIP
+("identification, not verification"). Public per-name probing is inherent to
+the protocol; the server never enumerates the registry.
+
 Trust model: the user must trust the LNURL server and Spark Service Provider not to collude by sharing the preimage. The user must also trust the LNURL server to return invoices that pay the registered user.
 
 ## Development Environment
@@ -184,6 +206,7 @@ Important options:
 | `--max-sendable` | Maximum payment amount in millisatoshi | `4000000000` |
 | `--webhook-domain` | Domain used for provider webhook URLs. Required for Blink invoice callbacks; Blink invoice creation sends `{scheme}://{webhook-domain}/webhook/blink`. Also used when registering the Spark SSP webhook URL. | unset |
 | `--ssp-auth-seed` | Hex-encoded 32-byte seed for Spark SSP authentication | random |
+| `--nostr-static-names` | JSON object of statically-served NIP-05 names (`{"_":"<64-char lowercase hex>"}`), served before the dynamic registry — use for the domain root `_` and official accounts | unset |
 
 `DEPLOYMENT_ENV` accepts `production`, `staging`, or `local` and sets the default provider wiring. When unset or blank, startup defaults to `production`. `LNURL_SPARK_NETWORK` and `LNURL_BLINK_GRAPHQL_ENDPOINT` are optional explicit overrides.
 
@@ -213,6 +236,7 @@ Authenticated routes always require Spark signatures. If `ca_cert` is configured
 | Public LNURL | GET | `/.well-known/lnurlp/{identifier}` | LNURL-pay endpoint for Lightning Address handling |
 | Public LNURL | GET | `/lnurlp/{identifier}` | Alternative LNURL-pay endpoint |
 | Public LNURL | GET | `/lnurlp/{identifier}/invoice` | Invoice generation endpoint for LNURL-pay |
+| Public NIP-05 | GET | `/.well-known/nostr.json?name={name}` | NIP-05 verification: static overlay first, then the dynamic registry; only the queried name is returned |
 | Public | GET | `/verify/{payment_hash}` | LUD-21 invoice verification endpoint |
 | Health | GET | `/health` | Health check endpoint |
 | Webhook | POST | `/webhook` | Spark SSP payment notification webhook |
@@ -224,6 +248,8 @@ Authenticated routes always require Spark signatures. If `ca_cert` is configured
 | Authenticated | POST | `/lnurlpay/{pubkey}/recover` | Recover a username registration |
 | Authenticated | GET | `/lnurlpay/{pubkey}/metadata` | List LNURL sender comments, zaps, and invoice metadata |
 | Authenticated | POST | `/lnurlpay/{pubkey}/metadata/{payment_hash}/zap` | Publish a zap receipt |
+| Authenticated | POST | `/lnurlpay/{pubkey}/nostr` | Bind a NIP-05 nostr pubkey to the account's handle (Spark signature + kind-22242 proof event) |
+| Public NIP-05 | POST | `/nostr/blink` | Bind a NIP-05 nostr pubkey to a blink (custodial) account's provisioned username (auth: forwarded Blink session token, validated via GraphQL `me`) |
 | Authenticated | POST | `/lnurlpay/{pubkey}/invoice-paid` | Notify a single paid invoice |
 | Authenticated | POST | `/lnurlpay/{pubkey}/invoices-paid` | Notify paid invoices in batch |
 

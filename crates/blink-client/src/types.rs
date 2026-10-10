@@ -76,3 +76,12 @@ pub struct PaymentStatus {
     pub preimage: Option<String>,
     pub amount_received_sat: Option<i64>,
 }
+
+/// Authenticated `me` account, used to validate forwarded session tokens
+/// for NIP-05 registration. `username` is optional server-side (accounts
+/// can exist without one).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct MeAccount {
+    pub id: String,
+    pub username: Option<String>,
+}

@@ -1,6 +1,7 @@
 mod account;
 mod internal;
 mod lnurl_pay;
+pub(crate) mod nostr;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod webhook;

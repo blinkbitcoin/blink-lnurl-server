@@ -813,7 +813,9 @@ pub(super) fn spark_registration_error(
     }
 }
 
-fn require_spark_provider_enabled<DB>(state: &State<DB>) -> Result<(), (StatusCode, Json<Value>)> {
+pub(super) fn require_spark_provider_enabled<DB>(
+    state: &State<DB>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     if state.providers.spark_enabled() {
         return Ok(());
     }

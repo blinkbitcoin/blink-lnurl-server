@@ -4,9 +4,9 @@ use sqlx::{PgPool, Row};
 use crate::repository::{
     Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
     IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
-    NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
-    UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
-    generate_account_id,
+    NewSparkRegistration, NostrIdentity, PendingZapReceipt, ResolvedRecipient, SparkAccountMode,
+    SparkModeUpdate, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    classify_refused_mode_write, generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -263,6 +263,96 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .transpose()
     }
 
+    async fn upsert_nostr_identity(
+        &self,
+        account_id: &str,
+        domain: &str,
+        nostr_pubkey: &str,
+        username: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        let now = now_millis();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        // Lock the ownership row (round-2 review): a concurrent transfer or
+        // rename deleting this identifier serializes against this write, so
+        // no interleaving under READ COMMITTED can leave a binding that
+        // outlives the ownership it was proven against.
+        let owned: Option<(String,)> = sqlx::query_as(
+            "SELECT identifier FROM account_identifiers ai
+             WHERE ai.account_id = $1
+               AND ai.domain = $2
+               AND ai.identifier = $3
+               AND ai.identifier_kind = 'username'
+             FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(domain)
+        .bind(username)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if owned.is_none() {
+            return Err(LnurlRepositoryError::InvalidOwnership);
+        }
+
+        // Keyed on the proven username: a sibling handle of the same account
+        // gets no coverage from this proof.
+        sqlx::query(
+            "INSERT INTO nostr_identities (account_id, domain, nostr_pubkey, username, created_at, updated_at)
+             VALUES ($1, $2, $3, $5, $4, $4)
+             ON CONFLICT (account_id, domain, username)
+             DO UPDATE SET nostr_pubkey = EXCLUDED.nostr_pubkey
+             ,              updated_at = EXCLUDED.updated_at",
+        )
+        .bind(account_id)
+        .bind(domain)
+        .bind(nostr_pubkey)
+        .bind(now)
+        .bind(username)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+        Ok(())
+    }
+
+    async fn get_nostr_identity_by_identifier(
+        &self,
+        domain: &str,
+        identifier: &str,
+    ) -> Result<Option<NostrIdentity>, LnurlRepositoryError> {
+        let maybe_identity = sqlx::query(
+            "SELECT ni.account_id, ni.domain, ni.nostr_pubkey, ni.username
+             FROM nostr_identities ni
+             JOIN account_identifiers ai
+               ON ai.account_id = ni.account_id
+              AND ai.domain = ni.domain
+              AND ai.identifier = ni.username
+             WHERE ni.domain = $1
+               AND ai.identifier = $2
+               AND ai.identifier_kind = 'username'",
+        )
+        .bind(domain)
+        .bind(identifier)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(NostrIdentity {
+                account_id: row.try_get(0)?,
+                domain: row.try_get(1)?,
+                nostr_pubkey: row.try_get(2)?,
+                username: row.try_get(3)?,
+            })
+        })
+        .transpose()?;
+        Ok(maybe_identity)
+    }
+
     async fn get_account_by_id(
         &self,
         account_id: &str,
@@ -355,7 +445,7 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::InvalidOwnership);
         }
 
-        sqlx::query(
+        let stale_usernames = sqlx::query(
             "DELETE FROM account_identifiers
              WHERE account_id = $1
              AND domain = $2
@@ -367,6 +457,22 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         .bind(&registration.identifier.identifier)
         .execute(&mut *tx)
         .await?;
+
+        // A username change retires the proven handles that were removed:
+        // those bindings were proven for the OLD local-parts, so they must
+        // not survive. Scoped to the removed names — an idempotent
+        // re-registration of the same username keeps its binding.
+        if stale_usernames.rows_affected() > 0 {
+            sqlx::query(
+                "DELETE FROM nostr_identities
+                 WHERE account_id = $1 AND domain = $2 AND username <> $3",
+            )
+            .bind(&account_id)
+            .bind(&registration.identifier.domain)
+            .bind(&registration.identifier.identifier)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(
             "INSERT INTO accounts (account_id, provider, created_at, updated_at)
@@ -711,6 +817,19 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             return Err(LnurlRepositoryError::SourceNotOwner);
         }
 
+        // A nostr mapping must never outlive the username it attests —
+        // scoped to the removed identifier so sibling handles of the same
+        // account keep their independently-proven bindings.
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&account_id)
+        .bind(domain)
+        .bind(identifier)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
@@ -831,6 +950,29 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              AND domain = $2
              AND identifier_kind = 'username'
              AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        // The handle changed owner: the SOURCE binding for the transferred
+        // name dies (its proof was the old owner's), and the DESTINATION
+        // loses the bindings of whatever aliases this transfer displaced —
+        // but neither side's siblings are touched (round-3 review).
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&transfer.source_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username <> $3",
         )
         .bind(&destination_account_id)
         .bind(&transfer.domain)
@@ -960,6 +1102,30 @@ impl crate::repository::LnurlRepository for LnurlRepository {
              AND domain = $2
              AND identifier_kind = 'username'
              AND identifier <> $3",
+        )
+        .bind(&destination_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+
+        // The handle moved from a blink account to a spark account: the
+        // SOURCE (which may hold other proven handles — the internal route
+        // provisions several usernames per account) keeps its siblings; only
+        // the transferred name's binding dies, and the DESTINATION loses the
+        // bindings of aliases this transfer displaced.
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username = $3",
+        )
+        .bind(&transfer.source_account_id)
+        .bind(&transfer.domain)
+        .bind(&transfer.identifier)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM nostr_identities
+             WHERE account_id = $1 AND domain = $2 AND username <> $3",
         )
         .bind(&destination_account_id)
         .bind(&transfer.domain)
@@ -2430,5 +2596,195 @@ mod provider_neutral_tests {
             return;
         };
         shared_tests::register_after_mode_attaches_to_the_same_account(&db).await;
+    }
+}
+
+#[cfg(test)]
+mod nostr_postgres_tests {
+    use super::LnurlRepository;
+    use crate::repository::LnurlRepository as _;
+    use crate::repository::LnurlRepositoryError;
+    use crate::repository::nostr_shared_tests;
+
+    /// Skips only when `LNURL_TEST_POSTGRES_URL` is unset (plain `cargo
+    /// test`); once the variable is present, operational failures propagate
+    /// (round-2 review: silent skips devalue the real-backend coverage).
+    async fn setup() -> Option<(LnurlRepository, sqlx::PgPool)> {
+        let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("postgres reachable via LNURL_TEST_POSTGRES_URL");
+        crate::postgresql::run_migrations(&pool)
+            .await
+            .expect("migrations apply");
+        for statement in [
+            "DELETE FROM nostr_identities",
+            "DELETE FROM account_identifiers",
+            "DELETE FROM spark_accounts",
+            "DELETE FROM blink_accounts",
+            "DELETE FROM accounts",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("cleanup runs");
+        }
+        let repo = LnurlRepository::new(pool.clone());
+        Some((repo, pool))
+    }
+
+    #[tokio::test]
+    async fn insert_and_lookup() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::insert_and_lookup(&db).await;
+    }
+
+    #[tokio::test]
+    async fn lookup_misses_wrong_domain_or_identifier() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::lookup_misses_wrong_domain_or_identifier(&db).await;
+    }
+
+    #[tokio::test]
+    async fn replace_updates_pubkey() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::replace_updates_pubkey(&db).await;
+    }
+
+    #[tokio::test]
+    async fn upsert_requires_username_ownership() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::upsert_requires_username_ownership(&db).await;
+    }
+
+    #[tokio::test]
+    async fn unregister_clears_binding() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::unregister_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn spark_transfer_clears_both_sides() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::spark_transfer_clears_both_sides(&db).await;
+    }
+
+    #[tokio::test]
+    async fn blink_to_spark_transfer_clears_binding() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::blink_to_spark_transfer_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn username_replacement_clears_binding() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::username_replacement_clears_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn binding_is_per_proven_handle() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::binding_is_per_proven_handle(&db).await;
+    }
+
+    #[tokio::test]
+    async fn moving_one_handle_keeps_sibling_binding() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::moving_one_handle_keeps_sibling_binding(&db).await;
+    }
+
+    #[tokio::test]
+    async fn spark_transfer_scopes_binding_cleanup() {
+        let Some((db, _pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::spark_transfer_scopes_binding_cleanup(&db).await;
+    }
+
+    /// Round-2 review: deterministic two-connection interleaving — a transfer
+    /// that removes the identifier while a nostr write is in flight must not
+    /// leave a binding behind. Connection A locks the identifier row and
+    /// deletes it (transfer stand-in); the repository write on connection B
+    /// blocks on that lock, then observes the loss and fails closed.
+    #[tokio::test]
+    async fn upsert_serializes_against_concurrent_identifier_removal() {
+        let Some((db, pool)) = setup().await else {
+            return;
+        };
+        nostr_shared_tests::insert_and_lookup(&db).await; // account 02aa owns alice, binding exists
+
+        let account = db
+            .get_account_by_spark_pubkey("02aa")
+            .await
+            .unwrap()
+            .expect("spark account exists");
+
+        let mut tx_a = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT 1 FROM account_identifiers
+             WHERE account_id = $1 AND domain = 'example.com' AND identifier = 'alice'
+             FOR UPDATE",
+        )
+        .bind(&account.account_id)
+        .fetch_one(&mut *tx_a)
+        .await
+        .unwrap();
+
+        let writer = {
+            let db = db.clone();
+            let account_id = account.account_id.clone();
+            tokio::spawn(async move {
+                db.upsert_nostr_identity(&account_id, "example.com", &"cc".repeat(32), "alice")
+                    .await
+            })
+        };
+        // Let the writer reach (and block on) the row lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        sqlx::query(
+            "DELETE FROM account_identifiers WHERE account_id = $1 AND identifier = 'alice'",
+        )
+        .bind(&account.account_id)
+        .execute(&mut *tx_a)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM nostr_identities WHERE account_id = $1 AND username = 'alice'")
+            .bind(&account.account_id)
+            .execute(&mut *tx_a)
+            .await
+            .unwrap();
+        tx_a.commit().await.unwrap();
+
+        let outcome = writer.await.unwrap();
+        assert!(
+            matches!(outcome, Err(LnurlRepositoryError::InvalidOwnership)),
+            "write in flight must fail closed once ownership is gone, got {outcome:?}"
+        );
+        assert!(
+            db.get_nostr_identity_by_identifier("example.com", "alice")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

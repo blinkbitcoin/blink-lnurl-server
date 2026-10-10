@@ -99,6 +99,12 @@ pub struct BlinkProvider {
 }
 
 impl BlinkProvider {
+    /// Resolve the account behind a user session token (NIP-05 blink
+    /// registration). See `blink_client::Client::me`.
+    pub async fn me(&self, token: &str) -> Result<blink_client::MeAccount, BlinkClientError> {
+        self.client.me(token).await
+    }
+
     #[allow(dead_code)]
     pub fn new(client: blink_client::Client) -> Self {
         Self::new_with_webhook_url(client, Some("http://127.0.0.1/webhook/blink".to_string()))
@@ -416,6 +422,12 @@ impl ProviderRegistry {
 
     pub fn blink_enabled(&self) -> bool {
         self.blink_enabled
+    }
+
+    /// Validate a forwarded Blink session token by resolving its `me`
+    /// account (NIP-05 blink registration path).
+    pub async fn blink_me(&self, token: &str) -> Result<blink_client::MeAccount, BlinkClientError> {
+        self.blink.me(token).await
     }
 
     fn blink_client(blink_graphql_endpoint: Option<&str>) -> blink_client::Client {

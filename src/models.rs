@@ -223,6 +223,48 @@ pub struct PublishZapReceiptRequest {
     pub zap_receipt: String,
 }
 
+/// Bind a nostr key to the caller's `username@domain` handle (NIP-05).
+/// Auth is the Spark identity-key signature over
+/// `nostr:{nostr_pubkey}-{timestamp}` (same scheme as the D2 grant routes).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterNostrIdentityRequest {
+    /// Lowercase hex x-only secp256k1 nostr pubkey (64 chars).
+    pub nostr_pubkey: String,
+    /// Kind-22242 nostr event signed by the nostr key, carrying an
+    /// `lnaddress` tag equal to `username@domain`.
+    pub nostr_proof: String,
+    pub signature: String,
+    pub timestamp: u64,
+}
+
+/// Bind a nostr key to a blink (custodial) account's `username@domain`
+/// handle. Auth is a Blink session token forwarded to the GraphQL `me`
+/// query — the server never issues or stores credentials.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterBlinkNostrIdentityRequest {
+    /// Lowercase hex x-only secp256k1 nostr pubkey (64 chars).
+    pub nostr_pubkey: String,
+    /// Kind-22242 nostr event signed by the nostr key, carrying an
+    /// `lnaddress` tag equal to `username@domain`.
+    pub nostr_proof: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterNostrIdentityResponse {
+    pub username: String,
+    pub domain: String,
+    pub nostr_pubkey: String,
+    /// The full NIP-05 internet identifier, e.g. `alice@blink.sv`.
+    pub nip05: String,
+}
+
+/// NIP-05 well-known response. Deliberately only ever holds the single
+/// queried name — the endpoint never enumerates the registry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NostrJsonResponse {
+    pub names: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InvoicePaidRequest {
     pub signature: String,

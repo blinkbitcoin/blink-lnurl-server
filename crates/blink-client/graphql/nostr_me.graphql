@@ -1,0 +1,6 @@
+query NostrMe {
+  me {
+    id
+    username
+  }
+}

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeMap, collections::HashSet, sync::Arc};
 use tokio::sync::{RwLock, watch};
 
 use crate::country::CountryResolver;
@@ -14,6 +14,9 @@ pub struct State<DB> {
     /// Shared per-IP budget for the mode route and for the paid country
     /// lookups the signed-request handlers make.
     pub ip_rate_limiter: Arc<PerIpRateLimiter>,
+    /// Independent, generous per-IP budget for the public NIP-05 lookup —
+    /// must never be starved by (or starve) the signed-request budget.
+    pub nostr_json_rate_limiter: Arc<PerIpRateLimiter>,
     /// Aggregate daily cap on vendor lookups, shared by every route.
     pub country_lookup_budget: Arc<GlobalBudget>,
     pub scheme: String,
@@ -23,6 +26,9 @@ pub struct State<DB> {
     pub include_spark_address: bool,
     pub domains: Arc<RwLock<HashSet<String>>>,
     pub nostr_keys: Option<nostr::Keys>,
+    /// Static NIP-05 overlay (domain root `_`, official accounts): served
+    /// before the dynamic registry and immune to registration lifecycle.
+    pub nostr_static_names: Arc<BTreeMap<String, String>>,
     pub ca_cert: Option<Vec<u8>>,
     pub crl_url: Option<String>,
     pub crl: HashSet<String>,
@@ -50,6 +56,8 @@ where
             include_spark_address: self.include_spark_address,
             domains: Arc::clone(&self.domains),
             nostr_keys: self.nostr_keys.clone(),
+            nostr_static_names: Arc::clone(&self.nostr_static_names),
+            nostr_json_rate_limiter: Arc::clone(&self.nostr_json_rate_limiter),
             ca_cert: self.ca_cert.clone(),
             crl_url: self.crl_url.clone(),
             crl: self.crl.clone(),
