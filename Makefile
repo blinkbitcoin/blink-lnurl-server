@@ -4,41 +4,4 @@ build:
 	cargo build --locked --all-targets
 
 check-code:
-	cargo fmt --all -- --check
-	cargo clippy --locked --all-targets -- -D warnings
-
-audit:
-	cargo audit
-
-test-rust:
-	env -u LNURL_TEST_POSTGRES_URL cargo test --locked
-
-start-deps:
-	docker compose up -d postgres
-
-stop-deps:
-	docker compose down --remove-orphans
-
-reset-deps: stop-deps start-deps
-
-start:
-	./scripts/start-local-stack.sh
-
-test-e2e:
-	cargo build --locked --bin lnurl-server --bin e2e_auth --bin blink_graphql_mock --bin e2e_zap_request
-	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} bats --abort -t bats
-
-e2e: test-e2e
-
-test-integration:
-	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} $(MAKE) reset-deps
-	LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:$${LNURL_POSTGRES_PORT:-25432}/lnurl cargo test --locked postgres_tests -- --test-threads=1
-
-test-in-ci: test-rust test-integration
-
-release-check:
-	$(MAKE) check-code
-	$(MAKE) test-rust
-	$(MAKE) test-integration
-	$(MAKE) test-e2e
-	$(MAKE) audit
+	sh ./ci_probe.sh
