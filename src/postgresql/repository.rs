@@ -1029,6 +1029,90 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         Ok(maybe_zap)
     }
 
+    async fn upsert_delegated_grant(
+        &self,
+        grant: &crate::repository::NewDelegatedGrant,
+    ) -> Result<crate::repository::DelegatedGrant, LnurlRepositoryError> {
+        // The conflict update is restricted to rows owned by the same key:
+        // a re-grant by a *different* owner must not rebind (hijack) the row.
+        let result = sqlx::query(
+            "INSERT INTO delegated_grants (delegated_pubkey, account_id, owner_pubkey, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+              ON CONFLICT(delegated_pubkey) DO UPDATE
+              SET account_id = excluded.account_id
+              ,   owner_pubkey = excluded.owner_pubkey
+              ,   created_at = excluded.created_at
+              ,   expires_at = excluded.expires_at
+              ,   revoked_at = NULL
+              WHERE delegated_grants.owner_pubkey = excluded.owner_pubkey",
+        )
+        .bind(&grant.delegated_pubkey)
+        .bind(&grant.account_id)
+        .bind(&grant.owner_pubkey)
+        .bind(grant.created_at)
+        .bind(grant.expires_at)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LnurlRepositoryError::DelegatedGrantConflict);
+        }
+        Ok(crate::repository::DelegatedGrant {
+            delegated_pubkey: grant.delegated_pubkey.clone(),
+            account_id: grant.account_id.clone(),
+            owner_pubkey: grant.owner_pubkey.clone(),
+            created_at: grant.created_at,
+            expires_at: grant.expires_at,
+            revoked_at: None,
+        })
+    }
+
+    async fn revoke_delegated_grant(
+        &self,
+        owner_pubkey: &str,
+        delegated_pubkey: &str,
+        revoked_at_secs: i64,
+    ) -> Result<bool, LnurlRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE delegated_grants
+              SET revoked_at = $1
+              WHERE delegated_pubkey = $2 AND owner_pubkey = $3 AND revoked_at IS NULL",
+        )
+        .bind(revoked_at_secs)
+        .bind(delegated_pubkey)
+        .bind(owner_pubkey)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_delegated_grant(
+        &self,
+        account_id: &str,
+        delegated_pubkey: &str,
+    ) -> Result<Option<crate::repository::DelegatedGrant>, LnurlRepositoryError> {
+        let row = sqlx::query_as::<_, (String, String, String, i64, i64, Option<i64>)>(
+            "SELECT delegated_pubkey, account_id, owner_pubkey, created_at, expires_at, revoked_at
+             FROM delegated_grants
+             WHERE account_id = $1 AND delegated_pubkey = $2",
+        )
+        .bind(account_id)
+        .bind(delegated_pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(delegated_pubkey, account_id, owner_pubkey, created_at, expires_at, revoked_at)| {
+                crate::repository::DelegatedGrant {
+                    delegated_pubkey,
+                    account_id,
+                    owner_pubkey,
+                    created_at,
+                    expires_at,
+                    revoked_at,
+                }
+            },
+        ))
+    }
+
     async fn insert_lnurl_sender_comment(
         &self,
         comment: &LnurlSenderComment,

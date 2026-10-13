@@ -254,3 +254,49 @@ pub struct PublishZapReceiptResponse {
 pub fn sanitize_username(username: &str) -> String {
     username.trim().to_lowercase()
 }
+
+/// D1: Spark-signed invoice request carrying a caller-chosen description
+/// hash. The `deny_unknown_fields` attribute rejects LNURL-style
+/// `metadata`/`description`/`nostr` parameters: the whole point of this
+/// endpoint is that the caller commits only to a hash.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedInvoiceRequest {
+    pub amount_msat: u64,
+    /// 64 lowercase hex chars, exactly what the invoice's `h` tag will commit to
+    pub description_hash: String,
+    pub expiry_secs: Option<u32>,
+    /// Caller-chosen replay guard, must be unique within the timestamp window
+    pub request_id: String,
+    pub pubkey: String,
+    pub timestamp: u64,
+    /// DER hex signature over the canonical message (see handler) with
+    /// `-{timestamp}` appended, by the recipient Spark identity key
+    pub signature: String,
+}
+
+/// D2: authorize an auxiliary key to request invoices on the owner's behalf.
+/// The owner signs `"grant:{delegated_pubkey}:{expiry_secs}"`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantDelegatedKeyRequest {
+    pub delegated_pubkey: String,
+    pub expiry_secs: u64,
+    pub timestamp: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrantDelegatedKeyResponse {
+    pub delegated_pubkey: String,
+    pub expires_at: i64,
+}
+
+/// D2: revoke a delegated key. Query params on
+/// `DELETE /lnurlpay/{pubkey}/grant/{delegated_pubkey}`; the owner signs
+/// `"revoke:{delegated_pubkey}"`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RevokeDelegatedKeyParams {
+    pub timestamp: u64,
+    pub signature: String,
+}
