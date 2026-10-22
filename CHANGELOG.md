@@ -1,3 +1,15 @@
+# [blink-lnurl-server release v0.8.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.8.1)
+
+
+### Bug Fixes
+
+- Correct chart Git get and repipe target (#47)
+
+### Miscellaneous Tasks
+
+- Fix clippy 1.99 lints (#51)
+- Bump TLS stack and clear audit advisories (#50)
+
 # [blink-lnurl-server release v0.8.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.8.0)
 
 
