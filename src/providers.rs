@@ -206,14 +206,14 @@ impl SparkProvider {
         })
     }
 
-    #[allow(clippy::unused_async)]
-    pub async fn payment_status(
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    pub fn payment_status(
         &self,
         request: PaymentStatusRequest<'_>,
-    ) -> Result<ProviderPaymentStatus, ProviderError> {
+    ) -> impl std::future::Future<Output = Result<ProviderPaymentStatus, ProviderError>> {
         let _ = request;
-        Err(ProviderError::PaymentStatusUnavailable(anyhow::anyhow!(
-            SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL
+        std::future::ready(Err(ProviderError::PaymentStatusUnavailable(
+            anyhow::anyhow!(SPARK_PAYMENT_STATUS_PHASE_7_DEFERRAL),
         )))
     }
 }

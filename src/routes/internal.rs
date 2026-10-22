@@ -921,7 +921,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
         assert_eq!(repo.blink_to_spark_transfer_count(), 0);
     }
 
@@ -948,7 +948,7 @@ mod tests {
             .await;
 
             assert_internal_provider_disabled(status, &body);
-            assert!(repo.resolve_calls().is_empty());
+            assert_eq!(repo.resolve_calls(), []);
             assert_eq!(repo.blink_to_spark_transfer_count(), 0);
         }
     }
@@ -990,7 +990,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, json!({"error": INTERNAL_ERROR_INVALID_REQUEST}));
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
         assert_eq!(repo.blink_to_spark_transfer_count(), 0);
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
         assert_eq!(repo.blink_to_spark_transfer_count(), 0);
     }
 
@@ -1168,7 +1168,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({"error": "forbidden"}));
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
     }
 
     #[tokio::test]
@@ -1213,7 +1213,7 @@ mod tests {
         assert_eq!(domain_body, json!({"error": "invalid_domain"}));
         assert_eq!(identifier_status, StatusCode::BAD_REQUEST);
         assert_eq!(identifier_body, json!({"error": "invalid_identifier"}));
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
     }
 
     #[tokio::test]
@@ -1229,7 +1229,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(repo.resolve_calls().is_empty());
+        assert_eq!(repo.resolve_calls(), []);
     }
 
     // -- Region-determination mode ---------------------------------------------
