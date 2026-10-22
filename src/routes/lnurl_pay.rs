@@ -1447,7 +1447,7 @@ mod tests {
         };
         assert_eq!(invalid_status, StatusCode::NOT_FOUND);
         assert_eq!(invalid_body, Value::String(String::new()));
-        assert!(invalid_repo.resolve_calls().is_empty());
+        assert_eq!(invalid_repo.resolve_calls(), []);
     }
 
     #[test]
