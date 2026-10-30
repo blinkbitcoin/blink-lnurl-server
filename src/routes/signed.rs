@@ -42,7 +42,12 @@ pub(super) enum SignedRoute {
     /// v2-only: the route is new, so it has no legacy form and no counter.
     Available,
     Register,
+    /// v2-only: the legacy unregister message is the legacy register message,
+    /// so accepting it would let a register signature delete the address.
     Unregister,
+    /// v2-only: the legacy transfer message carries no time or domain, so a
+    /// signature over it would authorize the handover on any deployment,
+    /// indefinitely.
     Transfer,
     Recover,
     Metadata,
@@ -54,10 +59,8 @@ pub(super) enum SignedRoute {
 
 impl SignedRoute {
     /// Every route that still accepts a legacy message, in report order.
-    const LEGACY: [Self; 9] = [
+    const LEGACY: [Self; 7] = [
         Self::Register,
-        Self::Unregister,
-        Self::Transfer,
         Self::Recover,
         Self::Metadata,
         Self::Mode,
@@ -83,16 +86,14 @@ impl SignedRoute {
 
     const fn legacy_index(self) -> Option<usize> {
         match self {
-            Self::Available => None,
+            Self::Available | Self::Unregister | Self::Transfer => None,
             Self::Register => Some(0),
-            Self::Unregister => Some(1),
-            Self::Transfer => Some(2),
-            Self::Recover => Some(3),
-            Self::Metadata => Some(4),
-            Self::Mode => Some(5),
-            Self::ZapReceipt => Some(6),
-            Self::InvoicePaid => Some(7),
-            Self::InvoicesPaid => Some(8),
+            Self::Recover => Some(1),
+            Self::Metadata => Some(2),
+            Self::Mode => Some(3),
+            Self::ZapReceipt => Some(4),
+            Self::InvoicePaid => Some(5),
+            Self::InvoicesPaid => Some(6),
         }
     }
 }
@@ -104,7 +105,7 @@ pub(super) enum MessageFormat {
     BreezV2,
     /// `blink-lnurl:v1`, the Blink app's own messages.
     BlinkV1,
-    /// Pre-v2: `{message}-{timestamp}`, or the untimestamped transfer message.
+    /// Pre-v2: `{message}-{timestamp}`.
     Legacy,
 }
 
@@ -223,51 +224,39 @@ pub(super) async fn verify_candidates<'a, DB>(
     Err(invalid_signature())
 }
 
-/// How long the claim over a statement must be retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ClaimExpiry {
-    /// The statement carries this timestamp, so its claim may be pruned once
-    /// [`check_timestamp`] refuses the statement on its own.
-    Bounded(u64),
-    /// Nothing bounds the statement in time (the legacy transfer message), so
-    /// dropping its claim would put it back in play.
-    Unbounded,
+/// When the claim over a statement signed at `timestamp` may be pruned: once
+/// [`check_timestamp`] refuses the statement on its own. Saturating, since an
+/// unrepresentable expiry only retains the claim longer.
+fn claim_expires_at(timestamp: u64) -> i64 {
+    i64::try_from(timestamp.saturating_add(super::ACCEPTABLE_TIME_DIFF_SECS)).unwrap_or(i64::MAX)
 }
 
-impl ClaimExpiry {
-    fn expires_at(self) -> i64 {
-        match self {
-            // Saturating: an unrepresentable expiry only retains the claim
-            // longer.
-            Self::Bounded(timestamp) => {
-                i64::try_from(timestamp.saturating_add(super::ACCEPTABLE_TIME_DIFF_SECS))
-                    .unwrap_or(i64::MAX)
-            }
-            Self::Unbounded => i64::MAX,
-        }
-    }
-}
-
-/// The claim record for the statement `candidate` authorized.
+/// The claim record for the statement `candidate` authorized on `domain`.
 ///
 /// Hashes what was authorized rather than the signature bytes: ECDSA
 /// signatures are malleable, so keying on them would let a reshaped signature
-/// re-authorize a claimed statement.
+/// re-authorize a claimed statement. The resolved domain is hashed in even
+/// though v2 messages already name it: legacy messages do not, and without it
+/// presenting a legacy statement on another allowlisted host would spend it
+/// for the host it was meant for.
 pub(super) fn statement_claim(
     pubkey: &PublicKey,
+    domain: &str,
     candidate: &Candidate,
-    expiry: ClaimExpiry,
+    timestamp: u64,
 ) -> StatementClaim {
     let mut engine = sha256::Hash::engine();
     engine.input(pubkey.to_string().as_bytes());
-    // The pubkey is fixed-width hex, but the boundary is still marked so no
-    // pubkey/message split can be read two ways.
+    // Every field is delimited so no pubkey/domain/message split can be read
+    // two ways; a domain cannot contain NUL.
+    engine.input(b"\x00");
+    engine.input(domain.as_bytes());
     engine.input(b"\x00");
     engine.input(candidate.message.as_bytes());
     StatementClaim {
         statement_hash: sha256::Hash::from_engine(engine).to_byte_array(),
         route: candidate.route.as_str(),
-        expires_at: expiry.expires_at(),
+        expires_at: claim_expires_at(timestamp),
     }
 }
 
@@ -367,36 +356,45 @@ mod tests {
             assert!(!seen[index], "{} shares a counter", route.as_str());
             seen[index] = true;
         }
-        assert_eq!(SignedRoute::Available.legacy_index(), None);
+        for route in [
+            SignedRoute::Available,
+            SignedRoute::Unregister,
+            SignedRoute::Transfer,
+        ] {
+            assert_eq!(route.legacy_index(), None, "{} is v2-only", route.as_str());
+        }
     }
 
     #[test]
-    fn statement_claims_key_on_pubkey_and_message_not_signature() {
+    fn statement_claims_key_on_pubkey_domain_and_message_not_signature() {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let key = |seed| {
             let secret = bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
             PublicKey::from_secret_key(&secp, &secret)
         };
         let message = |text: &str| Candidate::legacy(text.to_string(), SignedRoute::Register);
-        let claim =
-            |seed, text| statement_claim(&key(seed), &message(text), ClaimExpiry::Bounded(1));
+        let claim = |seed, domain, text| statement_claim(&key(seed), domain, &message(text), 1);
 
-        assert_eq!(claim(1, "alice-1"), claim(1, "alice-1"));
-        assert_ne!(
-            claim(1, "alice-1").statement_hash,
-            claim(2, "alice-1").statement_hash
+        assert_eq!(
+            claim(1, "a.example", "alice-1"),
+            claim(1, "a.example", "alice-1")
         );
-        assert_ne!(
-            claim(1, "alice-1").statement_hash,
-            claim(1, "alice-2").statement_hash
-        );
+        for other in [
+            claim(2, "a.example", "alice-1"),
+            claim(1, "b.example", "alice-1"),
+            claim(1, "a.example", "alice-2"),
+        ] {
+            assert_ne!(
+                claim(1, "a.example", "alice-1").statement_hash,
+                other.statement_hash
+            );
+        }
     }
 
     #[test]
     fn claim_expiry_outlives_the_accept_window() {
-        assert_eq!(ClaimExpiry::Bounded(1_000).expires_at(), 1_600);
-        assert_eq!(ClaimExpiry::Bounded(u64::MAX).expires_at(), i64::MAX);
-        assert_eq!(ClaimExpiry::Unbounded.expires_at(), i64::MAX);
+        assert_eq!(claim_expires_at(1_000), 1_600);
+        assert_eq!(claim_expires_at(u64::MAX), i64::MAX);
     }
 
     #[test]

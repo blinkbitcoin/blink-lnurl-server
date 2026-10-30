@@ -559,27 +559,6 @@ recover_user_status() {
     "${BASE_URL}/lnurlpay/${pubkey}/recover"
 }
 
-unregister_user() {
-  local username="${1:?username is required}"
-  local host="${2:?host is required}"
-  local auth
-  local pubkey
-  local timestamp
-  local signature
-
-  auth="$(auth_payload "${username}")"
-  pubkey="$(json_get "${auth}" '.pubkey')"
-  timestamp="$(json_get "${auth}" '.timestamp')"
-  signature="$(json_get "${auth}" '.unregister_signature')"
-
-  curl -fsS \
-    --request DELETE \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"signature\":\"${signature}\",\"timestamp\":${timestamp}}" \
-    "${BASE_URL}/lnurlpay/${pubkey}"
-}
-
 unregister_user_status() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
@@ -595,30 +574,9 @@ unregister_user_status() {
     "${BASE_URL}/lnurlpay/${pubkey}"
 }
 
-transfer_user() {
-  local username="${1:?username is required}"
-  local host="${2:?host is required}"
-  local description="${3:-Transferred LNURL user}"
-  local auth
-  local from_pubkey
-  local to_pubkey
-  local from_signature
-  local to_signature
-
-  auth="$(auth_payload "${username}")"
-  from_pubkey="$(json_get "${auth}" '.pubkey')"
-  to_pubkey="$(json_get "${auth}" '.to_pubkey')"
-  from_signature="$(json_get "${auth}" '.transfer_from_signature')"
-  to_signature="$(json_get "${auth}" '.transfer_to_signature')"
-
-  curl -fsS \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
-    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer" | jq -cer '.'
-}
-
-transfer_user_status() {
+# Prints the status code and body on separate lines. Leave the timestamp empty
+# to send a pre-v2 (untimestamped) transfer.
+transfer_user_status_body() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
   local description="${3:?description is required}"
@@ -626,12 +584,10 @@ transfer_user_status() {
   local to_signature="${5:?to signature is required}"
   local from_pubkey="${6:?from pubkey is required}"
   local to_pubkey="${7:?to pubkey is required}"
+  local timestamp="${8:-}"
 
-  curl -sS -o /dev/null -w "%{http_code}" \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
-    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer"
+  http_status_body "POST" "${BASE_URL}/lnurlpay/${to_pubkey}/transfer" "${host}" \
+    "$(jq -cn --arg username "${username}" --arg description "${description}" --arg from_pubkey "${from_pubkey}" --arg from_signature "${from_signature}" --arg to_signature "${to_signature}" --arg timestamp "${timestamp}" '{username:$username,description:$description,from_pubkey:$from_pubkey,from_signature:$from_signature,to_signature:$to_signature} + (if $timestamp == "" then {} else {timestamp:($timestamp|tonumber)} end)')"
 }
 
 http_status_body() {

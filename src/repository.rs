@@ -324,12 +324,12 @@ pub struct IdentifierTransfer {
 /// once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementClaim {
-    /// `sha256(pubkey || 0x00 || signed message)`.
+    /// `sha256(pubkey || 0x00 || domain || 0x00 || signed message)`.
     pub statement_hash: [u8; 32],
     /// Which route acted on it. Diagnostic only.
     pub route: &'static str,
-    /// Unix seconds after which the row may be pruned; `i64::MAX` for a
-    /// statement nothing else bounds in time.
+    /// Unix seconds after which the row may be pruned: the statement's
+    /// timestamp plus the accept window, saturating at `i64::MAX`.
     pub expires_at: i64,
 }
 
@@ -1264,7 +1264,7 @@ pub mod shared_tests {
         );
     }
 
-    pub async fn expired_claims_are_pruned_and_unbounded_ones_never<DB>(db: &DB)
+    pub async fn expired_claims_are_pruned_and_saturated_ones_never<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
@@ -1279,7 +1279,7 @@ pub mod shared_tests {
                 .unwrap()
         );
         assert!(
-            db.claim_signed_message(&claim(5, "transfer", i64::MAX))
+            db.claim_signed_message(&claim(5, "register", i64::MAX))
                 .await
                 .unwrap()
         );
@@ -1298,10 +1298,10 @@ pub mod shared_tests {
                 .unwrap()
         );
         assert!(
-            !db.claim_signed_message(&claim(5, "transfer", i64::MAX))
+            !db.claim_signed_message(&claim(5, "register", i64::MAX))
                 .await
                 .unwrap(),
-            "a claim nothing bounds in time must never be pruned"
+            "a saturated expiry must never be pruned"
         );
     }
 

@@ -1932,8 +1932,8 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
-    async fn expired_claims_are_pruned_and_unbounded_ones_never() {
-        shared_tests::expired_claims_are_pruned_and_unbounded_ones_never(&setup_test_db().await)
+    async fn expired_claims_are_pruned_and_saturated_ones_never() {
+        shared_tests::expired_claims_are_pruned_and_saturated_ones_never(&setup_test_db().await)
             .await;
     }
 

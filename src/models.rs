@@ -192,9 +192,9 @@ pub struct TransferLnurlPayRequest {
     pub from_pubkey: String,
     pub from_signature: String,
     pub to_signature: String,
-    /// Covered by both signatures. Present selects the `breez-lnurl:v2`
-    /// transfer messages; absent selects the legacy untimestamped one, which is
-    /// what a client predating v2 sends.
+    /// Covered by both `breez-lnurl:v2` signatures. Optional only so that a
+    /// client predating v2, which omits it, gets a 400 that says why rather
+    /// than a deserialization error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
 }

@@ -20,6 +20,8 @@ Where the implementation differs from the text below:
 - Signed `available` mirrors the unsigned route, which has no `require_spark_provider_enabled` gate. That keeps the two answers identical.
 - `/mode` now resolves the request domain, which the `blink-lnurl:v1` message needs. A `/mode` request to a host outside the allow-list now gets a 404, as the other management routes already did.
 - Phase 4 claims inside the repository transaction of the write it authorizes, for registration, deletion and transfer alike. So a refused or failed write never spends its statement, and routes never claim on their own.
+- Following review, unregister and transfer are v2-only, ahead of Phase 6. The pre-v2 unregister message equals the pre-v2 register message, so a register signature could delete an address its signer already held. The pre-v2 transfer message has no time or domain, so its signature never expired on any deployment. Breez SDK 0.22 sends these only from `deleteLightningAddress` and the transfer authorize/claim APIs, which the Blink app does not call.
+- The claim hash also covers the resolved domain, and a pre-v2 register stores the SDK's default description `Pay to {username}@{domain}` rather than the unsigned one in the body.
 
 ## 1. Problem
 
@@ -217,6 +219,7 @@ Files: `src/routes/account.rs`, `src/routes/mod.rs`, a new `src/routes/signed.rs
   - A timestamp outside the window gets the distinct error "transfer
     authorization is expired or not yet valid".
 - `None`: keep legacy `transfer:{username}-{to_pubkey}` for both signatures.
+  (Superseded: `None` is refused; see Status.)
 
 **2f. Unchanged on purpose**
 - `/mode`, zap receipt, invoice-paid and invoices-paid stay legacy-only for now.
@@ -295,12 +298,13 @@ stops replay of mutating requests within the window.
    `migrations/sqlite`.
 2. Repository: `claim_signed_message(hash, route, expires_at) -> bool` and
    `delete_expired_signed_messages(now)`. Start the pruner task in `main.rs`.
-3. `statement_hash = sha256(pubkey_hex || 0x00 || message)`. It hashes the
+3. `statement_hash = sha256(pubkey_hex || 0x00 || domain || 0x00 || message)`. It hashes the
    statement, not the signature bytes, because signatures are malleable.
 4. Claim on register, unregister and transfer, *after* the domain and input
    checks and *before* acting.
    - Inside the transaction for transfer.
-   - Expiry is `ts + 600`, or never for the untimestamped legacy transfer.
+   - Expiry is `ts + 600`. (The untimestamped legacy transfer, which would
+     have needed a claim kept forever, is no longer accepted; see Status.)
 5. A replay returns 409 "signature has already been used". Clients re-sign on
    retry, as the 0.23.1 SDK does.
 6. `/mode` keeps its monotonic `mode_last_timestamp` anchor. Claiming there is
@@ -337,7 +341,8 @@ Implementation if approved:
 - Once a route reads zero across deployments for an agreed window:
   - Drop its legacy candidate.
   - Make `ListMetadataRequest` header-only.
-  - Make transfer `timestamp` required.
+  - Give `/invoices-paid` a message of its own: today it shares
+    `{pubkey}-{ts}` with pre-v2 recover and metadata.
   - Then remove `GET /lnurlpay/available/{identifier}`.
 
 ## 4. Risks and checks
