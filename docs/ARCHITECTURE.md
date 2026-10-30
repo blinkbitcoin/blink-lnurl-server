@@ -36,7 +36,7 @@ graph TD
 
 1. Spark-compatible clients call `/lnurlpay/{pubkey}` management routes for availability, registration, deletion, transfer, recovery, metadata listing, invoice-paid notifications, and zap receipt publication.
 2. `src/auth.rs` optionally enforces bearer X.509 client-certificate authentication when a CA certificate is configured.
-3. `src/routes/account.rs` validates Spark public keys, signatures, timestamps, usernames, descriptions, and domain ownership.
+3. `src/routes/signed.rs` verifies the identity-key signature against each route's candidate messages: `breez-lnurl:v2` (Breez SDK 0.23+) first, then the pre-v2 form, counting legacy matches. `src/routes/account.rs` validates usernames, descriptions, and domain ownership, and builds each route's candidates.
 4. Route handlers mutate provider-neutral account and identifier state through `LnurlRepository` methods such as `upsert_spark_registration`, `delete_spark_registration`, and `transfer_identifier`.
 
 ### Blink internal account management

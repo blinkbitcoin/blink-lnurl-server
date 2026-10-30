@@ -7,7 +7,7 @@ This service exposes public LNURL-pay and Lightning Address endpoints, Spark-com
 The API uses different authentication mechanisms by route group:
 
 - **Public LNURL endpoints** (`/.well-known/lnurlp/*`, `/lnurlp/*`, `/verify/*`, `/health`) do not require credentials.
-- **Spark-compatible management endpoints** under `/lnurlpay/{pubkey}` verify Spark signatures in the JSON body or query string. The signed message is usually `{message}-{timestamp}` and timestamps must be within 600 seconds of server time (`src/routes/account.rs`, `src/routes/mod.rs`). If `LNURL_CA_CERT` is configured, these routes also require an `Authorization: Bearer <base64-der-client-certificate>` header validated against the configured CA and optional CRL (`src/auth.rs`).
+- **Spark-compatible management endpoints** under `/lnurlpay/{pubkey}` verify Spark identity-key signatures carried in the JSON body, the `X-Breez-Signature`/`X-Breez-Timestamp` headers (metadata), or the query string. See [Signed messages](#signed-messages) for the formats; timestamps must be within 600 seconds of server time (`src/routes/signed.rs`, `src/routes/account.rs`). If `LNURL_CA_CERT` is configured, these routes also require an `Authorization: Bearer <base64-der-client-certificate>` header validated against the configured CA and optional CRL (`src/auth.rs`).
 - **Internal Blink endpoints** under `/internal/*` require `Authorization: Bearer <jwt>`. Tokens must be RS256 JWTs with a matching `kid` from the configured JWKS, expected issuer, expected audience, `exp`, and `nbf` claims (`src/internal_auth.rs`). Required scopes are listed per endpoint below.
 - **Spark SSP webhook** `/webhook` requires the `X-Spark-Signature` header. The value must be a hex-encoded HMAC-SHA256 of the raw request body using the persisted `webhook_secret` setting (`src/routes/webhook.rs`).
 - **Blink invoice webhook** `/webhook/blink` is a public receiver endpoint for Blink invoice callbacks; it validates the payment request hash when `paymentRequest` is present and settles only stored Blink invoices (`src/routes/webhook.rs`).
@@ -22,13 +22,14 @@ The API uses different authentication mechanisms by route group:
 | `GET` | `/lnurlp/{domain}/{identifier}/invoice` | Create a BOLT11 invoice for an LNURL payment callback using the path domain. Used when `LNURL_CALLBACK_DOMAIN` is configured. | No |
 | `GET` | `/verify/{payment_hash}` | Return LUD-21 settlement status, preimage, and invoice for a stored payment hash. | No |
 | `GET` | `/health` | Readiness check returning HTTP 200. | No |
-| `GET` | `/lnurlpay/available/{identifier}` | Check whether a Spark username is available on the request host domain. | Optional client certificate if `LNURL_CA_CERT` is configured |
+| `GET` | `/lnurlpay/available/{identifier}` | Check whether a Spark username is available on the request host domain (Breez SDK before 0.23). | Optional client certificate if `LNURL_CA_CERT` is configured |
+| `POST` | `/lnurlpay/{pubkey}/available` | Check whether a Spark username is available to `{pubkey}` on the request host domain (Breez SDK 0.23+). | Spark signature (v2 only); optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}` | Register a Spark LNURL username. | Spark signature; optional client certificate |
 | `DELETE` | `/lnurlpay/{pubkey}` | Unregister a Spark LNURL username. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/transfer` | Transfer a Spark username from one Spark pubkey to another. | Spark signatures; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/recover` | Recover the mode, and the registered LNURL and Lightning Address, for a Spark pubkey. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/mode` | Set the region-determination mode (`enhanced` or `anon`) for a Spark pubkey, creating the account on first contact. | Spark signature; optional client certificate; per-IP rate limit |
-| `GET` | `/lnurlpay/{pubkey}/metadata` | List sender comments, zap requests, zap receipts, preimages, and update times for a Spark pubkey. | Spark signature query parameters; optional client certificate |
+| `GET` | `/lnurlpay/{pubkey}/metadata` | List sender comments, zap requests, zap receipts, preimages, and update times for a Spark pubkey. Served `Cache-Control: no-store, private`. | Spark signature in `X-Breez-*` headers or query parameters; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/metadata/{payment_hash}/zap` | Publish and persist a NIP-57 zap receipt for a stored zap request. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/invoice-paid` | Legacy single-invoice paid notification with a preimage. | Spark signature; optional client certificate |
 | `POST` | `/lnurlpay/{pubkey}/invoices-paid` | Batch paid-invoice notification with up to 100 invoices. | Spark signature; optional client certificate |
@@ -91,7 +92,41 @@ Successful responses contain exactly `pr`, `routes`, and `verify`:
 
 When `LNURL_CALLBACK_DOMAIN` is configured, the advertised `verify` URL uses that host as well.
 
+### Signed messages
+
+Every signed route verifies an ECDSA signature by the Spark identity key over `sha256(message)`, hex-encoded DER. A route accepts the formats below in order, and the first that verifies wins.
+
+**`breez-lnurl:v2`** (Breez SDK 0.23+). The fields are joined by `\n`: the version, the route, the request domain, then the route's own fields. The builders come from Breez's `lnurl-models` crate (pinned in `Cargo.toml`, with golden vectors in `src/signed_message.rs`), so the bytes match what the SDK signs. The domain is the request host as the server resolves it (see `docs/ARCHITECTURE.md`), lowercased, with no default port. If no candidate verifies on a route that names a domain, the error is `"invalid signature for domain '<domain>'"`, which separates "signed for another host" from "signed by another key".
+
+| Route | v2 fields after `breez-lnurl:v2\n<route>\n<domain>` | Pre-v2 message |
+|---|---|---|
+| `POST /lnurlpay/{pubkey}/available` | `<pubkey>\n<username>\n<ts>` | none (v2 only) |
+| `POST /lnurlpay/{pubkey}` (register) | `<username>\n<sha256-hex(description)>\n<ts>` | `{username}-{ts}` |
+| `DELETE /lnurlpay/{pubkey}` (unregister) | `<username>\n<ts>` | `{username}-{ts}` |
+| `POST /lnurlpay/{pubkey}/recover` | `<pubkey>\n<ts>` | `{pubkey}-{ts}` |
+| `GET /lnurlpay/{pubkey}/metadata` | `<pubkey>\n<ts>` | `{pubkey}-{ts}` |
+| `POST /lnurlpay/{to_pubkey}/transfer`, current owner | `transfer-from`: `<username>\n<from_pubkey>\n<to_pubkey>\n<ts>` | `transfer:{username}-{to_pubkey}` |
+| `POST /lnurlpay/{to_pubkey}/transfer`, transferee | `transfer-to`: `<username>\n<from_pubkey>\n<to_pubkey>\n<sha256-hex(description)>\n<ts>` | `transfer:{username}-{to_pubkey}` |
+
+The description is hashed byte-exact; it is never trimmed or normalized.
+
+On transfer, a `timestamp` field in the body selects the v2 messages for both signatures, with no legacy fallback. A v2 timestamp outside the window is refused with `"transfer authorization is expired or not yet valid"`. Without a `timestamp`, both signatures cover the legacy message.
+
+`/mode`, `/metadata/{payment_hash}/zap`, `/invoice-paid`, and `/invoices-paid` verify only their pre-v2 messages: `mode:{mode}:{pubkey}-{ts}`, `{zap_receipt}-{ts}`, `{preimage}-{ts}`, and `{pubkey}-{ts}`.
+
+Pre-v2 verifies are counted per route and logged once a minute on the `blink_lnurl::legacy_signatures` tracing target, for example `legacy signed-message verifies: register=0 unregister=0 …`. The legacy forms are removed once those counts read zero.
+
 ### Spark-compatible management requests
+
+Signed availability request (`POST /lnurlpay/{pubkey}/available`), answered with `{"available": true|false}`:
+
+```json
+{
+  "username": "alice",
+  "signature": "<der-signature-hex>",
+  "timestamp": 1710000000
+}
+```
 
 Registration request:
 
@@ -128,7 +163,7 @@ Batch invoice-paid request:
 }
 ```
 
-Recover response. `mode` is always present; `null` means the account has never chosen one. The address fields are absent for an account that has a mode but no username:
+Recover response. `mode` is always present; `null` means the account has never chosen one. For an account that has a mode but no username, the answer depends on the signature format. A pre-v2 signature (the Blink app's own call) gets the mode with the address fields absent. A `breez-lnurl:v2` signature (the Breez SDK, whose response type requires every address field) gets `404`:
 
 ```json
 {
@@ -159,6 +194,8 @@ Mode response:
 ```
 
 Setting `enhanced` resolves the request IP (from `x-real-ip`) to a country and stores it as compliance evidence; setting `anon` clears that evidence in the same statement and stops invoice issuance for the account's Lightning Address. Registering a username and receiving a user-initiated transfer are both refused while the stored mode is `anon`. The server-initiated migration transfer is the deliberate exception: it completes even for an `anon` destination, and the address stays dormant (no invoices are minted) until the account switches to `enhanced` — failing the migration would be the harsher outcome for a state only the account holder can create. The accepted timestamp is stored verbatim as the monotonic anchor; a timestamp more than 30 seconds ahead of server time is refused with `mode_timestamp_in_future` rather than clamped — a clamped anchor would sit below the timestamp of the request that wrote it, letting a captured request be replayed past a later mode switch. The refusal caps any fast-clock cross-device lockout at 30 seconds.
+
+Metadata credentials. Breez SDK 0.23+ sends `X-Breez-Signature` and `X-Breez-Timestamp` headers. The `signature` and `timestamp` query parameters remain accepted. A header that is present wins outright, and a malformed one is refused with `400` rather than falling back to the query.
 
 Successful `DELETE`, `/invoice-paid`, and `/invoices-paid` responses have an empty body.
 

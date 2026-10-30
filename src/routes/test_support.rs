@@ -70,6 +70,8 @@ pub(crate) struct MockRepository {
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
     pub(super) spark_modes: std::sync::Arc<Mutex<HashMap<String, SparkAccountMode>>>,
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
+    /// `(domain, pubkey, identifier)` per accepted unregister.
+    pub(super) spark_unregistrations: std::sync::Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +138,10 @@ impl MockRepository {
 
     pub(super) fn spark_registration_count(&self) -> usize {
         self.spark_registrations.lock().unwrap().len()
+    }
+
+    pub(super) fn spark_unregistrations(&self) -> Vec<(String, String, String)> {
+        self.spark_unregistrations.lock().unwrap().clone()
     }
 }
 
@@ -204,6 +210,19 @@ impl LnurlRepository for MockRepository {
             .lock()
             .unwrap()
             .push(registration.clone());
+        Ok(())
+    }
+    async fn delete_spark_registration(
+        &self,
+        domain: &str,
+        pubkey: &str,
+        identifier: &str,
+    ) -> Result<(), LnurlRepositoryError> {
+        self.spark_unregistrations.lock().unwrap().push((
+            domain.to_string(),
+            pubkey.to_string(),
+            identifier.to_string(),
+        ));
         Ok(())
     }
     async fn get_spark_account_mode(

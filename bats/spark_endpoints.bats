@@ -96,6 +96,63 @@ identifier_spark_pubkey() {
   assert_json_equals "$output" '.available' 'true'
 }
 
+@test "spark: v2 signed availability register recover metadata and unregister" {
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+
+  run register_user_v2 "v2user" "localhost:8080" "V2 test wallet"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.lightning_address' 'v2user@localhost:8080'
+
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'false'
+
+  response="$(recover_user_v2_status_body "v2user" "localhost:8080")"
+  [ "${response##*$'\n'}" = "200" ]
+  body="${response%$'\n'*}"
+  assert_json_equals "$body" '.username' 'v2user'
+  assert_json_equals "$body" '.description' 'V2 test wallet'
+
+  run list_metadata_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no-store, private"* ]]
+
+  run unregister_user_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+}
+
+@test "spark: v2 signature for another domain names the resolved domain" {
+  response="$(username_available_v2_status_body "v2domain" "localhost:8080" "other.example")"
+  [ "${response##*$'\n'}" = "400" ]
+  [ "${response%$'\n'*}" = "\"invalid signature for domain 'localhost:8080'\"" ]
+}
+
+@test "spark: v2 transfer hands the address to the transferee" {
+  run register_user_v2 "v2transfer" "localhost:8080" "V2 transfer source"
+  [ "$status" -eq 0 ]
+
+  run transfer_user_v2 "v2transfer" "localhost:8080" "V2 transfer target"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.lightning_address' 'v2transfer@localhost:8080'
+
+  response="$(recover_user_v2_status_body "v2transfer" "localhost:8080" "to")"
+  [ "${response##*$'\n'}" = "200" ]
+  assert_json_equals "${response%$'\n'*}" '.description' 'V2 transfer target'
+
+  response="$(recover_user_v2_status_body "v2transfer" "localhost:8080")"
+  [ "${response##*$'\n'}" = "404" ]
+
+  # The transferee identity is shared with the later legacy transfer test.
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "DELETE FROM account_identifiers WHERE domain = 'localhost:8080' AND identifier = 'v2transfer'" >/dev/null
+}
+
 @test "spark: availability and duplicate registration preserve Spark contract" {
   run username_available "dupeuser" "localhost:8080"
   [ "$status" -eq 0 ]

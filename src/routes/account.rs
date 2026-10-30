@@ -1,10 +1,12 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
+    response::IntoResponse,
 };
 use axum_extra::extract::Host;
 use bitcoin::secp256k1::PublicKey;
+use lnurl_models::signed_message;
 use serde_json::Value;
 use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
@@ -35,12 +37,18 @@ use super::{
     lnurl_pay::PublicIdentifierIntent,
     lnurl_pay::PublicRecipient,
     signed::{
-        Candidate, SignedRoute, check_timestamp, legacy_timestamped, parse_signed_request,
-        verify_candidates,
+        Candidate, MessageFormat, SignedRoute, check_timestamp, legacy_timestamped,
+        parse_signed_request, verify_candidates,
     },
 };
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
+
+/// Where `list_metadata` reads its credential from, in preference to the query
+/// string. A GET's query string lands in proxy and access logs, and the
+/// response carries preimages.
+const METADATA_SIGNATURE_HEADER: &str = "x-breez-signature";
+const METADATA_TIMESTAMP_HEADER: &str = "x-breez-timestamp";
 
 // Bounds how far ahead of the stored anchor an accepted mode request can sit,
 // which bounds the cross-device lockout after a fast-clock request.
@@ -63,17 +71,28 @@ where
         require_spark_provider_enabled(&state)?;
 
         let username = canonical_spark_username_for_route(&payload.username)?;
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &username,
-            payload.timestamp,
-            SignedRoute::Register,
-            &state,
-        )
-        .await?;
+        // The description and the resolved domain are both fields of the v2
+        // message, so both are settled before anything verifies a signature.
         validate_description(&payload.description)?;
         let domain = sanitize_domain(&state, &host).await?;
+        let (pubkey, signature) = parse_signed_request(&pubkey, &payload.signature)?;
+        check_timestamp(payload.timestamp)?;
+        let candidates = [
+            Candidate::breez_v2(
+                signed_message::register(
+                    &domain,
+                    &username,
+                    &payload.description,
+                    payload.timestamp,
+                ),
+                SignedRoute::Register,
+            ),
+            Candidate::legacy(
+                legacy_timestamped(&username, payload.timestamp),
+                SignedRoute::Register,
+            ),
+        ];
+        verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
 
         let stored_mode = stored_account_mode(&state, &pubkey.to_string()).await?;
         if stored_mode == Some(AccountMode::Anon) {
@@ -115,17 +134,28 @@ where
 
         let username = canonical_spark_username_for_route(&payload.username)?;
         validate_description(&payload.description)?;
+        let domain = sanitize_domain(&state, &host).await?;
 
-        let message = format!("transfer:{username}-{to_pubkey}");
-        let from_pk = verify_transfer_signature(
-            &payload.from_pubkey,
-            &payload.from_signature,
-            &message,
-            &state,
-        )
-        .await?;
-        let to_pk =
-            verify_transfer_signature(&to_pubkey, &payload.to_signature, &message, &state).await?;
+        let (from_pk, from_sig) =
+            parse_signed_request(&payload.from_pubkey, &payload.from_signature)?;
+        let (to_pk, to_sig) = parse_signed_request(&to_pubkey, &payload.to_signature)?;
+        // A timestamp selects the v2 messages on both signatures, with no
+        // legacy fallback: stripping it from a v2 request fails rather than
+        // downgrades.
+        if let Some(timestamp) = payload.timestamp {
+            check_timestamp(timestamp).map_err(|_| transfer_expired())?;
+        }
+        let (from_candidates, to_candidates) = transfer_candidates(
+            &domain,
+            &username,
+            &from_pk,
+            &to_pk,
+            &to_pubkey,
+            &payload.description,
+            payload.timestamp,
+        );
+        verify_candidates(&state, &from_pk, &from_sig, &from_candidates, Some(&domain)).await?;
+        verify_candidates(&state, &to_pk, &to_sig, &to_candidates, Some(&domain)).await?;
 
         if from_pk == to_pk {
             return Err((
@@ -136,7 +166,6 @@ where
             ));
         }
 
-        let domain = sanitize_domain(&state, &host).await?;
         let from_pubkey = from_pk.to_string();
         let to_pubkey = to_pk.to_string();
 
@@ -193,16 +222,21 @@ where
         require_spark_provider_enabled(&state)?;
 
         let username = canonical_spark_username_for_route(&payload.username)?;
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &username,
-            payload.timestamp,
-            SignedRoute::Unregister,
-            &state,
-        )
-        .await?;
         let domain = sanitize_domain(&state, &host).await?;
+        let (pubkey, signature) = parse_signed_request(&pubkey, &payload.signature)?;
+        check_timestamp(payload.timestamp)?;
+        let candidates = [
+            Candidate::breez_v2(
+                signed_message::unregister(&domain, &username, payload.timestamp),
+                SignedRoute::Unregister,
+            ),
+            // Byte-identical to the legacy register message.
+            Candidate::legacy(
+                legacy_timestamped(&username, payload.timestamp),
+                SignedRoute::Unregister,
+            ),
+        ];
+        verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
 
         state
             .db
@@ -226,16 +260,25 @@ where
         headers: HeaderMap,
         Json(payload): Json<RecoverLnurlPayRequest>,
     ) -> Result<Json<RecoverLnurlPayResponse>, (StatusCode, Json<Value>)> {
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &pubkey,
-            payload.timestamp,
-            SignedRoute::Recover,
-            &state,
-        )
-        .await?;
         let domain = sanitize_domain(&state, &host).await?;
+        let (identity, signature) = parse_signed_request(&pubkey, &payload.signature)?;
+        check_timestamp(payload.timestamp)?;
+        let candidates = [
+            Candidate::breez_v2(
+                signed_message::recover(&domain, &identity.to_string(), payload.timestamp),
+                SignedRoute::Recover,
+            ),
+            // The path segment verbatim, which is what the legacy message was
+            // built from. Byte-identical to the legacy metadata message.
+            Candidate::legacy(
+                legacy_timestamped(&pubkey, payload.timestamp),
+                SignedRoute::Recover,
+            ),
+        ];
+        let matched = verify_candidates(&state, &identity, &signature, &candidates, Some(&domain))
+            .await?
+            .format;
+        let pubkey = identity;
 
         let account = state
             .db
@@ -260,8 +303,15 @@ where
         let mode = mode.map(|mode| mode.as_str().to_string());
 
         // An account with a mode but no username is legitimate: mode is recorded
-        // before any address can exist.
+        // before any address can exist. Only the app's own recover reads that
+        // mode-only answer; a v2 signature comes from the Breez SDK, whose
+        // response type requires every address field and treats 404 as "no
+        // address", so it gets the 404.
         match (user, mode.as_ref()) {
+            (None, Some(_)) if matched == MessageFormat::BreezV2 => Err((
+                StatusCode::NOT_FOUND,
+                Json(Value::String("user not found".into())),
+            )),
             (Some(user), _) => Ok(Json(RecoverLnurlPayResponse {
                 lnurl: Some(format!("lnurlp://{}/lnurlp/{}", user.domain, user.username)),
                 lightning_address: Some(format!("{}@{}", user.username, user.domain)),
@@ -352,19 +402,29 @@ where
     }
 
     pub async fn list_metadata(
+        Host(host): Host,
         Path(pubkey): Path<String>,
+        headers: HeaderMap,
         Query(params): Query<ListMetadataRequest>,
         Extension(state): Extension<State<DB>>,
-    ) -> Result<Json<ListMetadataResponse>, (StatusCode, Json<Value>)> {
-        let pubkey = validate(
-            &pubkey,
-            &params.signature,
-            &pubkey,
-            params.timestamp,
-            SignedRoute::Metadata,
-            &state,
-        )
-        .await?;
+    ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+        let (signature, timestamp) =
+            metadata_credentials(&headers, params.signature, params.timestamp)?;
+        let domain = sanitize_domain(&state, &host).await?;
+        let (identity, signature) = parse_signed_request(&pubkey, &signature)?;
+        check_timestamp(timestamp)?;
+        let candidates = [
+            Candidate::breez_v2(
+                signed_message::metadata(&domain, &identity.to_string(), timestamp),
+                SignedRoute::Metadata,
+            ),
+            Candidate::legacy(
+                legacy_timestamped(&pubkey, timestamp),
+                SignedRoute::Metadata,
+            ),
+        ];
+        verify_candidates(&state, &identity, &signature, &candidates, Some(&domain)).await?;
+        let pubkey = identity;
         let offset = params.offset.unwrap_or(super::DEFAULT_METADATA_OFFSET);
         let limit = params.limit.unwrap_or(super::DEFAULT_METADATA_LIMIT);
         let metadata = state
@@ -378,7 +438,12 @@ where
                     Json(Value::String("internal server error".into())),
                 )
             })?;
-        Ok(Json(ListMetadataResponse { metadata }))
+        // The response carries preimages, so no cache between here and the
+        // client may retain it.
+        Ok((
+            [(CACHE_CONTROL, "no-store, private")],
+            Json(ListMetadataResponse { metadata }),
+        ))
     }
 }
 
@@ -637,28 +702,100 @@ pub(super) async fn validate<DB>(
     Ok(pubkey)
 }
 
-/// Verify a transfer-route signature over the canonical message
-/// `"transfer:{username}-{to_pubkey}"`. Used symmetrically on both ends: the
-/// current owner A and the new owner B sign the exact same bytes, and the
-/// route calls this once per signature. No timestamp — replay can only
-/// re-execute the same A → B → username transfer, which the server-side
-/// atomic delete bounds to the case where A still owns the name. The
-/// `"transfer:"` prefix domain-separates from `validate()`'s
-/// `"{message}-{timestamp}"` format so a captured register signature cannot
-/// be replayed as a transfer.
-pub(super) async fn verify_transfer_signature<DB>(
-    pubkey: &str,
-    signature: &str,
-    message: &str,
-    state: &State<DB>,
-) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let (pk, signature) = parse_signed_request(pubkey, signature)?;
-    let candidates = [Candidate::legacy(
-        message.to_string(),
-        SignedRoute::Transfer,
-    )];
-    verify_candidates(state, &pk, &signature, &candidates, None).await?;
-    Ok(pk)
+/// The messages the current owner's and the transferee's signatures may
+/// cover, in that order.
+///
+/// With a timestamp, v2 only: role-tagged so A's signature does not verify in
+/// B's slot, and B's commits to the description because B chooses it. Without
+/// one, the legacy `"transfer:{username}-{to_pubkey}"` that both parties sign
+/// identically, built from the path segment verbatim.
+fn transfer_candidates(
+    domain: &str,
+    username: &str,
+    from_pubkey: &PublicKey,
+    to_pubkey: &PublicKey,
+    raw_to_pubkey: &str,
+    description: &str,
+    timestamp: Option<u64>,
+) -> ([Candidate; 1], [Candidate; 1]) {
+    let Some(timestamp) = timestamp else {
+        let legacy = || {
+            Candidate::legacy(
+                format!("transfer:{username}-{raw_to_pubkey}"),
+                SignedRoute::Transfer,
+            )
+        };
+        return ([legacy()], [legacy()]);
+    };
+    let (from, to) = (from_pubkey.to_string(), to_pubkey.to_string());
+    (
+        [Candidate::breez_v2(
+            signed_message::transfer_from(domain, username, &from, &to, timestamp),
+            SignedRoute::Transfer,
+        )],
+        [Candidate::breez_v2(
+            signed_message::transfer_to(domain, username, &from, &to, description, timestamp),
+            SignedRoute::Transfer,
+        )],
+    )
+}
+
+/// Distinct from a rejected signature so a caller can tell a stale
+/// authorization from a wrongly signed one. Both sides sign the same timestamp, so
+/// this also covers a handover that took longer than the accept window.
+fn transfer_expired() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(Value::String(
+            "transfer authorization is expired or not yet valid".into(),
+        )),
+    )
+}
+
+/// Take the metadata request's signature and timestamp from the headers,
+/// falling back to the query string only where a header is absent. A present
+/// header wins outright, and one that fails to parse is refused rather than
+/// falling through, so a query parameter never overrides it.
+fn metadata_credentials(
+    headers: &HeaderMap,
+    query_signature: Option<String>,
+    query_timestamp: Option<u64>,
+) -> Result<(String, u64), (StatusCode, Json<Value>)> {
+    let signature = match headers.get(METADATA_SIGNATURE_HEADER) {
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| malformed_header(METADATA_SIGNATURE_HEADER))?
+                .to_string(),
+        ),
+        None => query_signature,
+    };
+    let timestamp = match headers.get(METADATA_TIMESTAMP_HEADER) {
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| malformed_header(METADATA_TIMESTAMP_HEADER))?,
+        ),
+        None => query_timestamp,
+    };
+
+    match (signature, timestamp) {
+        (Some(signature), Some(timestamp)) => Ok((signature, timestamp)),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(Value::String("missing signature or timestamp".into())),
+        )),
+    }
+}
+
+fn malformed_header(name: &str) -> (StatusCode, Json<Value>) {
+    trace!("malformed '{name}' header");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(Value::String(format!("malformed '{name}' header"))),
+    )
 }
 
 pub(super) fn parse_pubkey(pubkey: &str) -> Result<PublicKey, (StatusCode, Json<Value>)> {
@@ -1051,6 +1188,7 @@ mod tests {
                 from_pubkey: "not-a-pubkey".to_string(),
                 from_signature: "00".to_string(),
                 to_signature: "00".to_string(),
+                timestamp: None,
             }),
         )
         .await;
@@ -2146,6 +2284,7 @@ mod tests {
                 from_pubkey: from_pubkey.to_string(),
                 from_signature: sign_hex(from, &message),
                 to_signature: sign_hex(to, &message),
+                timestamp: None,
             }),
         )
         .await
@@ -2187,5 +2326,417 @@ mod tests {
         assert_eq!(record.mode, Some(AccountMode::Enhanced));
         assert_eq!(record.mode_source, Some(ModeSource::Migration));
         assert!(record.country.is_none());
+    }
+
+    // -- breez-lnurl:v2 signed messages (Breez SDK 0.23+) ----------------------
+
+    const V2_DOMAIN: &str = "example.com";
+
+    async fn v2_state(repo: MockRepository) -> State<MockRepository> {
+        route_test_state_with_country_resolver(repo, CountryResolver::disabled()).await
+    }
+
+    fn assert_bad_request(result: Result<impl Sized, (StatusCode, Json<Value>)>, expected: &str) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected 400 {expected}");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String(expected.to_string()));
+    }
+
+    fn invalid_signature_for_domain() -> String {
+        format!("invalid signature for domain '{V2_DOMAIN}'")
+    }
+
+    async fn post_register(
+        state: &State<MockRepository>,
+        pubkey: &str,
+        signature: String,
+        timestamp: u64,
+        description: &str,
+    ) -> Result<Json<RegisterLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        LnurlServer::register(
+            Host(V2_DOMAIN.to_string()),
+            Path(pubkey.to_string()),
+            Extension(state.clone()),
+            HeaderMap::new(),
+            Json(RegisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature,
+                timestamp,
+                description: description.to_string(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn register_accepts_a_breez_v2_signature() {
+        let (secret, pubkey) = mode_key(40);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+        let message = signed_message::register(V2_DOMAIN, "alice", "Pay to alice", timestamp);
+
+        let Json(response) = post_register(
+            &state,
+            &pubkey,
+            sign_hex(&secret, &message),
+            timestamp,
+            "Pay to alice",
+        )
+        .await
+        .expect("a v2 register signature must verify");
+
+        assert_eq!(response.lightning_address, "alice@example.com");
+        assert_eq!(repo.spark_registration_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_v2_signature_is_bound_to_domain_description_and_route() {
+        let (secret, pubkey) = mode_key(41);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+
+        let other_domain = signed_message::register("other.example", "alice", "d", timestamp);
+        let other_description = signed_message::register(V2_DOMAIN, "alice", " d ", timestamp);
+        let other_route = signed_message::unregister(V2_DOMAIN, "alice", timestamp);
+        for message in [other_domain, other_description, other_route] {
+            assert_bad_request(
+                post_register(&state, &pubkey, sign_hex(&secret, &message), timestamp, "d").await,
+                &invalid_signature_for_domain(),
+            );
+        }
+        assert_eq!(repo.spark_registration_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unregister_accepts_breez_v2_and_legacy_signatures() {
+        let (secret, pubkey) = mode_key(42);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+
+        for message in [
+            signed_message::unregister(V2_DOMAIN, "alice", timestamp),
+            format!("alice-{timestamp}"),
+        ] {
+            LnurlServer::unregister(
+                Host(V2_DOMAIN.to_string()),
+                Path(pubkey.clone()),
+                Extension(state.clone()),
+                Json(UnregisterLnurlPayRequest {
+                    username: "alice".to_string(),
+                    signature: sign_hex(&secret, &message),
+                    timestamp,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unregister must verify {message:?}: {e:?}"));
+        }
+        assert_eq!(repo.spark_unregistrations().len(), 2);
+    }
+
+    async fn post_recover(
+        state: &State<MockRepository>,
+        pubkey: &str,
+        message: &str,
+        secret: &SecretKey,
+        timestamp: u64,
+    ) -> Result<Json<RecoverLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        LnurlServer::recover(
+            Host(V2_DOMAIN.to_string()),
+            Path(pubkey.to_string()),
+            Extension(state.clone()),
+            HeaderMap::new(),
+            Json(RecoverLnurlPayRequest {
+                signature: sign_hex(secret, message),
+                timestamp,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recover_answers_a_mode_only_account_by_signature_format() {
+        let (secret, pubkey) = mode_key(43);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let state = v2_state(repo).await;
+        let timestamp = now_u64();
+
+        // The Breez SDK requires every address field, so "no address" is a 404.
+        let v2 = signed_message::recover(V2_DOMAIN, &pubkey, timestamp);
+        let Err((status, _)) = post_recover(&state, &pubkey, &v2, &secret, timestamp).await else {
+            panic!("a v2 recover of a mode-only account must 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The app's own recover reads the mode from the legacy answer.
+        let legacy = format!("{pubkey}-{timestamp}");
+        let Json(response) = post_recover(&state, &pubkey, &legacy, &secret, timestamp)
+            .await
+            .expect("a legacy recover of a mode-only account returns the mode");
+        assert_eq!(response.mode.as_deref(), Some("enhanced"));
+    }
+
+    #[tokio::test]
+    async fn recover_refuses_a_v2_metadata_signature() {
+        let (secret, pubkey) = mode_key(44);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Enhanced));
+        let state = v2_state(repo).await;
+        let timestamp = now_u64();
+
+        let metadata = signed_message::metadata(V2_DOMAIN, &pubkey, timestamp);
+        assert_bad_request(
+            post_recover(&state, &pubkey, &metadata, &secret, timestamp).await,
+            &invalid_signature_for_domain(),
+        );
+    }
+
+    async fn get_metadata(
+        state: &State<MockRepository>,
+        pubkey: &str,
+        headers: HeaderMap,
+        query: ListMetadataRequest,
+    ) -> axum::response::Response {
+        match LnurlServer::list_metadata(
+            Host(V2_DOMAIN.to_string()),
+            Path(pubkey.to_string()),
+            headers,
+            Query(query),
+            Extension(state.clone()),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    fn metadata_query(signature: Option<String>, timestamp: Option<u64>) -> ListMetadataRequest {
+        ListMetadataRequest {
+            signature,
+            timestamp,
+            offset: None,
+            limit: None,
+            updated_after: None,
+        }
+    }
+
+    fn breez_headers(signature: &str, timestamp: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Breez-Signature", signature.parse().unwrap());
+        headers.insert("X-Breez-Timestamp", timestamp.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn metadata_accepts_a_v2_header_credential_and_is_not_cached() {
+        let (secret, pubkey) = mode_key(45);
+        let state = v2_state(MockRepository::default()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(
+            &secret,
+            &signed_message::metadata(V2_DOMAIN, &pubkey, timestamp),
+        );
+
+        let response = get_metadata(
+            &state,
+            &pubkey,
+            breez_headers(&signature, &timestamp.to_string()),
+            metadata_query(None, None),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            "no-store, private"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_still_accepts_a_legacy_query_credential() {
+        let (secret, pubkey) = mode_key(46);
+        let state = v2_state(MockRepository::default()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(&secret, &format!("{pubkey}-{timestamp}"));
+
+        let response = get_metadata(
+            &state,
+            &pubkey,
+            HeaderMap::new(),
+            metadata_query(Some(signature), Some(timestamp)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metadata_header_wins_and_a_malformed_one_is_refused() {
+        let (secret, pubkey) = mode_key(47);
+        let state = v2_state(MockRepository::default()).await;
+        let timestamp = now_u64();
+        let good_query = metadata_query(
+            Some(sign_hex(&secret, &format!("{pubkey}-{timestamp}"))),
+            Some(timestamp),
+        );
+
+        // A wrong header signature is not rescued by a valid query one.
+        let wrong = sign_hex(&secret, "something else");
+        let response = get_metadata(
+            &state,
+            &pubkey,
+            breez_headers(&wrong, &timestamp.to_string()),
+            good_query,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let good_query = metadata_query(
+            Some(sign_hex(&secret, &format!("{pubkey}-{timestamp}"))),
+            Some(timestamp),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Breez-Timestamp", "soon".parse().unwrap());
+        let response = get_metadata(&state, &pubkey, headers, good_query).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = get_metadata(
+            &state,
+            &pubkey,
+            HeaderMap::new(),
+            metadata_query(None, None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn run_v2_transfer(
+        repo: MockRepository,
+        from_signature: String,
+        to_signature: String,
+        from_pubkey: &str,
+        to_pubkey: &str,
+        timestamp: u64,
+    ) -> Result<Json<TransferLnurlPayResponse>, (StatusCode, Json<Value>)> {
+        LnurlServer::transfer(
+            Host(V2_DOMAIN.to_string()),
+            Path(to_pubkey.to_string()),
+            Extension(v2_state(repo).await),
+            Json(TransferLnurlPayRequest {
+                username: "alice".to_string(),
+                description: "Alice".to_string(),
+                from_pubkey: from_pubkey.to_string(),
+                from_signature,
+                to_signature,
+                timestamp: Some(timestamp),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn transfer_accepts_role_tagged_v2_signatures() {
+        let (from, from_pubkey) = mode_key(48);
+        let (to, to_pubkey) = mode_key(49);
+        let repo = MockRepository::default()
+            .with_resolved_recipient(transfer_source_recipient(&from_pubkey));
+        let timestamp = now_u64();
+        let from_message =
+            signed_message::transfer_from(V2_DOMAIN, "alice", &from_pubkey, &to_pubkey, timestamp);
+        let to_message = signed_message::transfer_to(
+            V2_DOMAIN,
+            "alice",
+            &from_pubkey,
+            &to_pubkey,
+            "Alice",
+            timestamp,
+        );
+
+        let Json(response) = run_v2_transfer(
+            repo.clone(),
+            sign_hex(&from, &from_message),
+            sign_hex(&to, &to_message),
+            &from_pubkey,
+            &to_pubkey,
+            timestamp,
+        )
+        .await
+        .expect("role-tagged v2 transfer signatures must verify");
+        assert_eq!(response.lightning_address, "alice@example.com");
+
+        // Each signature only verifies in its own role's slot.
+        assert_bad_request(
+            run_v2_transfer(
+                repo.clone(),
+                sign_hex(&from, &to_message),
+                sign_hex(&to, &from_message),
+                &from_pubkey,
+                &to_pubkey,
+                timestamp,
+            )
+            .await,
+            &invalid_signature_for_domain(),
+        );
+
+        // A timestamp selects v2 outright: legacy bytes do not verify beside it.
+        let legacy = format!("transfer:alice-{to_pubkey}");
+        assert_bad_request(
+            run_v2_transfer(
+                repo,
+                sign_hex(&from, &legacy),
+                sign_hex(&to, &legacy),
+                &from_pubkey,
+                &to_pubkey,
+                timestamp,
+            )
+            .await,
+            &invalid_signature_for_domain(),
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_reports_a_stale_v2_authorization_as_expired() {
+        let (from, from_pubkey) = mode_key(50);
+        let (to, to_pubkey) = mode_key(51);
+        let timestamp = now_u64() - 601;
+        let from_message =
+            signed_message::transfer_from(V2_DOMAIN, "alice", &from_pubkey, &to_pubkey, timestamp);
+        let to_message = signed_message::transfer_to(
+            V2_DOMAIN,
+            "alice",
+            &from_pubkey,
+            &to_pubkey,
+            "Alice",
+            timestamp,
+        );
+
+        assert_bad_request(
+            run_v2_transfer(
+                MockRepository::default(),
+                sign_hex(&from, &from_message),
+                sign_hex(&to, &to_message),
+                &from_pubkey,
+                &to_pubkey,
+                timestamp,
+            )
+            .await,
+            "transfer authorization is expired or not yet valid",
+        );
+    }
+
+    /// The v2 message is built from the canonical username, so canonical form
+    /// must stay exactly what the SDK signs: `trim` then `lowercase`.
+    #[test]
+    fn canonical_username_is_what_breez_signs() {
+        for input in ["alice", " Alice ", "ALICE_99"] {
+            assert_eq!(
+                canonical_spark_username(input).unwrap(),
+                lnurl_models::sanitize_username(input)
+            );
+        }
     }
 }

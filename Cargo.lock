@@ -3900,6 +3900,7 @@ dependencies = [
  "anyhow",
  "bitcoin",
  "hex",
+ "lnurl-models",
  "serde_json",
  "spark",
  "spark-wallet",

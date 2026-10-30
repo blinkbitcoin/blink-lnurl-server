@@ -122,6 +122,15 @@ pub struct CheckUsernameAvailableResponse {
     pub available: bool,
 }
 
+/// Body of the signed availability check, which answers for the pubkey in the
+/// path rather than for everyone.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckUsernameAvailableRequest {
+    pub username: String,
+    pub signature: String,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecoverLnurlPayRequest {
     pub signature: String,
@@ -183,6 +192,11 @@ pub struct TransferLnurlPayRequest {
     pub from_pubkey: String,
     pub from_signature: String,
     pub to_signature: String,
+    /// Covered by both signatures. Present selects the `breez-lnurl:v2`
+    /// transfer messages; absent selects the legacy untimestamped one, which is
+    /// what a client predating v2 sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,8 +207,11 @@ pub struct TransferLnurlPayResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListMetadataRequest {
-    pub signature: String,
-    pub timestamp: u64,
+    /// Compatibility path: v2 clients send the credential in the
+    /// `X-Breez-Signature` / `X-Breez-Timestamp` headers instead, which keeps it
+    /// out of proxy and access logs.
+    pub signature: Option<String>,
+    pub timestamp: Option<u64>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
     pub updated_after: Option<i64>,

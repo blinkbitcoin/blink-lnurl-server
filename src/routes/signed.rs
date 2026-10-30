@@ -31,6 +31,8 @@ const LEGACY_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// The route a signature authorizes, which names its legacy counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SignedRoute {
+    /// v2-only: the route is new, so it has no legacy form and no counter.
+    Available,
     Register,
     Unregister,
     Transfer,
@@ -58,6 +60,7 @@ impl SignedRoute {
 
     pub(super) const fn as_str(self) -> &'static str {
         match self {
+            Self::Available => "available",
             Self::Register => "register",
             Self::Unregister => "unregister",
             Self::Transfer => "transfer",
@@ -70,17 +73,18 @@ impl SignedRoute {
         }
     }
 
-    const fn legacy_index(self) -> usize {
+    const fn legacy_index(self) -> Option<usize> {
         match self {
-            Self::Register => 0,
-            Self::Unregister => 1,
-            Self::Transfer => 2,
-            Self::Recover => 3,
-            Self::Metadata => 4,
-            Self::Mode => 5,
-            Self::ZapReceipt => 6,
-            Self::InvoicePaid => 7,
-            Self::InvoicesPaid => 8,
+            Self::Available => None,
+            Self::Register => Some(0),
+            Self::Unregister => Some(1),
+            Self::Transfer => Some(2),
+            Self::Recover => Some(3),
+            Self::Metadata => Some(4),
+            Self::Mode => Some(5),
+            Self::ZapReceipt => Some(6),
+            Self::InvoicePaid => Some(7),
+            Self::InvoicesPaid => Some(8),
         }
     }
 }
@@ -88,6 +92,8 @@ impl SignedRoute {
 /// Which wire format a candidate message is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MessageFormat {
+    /// `breez-lnurl:v2`, built by `lnurl-models`.
+    BreezV2,
     /// Pre-v2: `{message}-{timestamp}`, or the untimestamped transfer message.
     Legacy,
 }
@@ -101,6 +107,14 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
+    pub(super) fn breez_v2(message: String, route: SignedRoute) -> Self {
+        Self {
+            message,
+            route,
+            format: MessageFormat::BreezV2,
+        }
+    }
+
     pub(super) fn legacy(message: String, route: SignedRoute) -> Self {
         Self {
             message,
@@ -206,7 +220,9 @@ static LEGACY_VERIFIES: [AtomicU64; SignedRoute::LEGACY.len()] =
     [const { AtomicU64::new(0) }; SignedRoute::LEGACY.len()];
 
 fn record_legacy_verify(route: SignedRoute) {
-    LEGACY_VERIFIES[route.legacy_index()].fetch_add(1, Ordering::Relaxed);
+    if let Some(index) = route.legacy_index() {
+        LEGACY_VERIFIES[index].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Take and reset the counts, one entry per route including the zeroes: a
@@ -215,11 +231,12 @@ fn record_legacy_verify(route: SignedRoute) {
 fn drain_legacy_verifies() -> Vec<(&'static str, u64)> {
     SignedRoute::LEGACY
         .iter()
-        .map(|route| {
-            (
+        .filter_map(|route| {
+            let index = route.legacy_index()?;
+            Some((
                 route.as_str(),
-                LEGACY_VERIFIES[route.legacy_index()].swap(0, Ordering::Relaxed),
-            )
+                LEGACY_VERIFIES[index].swap(0, Ordering::Relaxed),
+            ))
         })
         .collect()
 }
@@ -250,10 +267,11 @@ mod tests {
     fn every_legacy_route_has_its_own_counter() {
         let mut seen = [false; SignedRoute::LEGACY.len()];
         for route in SignedRoute::LEGACY {
-            let index = route.legacy_index();
+            let index = route.legacy_index().expect("legacy route has a counter");
             assert!(!seen[index], "{} shares a counter", route.as_str());
             seen[index] = true;
         }
+        assert_eq!(SignedRoute::Available.legacy_index(), None);
     }
 
     #[test]

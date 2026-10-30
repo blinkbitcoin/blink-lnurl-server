@@ -22,8 +22,8 @@ use crate::{
         handle_invoices_paid,
     },
     models::{
-        CheckUsernameAvailableResponse, ERROR_RECIPIENT_NOT_RECEIVING, InvoicePaidRequest,
-        InvoicesPaidRequest,
+        CheckUsernameAvailableRequest, CheckUsernameAvailableResponse,
+        ERROR_RECIPIENT_NOT_RECEIVING, InvoicePaidRequest, InvoicesPaidRequest,
     },
     providers::{CreateInvoiceRequest, ProviderError},
     repository::{
@@ -37,7 +37,9 @@ use crate::{
 
 use super::{
     BLINK_BTC_EXPIRY_LIMIT_SECS, BLINK_USD_EXPIRY_LIMIT_SECS, LnurlServer, MAX_COMMENT_LENGTH,
-    MAX_NOSTR_EVENT_SIZE, account, signed::SignedRoute, webhook,
+    MAX_NOSTR_EVENT_SIZE, account,
+    signed::{Candidate, SignedRoute, check_timestamp, parse_signed_request, verify_candidates},
+    webhook,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -174,21 +176,36 @@ where
     ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
         let username = account::canonical_spark_username_for_route(&identifier)?;
         let domain = account::sanitize_domain(&state, &host).await?;
-        let recipient = state
-            .db
-            .resolve_recipient_by_identifier(&domain, &username)
-            .await
-            .map_err(|e| {
-                error!("failed to execute query: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(Value::String("internal server error".into())),
-                )
-            })?;
+        username_available(&state, &domain, &username).await
+    }
 
-        Ok(Json(CheckUsernameAvailableResponse {
-            available: recipient.is_none(),
-        }))
+    /// `POST /lnurlpay/{pubkey}/available`, the availability check Breez SDK
+    /// 0.23+ sends. Signed so the answer can be the asking pubkey's own; with
+    /// no per-pubkey holds on names it answers exactly as the unsigned route.
+    pub async fn available_for_pubkey(
+        Host(host): Host,
+        Path(pubkey): Path<String>,
+        Extension(state): Extension<State<DB>>,
+        Json(payload): Json<CheckUsernameAvailableRequest>,
+    ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
+        // Canonical form is trim + lowercase, which is what the SDK signs.
+        let username = account::canonical_spark_username_for_route(&payload.username)?;
+        let domain = account::sanitize_domain(&state, &host).await?;
+        let (identity, signature) = parse_signed_request(&pubkey, &payload.signature)?;
+        check_timestamp(payload.timestamp)?;
+        // No legacy candidate: the route is new, so every signature it ever
+        // sees is v2.
+        let candidates = [Candidate::breez_v2(
+            lnurl_models::signed_message::available(
+                &domain,
+                &identity.to_string(),
+                &username,
+                payload.timestamp,
+            ),
+            SignedRoute::Available,
+        )];
+        verify_candidates(&state, &identity, &signature, &candidates, Some(&domain)).await?;
+        username_available(&state, &domain, &username).await
     }
 
     pub async fn handle_lnurl_pay(
@@ -829,6 +846,31 @@ fn map_provider_invoice_error(error: ProviderError) -> (StatusCode, Json<Value>)
             lnurl_error("internal server error")
         }
     }
+}
+
+async fn username_available<DB>(
+    state: &State<DB>,
+    domain: &str,
+    username: &str,
+) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)>
+where
+    DB: LnurlRepository + Send + Sync,
+{
+    let recipient = state
+        .db
+        .resolve_recipient_by_identifier(domain, username)
+        .await
+        .map_err(|e| {
+            error!("failed to execute query: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Value::String("internal server error".into())),
+            )
+        })?;
+
+    Ok(Json(CheckUsernameAvailableResponse {
+        available: recipient.is_none(),
+    }))
 }
 
 pub(super) fn lnurl_error(message: &str) -> (StatusCode, Json<Value>) {
@@ -2037,5 +2079,139 @@ mod tests {
             get_public_invoice(state, "alice", LnurlPayCallbackParams::default()).await,
             "missing amount",
         );
+    }
+
+    // -- Signed availability (Breez SDK 0.23+) --------------------------------
+
+    fn availability_key(seed: u8) -> (bitcoin::secp256k1::SecretKey, String) {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+        let public = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        (secret, public.to_string())
+    }
+
+    fn sign_availability(secret: &bitcoin::secp256k1::SecretKey, message: &str) -> String {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let digest = sha256::Hash::hash(message.as_bytes());
+        let message = bitcoin::secp256k1::Message::from_digest(digest.to_byte_array());
+        hex::encode(secp.sign_ecdsa(&message, secret).serialize_der())
+    }
+
+    async fn post_available(
+        state: State<MockRepository>,
+        pubkey: &str,
+        username: &str,
+        signature: String,
+        timestamp: u64,
+    ) -> Result<Json<CheckUsernameAvailableResponse>, (StatusCode, Json<Value>)> {
+        LnurlServer::available_for_pubkey(
+            Host("example.com".to_string()),
+            Path(pubkey.to_string()),
+            Extension(state),
+            Json(CheckUsernameAvailableRequest {
+                username: username.to_string(),
+                signature,
+                timestamp,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn signed_availability_answers_like_the_unsigned_route() {
+        let (secret, pubkey) = availability_key(60);
+        let timestamp = crate::time::now_u64();
+        let message =
+            lnurl_models::signed_message::available("example.com", &pubkey, "bob", timestamp);
+
+        for (repo, expected) in [
+            (MockRepository::default(), true),
+            (
+                MockRepository::default().with_resolved_recipient(spark_resolved_recipient()),
+                false,
+            ),
+        ] {
+            let state = internal_route_test_state(repo.clone(), None).await;
+            let Json(signed) = post_available(
+                state.clone(),
+                &pubkey,
+                "bob",
+                sign_availability(&secret, &message),
+                timestamp,
+            )
+            .await
+            .expect("a v2 availability signature must verify");
+            let Json(unsigned) = LnurlServer::available(
+                Host("example.com".to_string()),
+                Path("bob".to_string()),
+                Extension(state),
+            )
+            .await
+            .expect("unsigned availability answers");
+
+            assert_eq!(signed.available, expected);
+            assert_eq!(unsigned.available, expected);
+            assert!(
+                repo.resolve_calls()
+                    .iter()
+                    .all(|call| call == &("example.com".to_string(), "bob".to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_availability_refuses_other_domains_names_keys_and_legacy_bytes() {
+        let (secret, pubkey) = availability_key(61);
+        let (_, other_pubkey) = availability_key(62);
+        let timestamp = crate::time::now_u64();
+        let available = lnurl_models::signed_message::available;
+
+        for message in [
+            available("other.example", &pubkey, "bob", timestamp),
+            available("example.com", &pubkey, "alice", timestamp),
+            available("example.com", &other_pubkey, "bob", timestamp),
+            format!("bob-{timestamp}"),
+        ] {
+            let state = internal_route_test_state(MockRepository::default(), None).await;
+            let Err((status, Json(body))) = post_available(
+                state,
+                &pubkey,
+                "bob",
+                sign_availability(&secret, &message),
+                timestamp,
+            )
+            .await
+            else {
+                panic!("{message:?} must not verify as availability for bob");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body,
+                Value::String("invalid signature for domain 'example.com'".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_availability_refuses_a_stale_timestamp() {
+        let (secret, pubkey) = availability_key(63);
+        let timestamp = crate::time::now_u64() - 601;
+        let message =
+            lnurl_models::signed_message::available("example.com", &pubkey, "bob", timestamp);
+        let state = internal_route_test_state(MockRepository::default(), None).await;
+
+        let Err((status, Json(body))) = post_available(
+            state,
+            &pubkey,
+            "bob",
+            sign_availability(&secret, &message),
+            timestamp,
+        )
+        .await
+        else {
+            panic!("a stale availability signature must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Value::String("invalid timestamp".into()));
     }
 }

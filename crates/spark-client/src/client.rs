@@ -10,9 +10,10 @@ use spark_wallet::{DefaultSigner, InvoiceDescription, SparkWallet, SparkWalletCo
 
 use crate::error::SparkClientError;
 use crate::types::{
-    ClientConfig, CreateInvoiceRequest, CreatedInvoice, SignedAuthPayload, VerifyMessageRequest,
-    WebhookRegistrationRequest,
+    ClientConfig, CreateInvoiceRequest, CreatedInvoice, SignedAuthPayload, SignedV2AuthPayload,
+    VerifyMessageRequest, WebhookRegistrationRequest,
 };
+use lnurl_models::signed_message;
 
 #[derive(Clone)]
 pub struct Client {
@@ -101,21 +102,8 @@ impl Client {
         username: &str,
         timestamp: u64,
     ) -> Result<SignedAuthPayload, SparkClientError> {
-        let signer = DefaultSigner::new(&[42u8; 32], spark_wallet::Network::Regtest)
-            .map_err(|e| SparkClientError::Signing(e.into()))?;
-        let pubkey = signer
-            .get_identity_public_key()
-            .await
-            .map_err(|e| SparkClientError::Signing(e.into()))?
-            .to_string();
-
-        let to_signer = DefaultSigner::new(&[43u8; 32], spark_wallet::Network::Regtest)
-            .map_err(|e| SparkClientError::Signing(e.into()))?;
-        let to_pubkey = to_signer
-            .get_identity_public_key()
-            .await
-            .map_err(|e| SparkClientError::Signing(e.into()))?
-            .to_string();
+        let (signer, pubkey) = test_identity(42).await?;
+        let (to_signer, to_pubkey) = test_identity(43).await?;
 
         let register_signature = sign(&signer, format!("{username}-{timestamp}")).await?;
         let recover_signature = sign(&signer, format!("{pubkey}-{timestamp}")).await?;
@@ -139,12 +127,85 @@ impl Client {
         })
     }
 
+    /// v2 signatures by the identities [`Self::build_auth_payload`] uses, over
+    /// the messages a Breez SDK 0.23+ client addressing `domain` signs.
+    pub async fn build_v2_auth_payload(
+        username: &str,
+        timestamp: u64,
+        domain: &str,
+        description: &str,
+    ) -> Result<SignedV2AuthPayload, SparkClientError> {
+        let (signer, pubkey) = test_identity(42).await?;
+        let (to_signer, to_pubkey) = test_identity(43).await?;
+
+        Ok(SignedV2AuthPayload {
+            domain: domain.to_string(),
+            description: description.to_string(),
+            available_signature: sign(
+                &signer,
+                signed_message::available(domain, &pubkey, username, timestamp),
+            )
+            .await?,
+            register_signature: sign(
+                &signer,
+                signed_message::register(domain, username, description, timestamp),
+            )
+            .await?,
+            unregister_signature: sign(
+                &signer,
+                signed_message::unregister(domain, username, timestamp),
+            )
+            .await?,
+            recover_signature: sign(&signer, signed_message::recover(domain, &pubkey, timestamp))
+                .await?,
+            metadata_signature: sign(
+                &signer,
+                signed_message::metadata(domain, &pubkey, timestamp),
+            )
+            .await?,
+            to_recover_signature: sign(
+                &to_signer,
+                signed_message::recover(domain, &to_pubkey, timestamp),
+            )
+            .await?,
+            transfer_from_signature: sign(
+                &signer,
+                signed_message::transfer_from(domain, username, &pubkey, &to_pubkey, timestamp),
+            )
+            .await?,
+            transfer_to_signature: sign(
+                &to_signer,
+                signed_message::transfer_to(
+                    domain,
+                    username,
+                    &pubkey,
+                    &to_pubkey,
+                    description,
+                    timestamp,
+                ),
+            )
+            .await?,
+        })
+    }
+
     pub async fn register_wallet_webhook(
         &self,
         request: WebhookRegistrationRequest,
     ) -> Result<String, SparkClientError> {
         crate::webhook::register_wallet_webhook(Arc::clone(&self.service_provider), request).await
     }
+}
+
+/// A deterministic regtest identity and its hex pubkey.
+async fn test_identity(seed: u8) -> Result<(DefaultSigner, String), SparkClientError> {
+    let signer = DefaultSigner::new(&[seed; 32], spark_wallet::Network::Regtest)
+        .map_err(|e| SparkClientError::Signing(e.into()))?;
+    let pubkey = signer
+        .get_identity_public_key()
+        .await
+        .map_err(|e| SparkClientError::Signing(e.into()))?
+        .to_string();
+    Ok((signer, pubkey))
 }
 
 async fn sign(signer: &DefaultSigner, message: String) -> Result<String, SparkClientError> {
@@ -173,5 +234,19 @@ mod tests {
         assert!(!payload.to_recover_signature.is_empty());
         assert!(!payload.transfer_from_signature.is_empty());
         assert!(!payload.transfer_to_signature.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_auth_payload_signs_distinct_messages_for_the_same_identities() {
+        let legacy = Client::build_auth_payload("alice", 1).await.unwrap();
+        let v2 = Client::build_v2_auth_payload("alice", 1, "localhost:8080", "d")
+            .await
+            .unwrap();
+
+        assert_ne!(v2.register_signature, legacy.register_signature);
+        assert_ne!(v2.unregister_signature, v2.register_signature);
+        assert_ne!(v2.recover_signature, v2.metadata_signature);
+        assert_ne!(v2.recover_signature, legacy.recover_signature);
+        assert_ne!(v2.transfer_from_signature, v2.transfer_to_signature);
     }
 }
