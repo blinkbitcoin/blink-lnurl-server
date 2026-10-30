@@ -112,7 +112,16 @@ The description is hashed byte-exact; it is never trimmed or normalized.
 
 On transfer, a `timestamp` field in the body selects the v2 messages for both signatures, with no legacy fallback. A v2 timestamp outside the window is refused with `"transfer authorization is expired or not yet valid"`. Without a `timestamp`, both signatures cover the legacy message.
 
-`/mode`, `/metadata/{payment_hash}/zap`, `/invoice-paid`, and `/invoices-paid` verify only their pre-v2 messages: `mode:{mode}:{pubkey}-{ts}`, `{zap_receipt}-{ts}`, `{preimage}-{ts}`, and `{pubkey}-{ts}`.
+**`blink-lnurl:v1`** (the Blink app's own calls). From Breez SDK 0.23 the public `signMessage` API refuses any message starting with `breez-lnurl:`. So the routes the app signs itself, outside the SDK, use the same shape in a namespace of their own (`src/signed_message.rs`, golden vectors included):
+
+| Route | Message | Pre-v2 message |
+|---|---|---|
+| `POST /lnurlpay/{pubkey}/recover` | `blink-lnurl:v1\nrecover\n<domain>\n<pubkey>\n<ts>` | `{pubkey}-{ts}` |
+| `POST /lnurlpay/{pubkey}/mode` | `blink-lnurl:v1\nmode\n<domain>\n<pubkey>\n<mode>\n<ts>` | `mode:{mode}:{pubkey}-{ts}` |
+
+Recover tries `breez-lnurl:v2`, then `blink-lnurl:v1`, then pre-v2. The pre-v2 recover message is byte-identical to the pre-v2 metadata message, so a captured pre-v2 recover signature is also a metadata credential. That stops being true once the app signs `blink-lnurl:v1` and the pre-v2 candidates are removed.
+
+`/metadata/{payment_hash}/zap`, `/invoice-paid`, and `/invoices-paid` verify only their pre-v2 messages: `{zap_receipt}-{ts}`, `{preimage}-{ts}`, and `{pubkey}-{ts}`. Breez SDK 0.23 does not call them.
 
 Pre-v2 verifies are counted per route and logged once a minute on the `blink_lnurl::legacy_signatures` tracing target, for example `legacy signed-message verifies: register=0 unregister=0 …`. The legacy forms are removed once those counts read zero.
 
@@ -163,7 +172,7 @@ Batch invoice-paid request:
 }
 ```
 
-Recover response. `mode` is always present; `null` means the account has never chosen one. For an account that has a mode but no username, the answer depends on the signature format. A pre-v2 signature (the Blink app's own call) gets the mode with the address fields absent. A `breez-lnurl:v2` signature (the Breez SDK, whose response type requires every address field) gets `404`:
+Recover response. `mode` is always present; `null` means the account has never chosen one. For an account that has a mode but no username, the answer depends on the signature format. A `blink-lnurl:v1` or pre-v2 signature (the Blink app's own call) gets the mode with the address fields absent. A `breez-lnurl:v2` signature (the Breez SDK, whose response type requires every address field) gets `404`:
 
 ```json
 {
@@ -175,7 +184,7 @@ Recover response. `mode` is always present; `null` means the account has never c
 }
 ```
 
-Mode request. The signed message is `mode:{mode}:{pubkey}-{timestamp}`; `timestamp` must be within 600 seconds of server time, at most 30 seconds ahead of it, AND strictly newer than the last accepted mode request for this pubkey. Re-sending the exact request that was last accepted (same mode, same timestamp — a retry after a dropped response) succeeds without changing anything; any other older request is refused:
+Mode request. The signed message is `blink-lnurl:v1\nmode\n<domain>\n<pubkey>\n<mode>\n<timestamp>`, or the pre-v2 `mode:{mode}:{pubkey}-{timestamp}`; `timestamp` must be within 600 seconds of server time, at most 30 seconds ahead of it, AND strictly newer than the last accepted mode request for this pubkey. Re-sending the exact request that was last accepted (same mode, same timestamp — a retry after a dropped response) succeeds without changing anything; any other older request is refused:
 
 ```json
 {

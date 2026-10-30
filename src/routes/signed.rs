@@ -1,8 +1,9 @@
 //! Signature verification for the `/lnurlpay/{pubkey}` management routes.
 //!
 //! A route lists the messages a signature may cover, most-preferred first:
-//! the `breez-lnurl:v2` form Breez SDK 0.23+ signs, then the pre-v2 form older
-//! clients still send. The first one that verifies wins, and the route reads
+//! the `breez-lnurl:v2` form Breez SDK 0.23+ signs, or the `blink-lnurl:v1`
+//! form the Blink app signs itself, then the pre-v2 form older clients still
+//! send. The first one that verifies wins, and the route reads
 //! which format matched from the returned [`Candidate`].
 //!
 //! Pre-v2 verifies are counted per route and logged once a minute on
@@ -94,6 +95,8 @@ impl SignedRoute {
 pub(super) enum MessageFormat {
     /// `breez-lnurl:v2`, built by `lnurl-models`.
     BreezV2,
+    /// `blink-lnurl:v1`, the Blink app's own messages.
+    BlinkV1,
     /// Pre-v2: `{message}-{timestamp}`, or the untimestamped transfer message.
     Legacy,
 }
@@ -112,6 +115,14 @@ impl Candidate {
             message,
             route,
             format: MessageFormat::BreezV2,
+        }
+    }
+
+    pub(super) fn blink_v1(message: String, route: SignedRoute) -> Self {
+        Self {
+            message,
+            route,
+            format: MessageFormat::BlinkV1,
         }
     }
 

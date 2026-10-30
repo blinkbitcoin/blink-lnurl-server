@@ -29,6 +29,7 @@ use crate::{
         LnurlRepositoryError, NewAccountIdentifier, NewSparkRegistration, ResolvedRecipient,
         SparkModeUpdate, WalletKind,
     },
+    signed_message::blink as blink_message,
     state::State,
 };
 
@@ -268,6 +269,11 @@ where
                 signed_message::recover(&domain, &identity.to_string(), payload.timestamp),
                 SignedRoute::Recover,
             ),
+            // The Blink app's own recover, which reads the mode.
+            Candidate::blink_v1(
+                blink_message::recover(&domain, &identity.to_string(), payload.timestamp),
+                SignedRoute::Recover,
+            ),
             // The path segment verbatim, which is what the legacy message was
             // built from. Byte-identical to the legacy metadata message.
             Candidate::legacy(
@@ -303,10 +309,10 @@ where
         let mode = mode.map(|mode| mode.as_str().to_string());
 
         // An account with a mode but no username is legitimate: mode is recorded
-        // before any address can exist. Only the app's own recover reads that
-        // mode-only answer; a v2 signature comes from the Breez SDK, whose
-        // response type requires every address field and treats 404 as "no
-        // address", so it gets the 404.
+        // before any address can exist. Only the app's own recover (blink v1 or
+        // pre-v2) reads that mode-only answer; a breez v2 signature comes from
+        // the Breez SDK, whose response type requires every address field and
+        // treats 404 as "no address", so it gets the 404.
         match (user, mode.as_ref()) {
             (None, Some(_)) if matched == MessageFormat::BreezV2 => Err((
                 StatusCode::NOT_FOUND,
@@ -336,6 +342,7 @@ where
     /// `POST /lnurlpay/{pubkey}/mode`. The pubkey signature is the sole
     /// authorization; the client-certificate middleware is not authz.
     pub async fn set_mode(
+        Host(host): Host,
         Path(pubkey): Path<String>,
         Extension(state): Extension<State<DB>>,
         headers: HeaderMap,
@@ -352,18 +359,32 @@ where
             ));
         }
 
-        // "mode:" domain-separates from every other signed message; a colon is
-        // illegal in usernames, so no register/unregister signature can reach here.
-        let message = format!("mode:{}:{}", mode.as_str(), pubkey);
-        let pubkey = validate(
-            &pubkey,
-            &payload.signature,
-            &message,
-            payload.timestamp,
-            SignedRoute::Mode,
-            &state,
-        )
-        .await?;
+        let domain = sanitize_domain(&state, &host).await?;
+        let (identity, signature) = parse_signed_request(&pubkey, &payload.signature)?;
+        check_timestamp(payload.timestamp)?;
+        let candidates = [
+            Candidate::blink_v1(
+                blink_message::mode(
+                    &domain,
+                    &identity.to_string(),
+                    mode.as_str(),
+                    payload.timestamp,
+                ),
+                SignedRoute::Mode,
+            ),
+            // "mode:" domain-separates from every other pre-v2 message; a colon
+            // is illegal in usernames, so no register/unregister signature can
+            // reach here.
+            Candidate::legacy(
+                legacy_timestamped(
+                    &format!("mode:{}:{pubkey}", mode.as_str()),
+                    payload.timestamp,
+                ),
+                SignedRoute::Mode,
+            ),
+        ];
+        verify_candidates(&state, &identity, &signature, &candidates, Some(&domain)).await?;
+        let pubkey = identity;
         let client_timestamp = i64::try_from(payload.timestamp).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1461,6 +1482,7 @@ mod tests {
         headers: HeaderMap,
     ) -> Result<SetLnurlPayModeResponse, (StatusCode, Json<Value>)> {
         LnurlServer::set_mode(
+            Host(V2_DOMAIN.to_string()),
             Path(pubkey.to_string()),
             Extension(state.clone()),
             headers,
@@ -2738,5 +2760,107 @@ mod tests {
                 lnurl_models::sanitize_username(input)
             );
         }
+    }
+
+    // -- blink-lnurl:v1 (the Blink app's own recover and mode) -----------------
+
+    #[tokio::test]
+    async fn recover_with_a_blink_v1_signature_returns_the_mode() {
+        let (secret, pubkey) = mode_key(52);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let state = v2_state(repo).await;
+        let timestamp = now_u64();
+
+        let message = blink_message::recover(V2_DOMAIN, &pubkey, timestamp);
+        let Json(response) = post_recover(&state, &pubkey, &message, &secret, timestamp)
+            .await
+            .expect("a blink v1 recover of a mode-only account returns the mode");
+        assert_eq!(response.mode.as_deref(), Some("anon"));
+        assert!(response.username.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_blink_v1_recover_signature_is_not_a_metadata_credential() {
+        let (secret, pubkey) = mode_key(53);
+        let state = v2_state(MockRepository::default()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(
+            &secret,
+            &blink_message::recover(V2_DOMAIN, &pubkey, timestamp),
+        );
+
+        let response = get_metadata(
+            &state,
+            &pubkey,
+            breez_headers(&signature, &timestamp.to_string()),
+            metadata_query(None, None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn blink_v1_mode_request(
+        secret: &SecretKey,
+        domain: &str,
+        pubkey: &str,
+        signed_mode: &str,
+        sent_mode: &str,
+        timestamp: u64,
+    ) -> SetLnurlPayModeRequest {
+        SetLnurlPayModeRequest {
+            mode: sent_mode.to_string(),
+            signature: sign_hex(
+                secret,
+                &blink_message::mode(domain, pubkey, signed_mode, timestamp),
+            ),
+            timestamp,
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_accepts_a_blink_v1_signature() {
+        let (secret, pubkey) = mode_key(54);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+
+        let response = post_mode(
+            &state,
+            &pubkey,
+            blink_v1_mode_request(&secret, V2_DOMAIN, &pubkey, "anon", "anon", timestamp),
+            headers_with_request_ip("203.0.113.9"),
+        )
+        .await
+        .expect("a blink v1 mode signature must verify");
+        assert_eq!(response.mode, "anon");
+        assert_eq!(
+            repo.spark_mode(&pubkey).and_then(|record| record.mode),
+            Some(AccountMode::Anon)
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_v1_mode_signature_is_bound_to_domain_and_mode() {
+        let (secret, pubkey) = mode_key(55);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+
+        for request in [
+            blink_v1_mode_request(&secret, "other.example", &pubkey, "anon", "anon", timestamp),
+            blink_v1_mode_request(&secret, V2_DOMAIN, &pubkey, "anon", "enhanced", timestamp),
+        ] {
+            assert_bad_request(
+                post_mode(
+                    &state,
+                    &pubkey,
+                    request,
+                    headers_with_request_ip("203.0.113.10"),
+                )
+                .await,
+                &invalid_signature_for_domain(),
+            );
+        }
+        assert!(repo.spark_mode(&pubkey).is_none());
     }
 }
