@@ -1,12 +1,14 @@
 mod account;
 mod internal;
 mod lnurl_pay;
+mod signed;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod webhook;
 mod zap;
 #[allow(unused_imports)]
 pub use lnurl_pay::{LnurlPayCallbackParams, PayResponse, Tag};
+pub use signed::spawn_legacy_signature_reporter;
 use std::marker::PhantomData;
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -14,7 +16,9 @@ use webhook::process_webhook;
 #[allow(unused_imports)]
 pub use webhook::{BlinkInvoiceWebhookPayload, BlinkInvoiceWebhookStatus};
 
-const ACCEPTABLE_TIME_DIFF_SECS: u64 = 600;
+/// Named locally for how it reads at the call sites, defined in `lnurl-models`
+/// so this server and every Breez client bound a timestamp identically.
+const ACCEPTABLE_TIME_DIFF_SECS: u64 = lnurl_models::signed_message::VALIDITY_SECS;
 const DEFAULT_METADATA_OFFSET: u32 = 0;
 const DEFAULT_METADATA_LIMIT: u32 = 100;
 /// Maximum number of nostr relays to connect to when publishing zap receipts.

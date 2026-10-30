@@ -10,7 +10,7 @@ use crate::{
     time::now_millis,
 };
 
-use super::{LnurlServer, account, lnurl_pay::lnurl_error};
+use super::{LnurlServer, account, lnurl_pay::lnurl_error, signed::SignedRoute};
 
 impl<DB> LnurlServer<DB>
 where
@@ -32,6 +32,7 @@ where
             &payload.signature,
             &payload.zap_receipt,
             payload.timestamp,
+            SignedRoute::ZapReceipt,
             &state,
         )
         .await?;

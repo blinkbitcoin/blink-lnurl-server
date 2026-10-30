@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use axum_extra::extract::Host;
-use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
+use bitcoin::secp256k1::PublicKey;
 use serde_json::Value;
 use std::net::IpAddr;
 use tracing::{debug, error, trace, warn};
@@ -28,10 +28,17 @@ use crate::{
         SparkModeUpdate, WalletKind,
     },
     state::State,
-    time::now_u64,
 };
 
-use super::{LnurlServer, lnurl_pay::PublicIdentifierIntent, lnurl_pay::PublicRecipient};
+use super::{
+    LnurlServer,
+    lnurl_pay::PublicIdentifierIntent,
+    lnurl_pay::PublicRecipient,
+    signed::{
+        Candidate, SignedRoute, check_timestamp, legacy_timestamped, parse_signed_request,
+        verify_candidates,
+    },
+};
 
 const SPARK_PROVIDER_DISABLED_MESSAGE: &str = "Spark provider disabled";
 
@@ -61,6 +68,7 @@ where
             &payload.signature,
             &username,
             payload.timestamp,
+            SignedRoute::Register,
             &state,
         )
         .await?;
@@ -190,6 +198,7 @@ where
             &payload.signature,
             &username,
             payload.timestamp,
+            SignedRoute::Unregister,
             &state,
         )
         .await?;
@@ -222,6 +231,7 @@ where
             &payload.signature,
             &pubkey,
             payload.timestamp,
+            SignedRoute::Recover,
             &state,
         )
         .await?;
@@ -300,6 +310,7 @@ where
             &payload.signature,
             &message,
             payload.timestamp,
+            SignedRoute::Mode,
             &state,
         )
         .await?;
@@ -350,6 +361,7 @@ where
             &params.signature,
             &pubkey,
             params.timestamp,
+            SignedRoute::Metadata,
             &state,
         )
         .await?;
@@ -606,58 +618,22 @@ pub(super) async fn verify_with_spark_client<DB>(
     state.spark_client.verify_message(request).await
 }
 
+/// Verify a legacy-only signature over `"{message}-{timestamp}"` for `route`.
 pub(super) async fn validate<DB>(
     pubkey: &str,
     signature: &str,
     message: &str,
     timestamp: u64,
+    route: SignedRoute,
     state: &State<DB>,
 ) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let pubkey = parse_pubkey(pubkey)?;
-    let signature = hex::decode(signature).map_err(|e| {
-        trace!("invalid signature, could not decode: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-    let signature = Signature::from_der(&signature).map_err(|e| {
-        trace!("invalid signature, could not parse: {:?}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-
-    let now = now_u64();
-    let diff = timestamp.abs_diff(now);
-    if diff > super::ACCEPTABLE_TIME_DIFF_SECS {
-        trace!(
-            "invalid timestamp, too far off: {}, now: {}, diff: {}",
-            timestamp, now, diff
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid timestamp".into())),
-        ));
-    }
-
-    let signed_message = format!("{message}-{timestamp}");
-    let verify_request = spark_client::VerifyMessageRequest {
-        message: &signed_message,
-        signature: &signature,
-        public_key: &pubkey,
-    };
-    verify_with_spark_client(state, verify_request)
-        .await
-        .map_err(|e| {
-            trace!("invalid signature with timestamp, could not verify: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(Value::String("invalid signature".into())),
-            )
-        })?;
-
+    let (pubkey, signature) = parse_signed_request(pubkey, signature)?;
+    check_timestamp(timestamp)?;
+    let candidates = [Candidate::legacy(
+        legacy_timestamped(message, timestamp),
+        route,
+    )];
+    verify_candidates(state, &pubkey, &signature, &candidates, None).await?;
     Ok(pubkey)
 }
 
@@ -676,37 +652,12 @@ pub(super) async fn verify_transfer_signature<DB>(
     message: &str,
     state: &State<DB>,
 ) -> Result<PublicKey, (StatusCode, Json<Value>)> {
-    let pk = parse_pubkey(pubkey)?;
-    let signature = hex::decode(signature).map_err(|e| {
-        trace!("invalid transfer signature, could not decode: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-    let signature = Signature::from_der(&signature).map_err(|e| {
-        trace!("invalid transfer signature, could not parse: {:?}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Value::String("invalid signature".into())),
-        )
-    })?;
-
-    let verify_request = spark_client::VerifyMessageRequest {
-        message,
-        signature: &signature,
-        public_key: &pk,
-    };
-    verify_with_spark_client(state, verify_request)
-        .await
-        .map_err(|e| {
-            trace!("invalid transfer signature, could not verify: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(Value::String("invalid signature".into())),
-            )
-        })?;
-
+    let (pk, signature) = parse_signed_request(pubkey, signature)?;
+    let candidates = [Candidate::legacy(
+        message.to_string(),
+        SignedRoute::Transfer,
+    )];
+    verify_candidates(state, &pk, &signature, &candidates, None).await?;
     Ok(pk)
 }
 
@@ -865,6 +816,8 @@ mod tests {
     use super::*;
     use crate::invoice_paid::create_provider_invoice_for_account;
     use crate::routes::test_support::*;
+    use crate::time::now_u64;
+    use bitcoin::secp256k1::ecdsa::Signature;
     use lightning_invoice::Bolt11Invoice;
     use serde_json::Value;
     use std::str::FromStr;

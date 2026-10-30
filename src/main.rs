@@ -579,6 +579,10 @@ where
         webhook_secret,
     };
 
+    // Makes the pre-v2 signed-message tail observable, which is what gates
+    // dropping the legacy candidates.
+    routes::spawn_legacy_signature_reporter();
+
     // Mounted below as POST /internal/blink/accounts for Blink Core.
     let internal_router = Router::new()
         .route(

@@ -37,7 +37,7 @@ use crate::{
 
 use super::{
     BLINK_BTC_EXPIRY_LIMIT_SECS, BLINK_USD_EXPIRY_LIMIT_SECS, LnurlServer, MAX_COMMENT_LENGTH,
-    MAX_NOSTR_EVENT_SIZE, account, webhook,
+    MAX_NOSTR_EVENT_SIZE, account, signed::SignedRoute, webhook,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -605,6 +605,7 @@ where
             &payload.signature,
             &payload.preimage,
             payload.timestamp,
+            SignedRoute::InvoicePaid,
             &state,
         )
         .await?;
@@ -701,6 +702,7 @@ where
             &payload.signature,
             &pubkey,
             payload.timestamp,
+            SignedRoute::InvoicesPaid,
             &state,
         )
         .await?;
