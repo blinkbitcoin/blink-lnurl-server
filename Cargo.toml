@@ -21,6 +21,7 @@ blink-client = { path = "crates/blink-client" }
 clap = { version = "4.5.40", features = ["derive"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
 hex = "0.4.3"
+lnurl-models = { git = "https://github.com/breez/spark-sdk", tag = "0.23.1", package = "lnurl-models" }
 lightning-invoice = { version = "0.34.0", features = ["std"] }
 nostr = { version = "0.44.7", default-features = false, features = ["std", "nip57"] }
 nostr-sdk = { version = "0.44.1", default-features = false, features = ["nip57"] }

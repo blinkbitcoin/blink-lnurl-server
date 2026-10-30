@@ -39,6 +39,7 @@ mod providers;
 mod rate_limit;
 mod repository;
 mod routes;
+mod signed_message;
 mod sqlite;
 mod state;
 mod time;

@@ -2310,6 +2310,7 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "lightning-invoice 0.34.0",
+ "lnurl-models",
  "nostr",
  "nostr-sdk",
  "phonenumber",
@@ -2326,6 +2327,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+]
+
+[[package]]
+name = "lnurl-models"
+version = "0.1.0"
+source = "git+https://github.com/breez/spark-sdk?tag=0.23.1#eb8821f7a463c9b7ab9341dfdf240dbad8d44920"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]
