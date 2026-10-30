@@ -4,6 +4,23 @@ Unblocks [blinkbitcoin/blink-mobile#4257](https://github.com/blinkbitcoin/blink-
 (Breez Spark SDK 0.22.0 → 0.23.1). That PR is marked "Do not merge before the
 LNURL server is adapted" and has a blocking review on exactly that.
 
+## Status
+
+| Phase | State | Commit |
+|---|---|---|
+| 0 | Done: `lnurl-models` pinned at tag `0.23.1`, golden vectors, Host decision recorded (kept `axum_extra::Host`) | `chore(lnurlpay): pin Breez v2 signed-message format` |
+| 1 | Done | `refactor(lnurlpay): verify signatures against candidate messages` |
+| 2 | Done; still needs the staging probe and the #4257 run in 2h | `feat(lnurlpay): accept Breez SDK 0.23 breez-lnurl:v2 requests` |
+| 3 | Server done; the blink-mobile change to sign `blink-lnurl:v1` is still open | `feat(lnurlpay): accept blink-lnurl:v1 for app-signed recover and mode` |
+| 4 | Done | `feat(lnurlpay): act on each signed register, unregister and transfer once` |
+| 5 | Not started: waiting on the product decision | — |
+| 6 | Later: driven by the `blink_lnurl::legacy_signatures` counts | — |
+
+Where the implementation differs from the text below:
+- Signed `available` mirrors the unsigned route, which has no `require_spark_provider_enabled` gate. That keeps the two answers identical.
+- `/mode` now resolves the request domain, which the `blink-lnurl:v1` message needs. A `/mode` request to a host outside the allow-list now gets a 404, as the other management routes already did.
+- Phase 4 claims after the checks that refuse a request (`enhanced_mode_required`, ownership), so a refused request stays actionable.
+
 ## 1. Problem
 
 The 0.23.1 client (`fa4d8c887`, "Scope LNURL signed messages to their route and
