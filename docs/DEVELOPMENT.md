@@ -53,7 +53,7 @@ There is no `.env.example` file. Local defaults are encoded in `docker-compose.y
 | `make start` | Runs `./scripts/start-local-stack.sh` to start PostgreSQL and the local LNURL server. |
 | `make test-e2e` | Builds `lnurl-server`, `e2e_auth`, `blink_graphql_mock`, and `e2e_zap_request`, then runs Bats tests under `bats/`. |
 | `make e2e` | Alias for `make test-e2e`. |
-| `make test-integration` | Restarts Postgres on `LNURL_POSTGRES_PORT` and runs `cargo test --locked postgres_tests -- --test-threads=1` with `LNURL_TEST_POSTGRES_URL` set. |
+| `make test-integration` | Restarts Postgres on `LNURL_POSTGRES_PORT` and runs `cargo test --locked postgres -- --test-threads=1` with `LNURL_TEST_POSTGRES_URL` set. |
 | `make test-in-ci` | Runs `make test-rust` and `make test-integration`. |
 | `make release-check` | Runs `check-code`, `test-rust`, `test-integration`, `test-e2e`, and `audit` in sequence. |
 

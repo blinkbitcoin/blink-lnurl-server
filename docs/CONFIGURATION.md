@@ -41,7 +41,7 @@ No `.env.example` or `.env.sample` file is present. The variables below are deri
 | `LNURL_COUNTRY_LOOKUPS_PER_DAY` | Optional | `5000` | Daily cap on country lookups across all client IPs (per replica), protecting the shared proxycheck quota from traffic that stays under every per-IP budget. Over budget, mode writes still succeed and stored evidence stops refreshing until the window resets. |
 | `LNURL_CONFIG` | Optional | `lnurl.conf` | Mirrors the `config` field, but the TOML file path is resolved before environment variables are merged; use `--config` to select a non-default config file. |
 | `LNURL_DEV_DONT_USE_LNURL_INCLUDE_SPARK_ADDRESS` | Optional, dev feature only | `false` | Development-only option compiled behind the `dev` Cargo feature to include Spark addresses in generated invoices. |
-| `LNURL_TEST_POSTGRES_URL` | Test-only | unset | PostgreSQL URL used by tests named `postgres_tests`; not used by the runtime server. |
+| `LNURL_TEST_POSTGRES_URL` | Test-only | unset | PostgreSQL URL used by the Postgres-backed tests (every test whose name contains `postgres`); not used by the runtime server. |
 | `LNURL_POSTGRES_PORT` | Local tooling only | `5432` for `make start`, `25432` for some test targets | Port used by Docker Compose helper scripts and Makefile targets. |
 | `LNURL_BIN` | Local tooling only | `target/debug/lnurl-server` | Binary path used by `scripts/start-local-stack.sh`. |
 

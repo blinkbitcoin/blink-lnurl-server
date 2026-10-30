@@ -265,13 +265,13 @@ mod postgres_tests {
 
     async fn setup_test_db() -> Option<crate::postgresql::LnurlRepository> {
         let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
-        crate::postgresql::run_migrations(&pool).await.ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        crate::postgresql::run_migrations(&pool).await.unwrap();
 
         sqlx::query("DELETE FROM webhook_deliveries")
             .execute(&pool)
             .await
-            .ok()?;
+            .unwrap();
 
         Some(crate::postgresql::LnurlRepository::new(pool))
     }

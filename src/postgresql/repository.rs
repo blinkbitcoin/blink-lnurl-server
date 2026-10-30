@@ -1873,14 +1873,14 @@ mod provider_neutral_tests {
 
     async fn setup_test_db() -> Option<(sqlx::PgPool, LnurlRepository)> {
         let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
-        crate::postgresql::run_migrations(&pool).await.ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        crate::postgresql::run_migrations(&pool).await.unwrap();
         sqlx::query(
             "TRUNCATE account_identifiers, spark_accounts, blink_accounts, accounts, used_signed_messages CASCADE",
         )
         .execute(&pool)
         .await
-        .ok()?;
+        .unwrap();
         let db = LnurlRepository::new(pool.clone());
         Some((pool, db))
     }
