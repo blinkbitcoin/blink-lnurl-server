@@ -323,6 +323,7 @@ mod shared_tests {
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: Some("acct_spark_invoice".to_string()),
             pubkey: "spark_account_invoice_pubkey".to_string(),
             identifier: NewAccountIdentifier {
@@ -375,6 +376,7 @@ mod shared_tests {
         DB: LnurlRepository + Clone + Send + Sync + 'static,
     {
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: Some("acct_provider_helper".to_string()),
             pubkey: "spark_provider_helper_pubkey".to_string(),
             identifier: NewAccountIdentifier {

@@ -207,6 +207,11 @@ impl LnurlRepository for MockRepository {
         registration: &NewSparkRegistration,
     ) -> Result<(), LnurlRepositoryError> {
         registration.validate()?;
+        if let Some(claim) = &registration.claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
         self.spark_registrations
             .lock()
             .unwrap()
@@ -226,12 +231,28 @@ impl LnurlRepository for MockRepository {
     async fn delete_expired_signed_messages(&self, _: i64) -> Result<u64, LnurlRepositoryError> {
         Ok(0)
     }
+    /// Refuses a pubkey that holds no such registration, and like the real
+    /// repositories leaves the claim unspent when it does.
     async fn delete_spark_registration(
         &self,
         domain: &str,
         pubkey: &str,
         identifier: &str,
+        claim: Option<&crate::repository::StatementClaim>,
     ) -> Result<(), LnurlRepositoryError> {
+        let owned = self.spark_registrations.lock().unwrap().iter().any(|r| {
+            r.pubkey == pubkey
+                && r.identifier.domain == domain
+                && r.identifier.identifier == identifier
+        });
+        if !owned {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+        if let Some(claim) = claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
         self.spark_unregistrations.lock().unwrap().push((
             domain.to_string(),
             pubkey.to_string(),

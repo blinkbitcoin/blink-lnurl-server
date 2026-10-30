@@ -19,7 +19,7 @@ LNURL server is adapted" and has a blocking review on exactly that.
 Where the implementation differs from the text below:
 - Signed `available` mirrors the unsigned route, which has no `require_spark_provider_enabled` gate. That keeps the two answers identical.
 - `/mode` now resolves the request domain, which the `blink-lnurl:v1` message needs. A `/mode` request to a host outside the allow-list now gets a 404, as the other management routes already did.
-- Phase 4 claims after the checks that refuse a request (`enhanced_mode_required`, ownership), so a refused request stays actionable.
+- Phase 4 claims inside the repository transaction of the write it authorizes, for registration, deletion and transfer alike. So a refused or failed write never spends its statement, and routes never claim on their own.
 
 ## 1. Problem
 

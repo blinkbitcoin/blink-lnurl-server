@@ -38,9 +38,8 @@ use super::{
     lnurl_pay::PublicIdentifierIntent,
     lnurl_pay::PublicRecipient,
     signed::{
-        Candidate, ClaimExpiry, MessageFormat, SignedRoute, check_timestamp, claim_statement,
-        legacy_timestamped, parse_signed_request, statement_already_used, statement_claim,
-        verify_candidates,
+        Candidate, ClaimExpiry, MessageFormat, SignedRoute, check_timestamp, legacy_timestamped,
+        parse_signed_request, statement_already_used, statement_claim, verify_candidates,
     },
 };
 
@@ -102,18 +101,6 @@ where
             return Err(enhanced_mode_required());
         }
 
-        // Register and the legacy unregister candidate cover identical bytes,
-        // so this spends the statement for both routes.
-        claim_statement(
-            &state,
-            &statement_claim(
-                &pubkey,
-                authorization,
-                ClaimExpiry::Bounded(payload.timestamp),
-            ),
-        )
-        .await?;
-
         let registration = NewSparkRegistration {
             account_id: None,
             pubkey: pubkey.to_string(),
@@ -123,6 +110,14 @@ where
                 identifier_kind: AccountIdentifierKind::Username,
                 description: payload.description,
             },
+            // Claimed in the registration's own transaction. Register and the
+            // legacy unregister candidate cover identical bytes, so a
+            // registration that lands spends the statement for both routes.
+            claim: Some(statement_claim(
+                &pubkey,
+                authorization,
+                ClaimExpiry::Bounded(payload.timestamp),
+            )),
         };
 
         if let Err(e) = state.db.upsert_spark_registration(&registration).await {
@@ -272,19 +267,16 @@ where
             .await
             .map_err(storage_error)?;
 
-        claim_statement(
-            &state,
-            &statement_claim(
-                &pubkey,
-                authorization,
-                ClaimExpiry::Bounded(payload.timestamp),
-            ),
-        )
-        .await?;
-
+        // Claimed in the delete's own transaction, so a refused delete leaves
+        // the statement actionable.
+        let claim = statement_claim(
+            &pubkey,
+            authorization,
+            ClaimExpiry::Bounded(payload.timestamp),
+        );
         state
             .db
-            .delete_spark_registration(&domain, &pubkey.to_string(), &username)
+            .delete_spark_registration(&domain, &pubkey.to_string(), &username, Some(&claim))
             .await
             .map_err(|e| spark_unregister_error(e, &username))?;
         debug!("unregistered user '{username}' for pubkey {pubkey}");
@@ -943,6 +935,7 @@ pub(super) fn spark_unregister_error(
             trace!("unregister pubkey does not own username '{username}'");
             (StatusCode::NOT_FOUND, Json(Value::String(String::new())))
         }
+        LnurlRepositoryError::StatementAlreadyUsed => statement_already_used(),
         error => storage_error(error),
     }
 }
@@ -959,6 +952,7 @@ pub(super) fn spark_registration_error(
                 Json(Value::String("name already taken".into())),
             )
         }
+        LnurlRepositoryError::StatementAlreadyUsed => statement_already_used(),
         error => storage_error(error),
     }
 }
@@ -2485,6 +2479,7 @@ mod tests {
             signed_message::unregister(V2_DOMAIN, "alice", timestamp),
             format!("alice-{timestamp}"),
         ] {
+            register_directly(&repo, &pubkey, "alice").await;
             LnurlServer::unregister(
                 Host(V2_DOMAIN.to_string()),
                 Path(pubkey.clone()),
@@ -2499,6 +2494,42 @@ mod tests {
             .unwrap_or_else(|e| panic!("unregister must verify {message:?}: {e:?}"));
         }
         assert_eq!(repo.spark_unregistrations().len(), 2);
+    }
+
+    /// Give `pubkey` `username` without going through a signed route.
+    async fn register_directly(repo: &MockRepository, pubkey: &str, username: &str) {
+        repo.upsert_spark_registration(&NewSparkRegistration {
+            account_id: None,
+            pubkey: pubkey.to_string(),
+            identifier: NewAccountIdentifier {
+                domain: V2_DOMAIN.to_string(),
+                identifier: username.to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "d".to_string(),
+            },
+            claim: None,
+        })
+        .await
+        .expect("direct registration succeeds");
+    }
+
+    async fn post_unregister(
+        state: &State<MockRepository>,
+        pubkey: &str,
+        signature: String,
+        timestamp: u64,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        LnurlServer::unregister(
+            Host(V2_DOMAIN.to_string()),
+            Path(pubkey.to_string()),
+            Extension(state.clone()),
+            Json(UnregisterLnurlPayRequest {
+                username: "alice".to_string(),
+                signature,
+                timestamp,
+            }),
+        )
+        .await
     }
 
     async fn post_recover(
@@ -2949,20 +2980,32 @@ mod tests {
         let _ = post_register(&state, &pubkey, signature.clone(), timestamp, "d")
             .await
             .expect("register succeeds");
-        assert_already_used(
-            LnurlServer::unregister(
-                Host(V2_DOMAIN.to_string()),
-                Path(pubkey.clone()),
-                Extension(state),
-                Json(UnregisterLnurlPayRequest {
-                    username: "alice".to_string(),
-                    signature,
-                    timestamp,
-                }),
-            )
-            .await,
-        );
+        assert_already_used(post_unregister(&state, &pubkey, signature, timestamp).await);
         assert_eq!(repo.spark_unregistrations().len(), 0);
+    }
+
+    /// The legacy register and unregister messages are the same bytes. A
+    /// pending register signature presented to unregister first is refused
+    /// there (nothing to delete) and must stay usable for the register it was
+    /// made for.
+    #[tokio::test]
+    async fn a_refused_unregister_does_not_spend_a_pending_register_signature() {
+        let (secret, pubkey) = mode_key(61);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(&secret, &format!("alice-{timestamp}"));
+
+        let Err((status, _)) = post_unregister(&state, &pubkey, signature.clone(), timestamp).await
+        else {
+            panic!("unregistering a name the pubkey does not hold must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = post_register(&state, &pubkey, signature, timestamp, "d")
+            .await
+            .expect("the register the signature was made for still succeeds");
+        assert_eq!(repo.spark_registration_count(), 1);
     }
 
     #[tokio::test]

@@ -271,33 +271,10 @@ pub(super) fn statement_claim(
     }
 }
 
-/// Claim the statement a verified signature authorized, refusing a replay.
-///
-/// A statement is claimable once, whichever route presents it, and is claimed
-/// before the route acts so a replay cannot slip in beside the request it
-/// copies. A client that retries re-signs, which gives a fresh timestamp and so
-/// a statement of its own.
-pub(super) async fn claim_statement<DB>(
-    state: &State<DB>,
-    claim: &StatementClaim,
-) -> Result<(), ApiError>
-where
-    DB: LnurlRepository + Send + Sync,
-{
-    let claimed = state.db.claim_signed_message(claim).await.map_err(|e| {
-        error!("failed to claim signed message: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Value::String("internal server error".into())),
-        )
-    })?;
-    if claimed {
-        return Ok(());
-    }
-    trace!("signature already used, refusing on '{}'", claim.route);
-    Err(statement_already_used())
-}
-
+/// The response to a statement that was already acted on. Routes never claim
+/// on their own: the claim rides in the transaction of the write it
+/// authorizes, so a write that fails rolls it back and a client that retries
+/// a refused request is not told its signature was used.
 pub(super) fn statement_already_used() -> ApiError {
     (
         StatusCode::CONFLICT,

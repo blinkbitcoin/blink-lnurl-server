@@ -121,6 +121,7 @@ mod shared_tests {
 
         db.add_domain(domain).await.unwrap();
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: None,
             pubkey: "enqueue_pubkey".to_string(),
             identifier: NewAccountIdentifier {
