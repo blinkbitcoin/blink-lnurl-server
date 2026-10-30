@@ -86,21 +86,30 @@ stop_stack() {
   stop_blink_graphql_mock
 }
 
+# A unix timestamp no earlier than now and strictly after the last one handed
+# out. The server acts on a register, unregister or transfer statement once, so
+# two requests signed in the same second must not sign the same bytes.
+fresh_timestamp() {
+  local now
+  local last=0
+  local next
+  mkdir -p "${STATE_DIR}"
+  now="$(date +%s)"
+  if [ -f "${STATE_DIR}/last_timestamp" ]; then
+    last="$(<"${STATE_DIR}/last_timestamp")"
+  fi
+  next=$((now > last ? now : last + 1))
+  echo "${next}" >"${STATE_DIR}/last_timestamp"
+  echo "${next}"
+}
+
 auth_payload() {
   local username="${1:?username is required}"
-  local timestamp="${2:-}"
+  local timestamp="${2:-$(fresh_timestamp)}"
   if [ -x "${E2E_AUTH_BIN}" ] && [ "${E2E_AUTH_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_auth.rs" ]; then
-    if [ -n "${timestamp}" ]; then
-      "${E2E_AUTH_BIN}" "${username}" "${timestamp}"
-    else
-      "${E2E_AUTH_BIN}" "${username}"
-    fi
+    "${E2E_AUTH_BIN}" "${username}" "${timestamp}"
   else
-    if [ -n "${timestamp}" ]; then
-      cargo run --quiet --locked --bin e2e_auth -- "${username}" "${timestamp}"
-    else
-      cargo run --quiet --locked --bin e2e_auth -- "${username}"
-    fi
+    cargo run --quiet --locked --bin e2e_auth -- "${username}" "${timestamp}"
   fi
 }
 
@@ -111,7 +120,7 @@ v2_auth_payload() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
   local description="${3:-Test LNURL user}"
-  local timestamp="${4:-$(date +%s)}"
+  local timestamp="${4:-$(fresh_timestamp)}"
   if [ -x "${E2E_AUTH_BIN}" ] && [ "${E2E_AUTH_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_auth.rs" ]; then
     "${E2E_AUTH_BIN}" "${username}" "${timestamp}" "${host}" "${description}"
   else

@@ -123,6 +123,8 @@ Recover tries `breez-lnurl:v2`, then `blink-lnurl:v1`, then pre-v2. The pre-v2 r
 
 `/metadata/{payment_hash}/zap`, `/invoice-paid`, and `/invoices-paid` verify only their pre-v2 messages: `{zap_receipt}-{ts}`, `{preimage}-{ts}`, and `{pubkey}-{ts}`. Breez SDK 0.23 does not call them.
 
+**Single use.** Register, unregister, and transfer claim the statement they act on: the pubkey plus the exact signed message, hashed into `used_signed_messages`. The same statement is then refused with `409 "signature has already been used"`, whichever of those routes presents it. In particular, a pre-v2 register signature, whose bytes equal the pre-v2 unregister message, cannot be replayed as an unregister. A client that retries re-signs, which gives a fresh timestamp and so a new statement. A request refused before it acts, for example `enhanced_mode_required`, does not spend its statement, and a transfer claims inside its own transaction. Claims are pruned once the statement's timestamp falls outside the 600-second window. The untimestamped pre-v2 transfer message is kept for good. Recover, metadata, and availability are reads and claim nothing.
+
 Pre-v2 verifies are counted per route and logged once a minute on the `blink_lnurl::legacy_signatures` tracing target, for example `legacy signed-message verifies: register=0 unregister=0 …`. The legacy forms are removed once those counts read zero.
 
 ### Spark-compatible management requests
@@ -332,7 +334,7 @@ Blink `/webhook/blink` body:
 | `401` | Empty body or JSON string | Missing/invalid client certificate, missing/invalid internal bearer JWT, or invalid Spark webhook signature. |
 | `403` | `{ "error": "forbidden" }` or `{ "error": "unauthorized" }` | Internal JWT lacks the required scope, or a zap receipt is being published by the wrong Spark pubkey. |
 | `404` | JSON string, `{ "error": "not_found" }`, or empty string | User, invoice, zap, account, or identifier was not found. |
-| `409` | JSON string or `{ "error": "identifier_conflict" }` | Username or identifier conflict, invalid provider ownership for transfer, `enhanced_mode_required` when a username is claimed or received while the stored mode is `anon`, or `mode_request_not_newer` when a mode request would roll the mode back. |
+| `409` | JSON string or `{ "error": "identifier_conflict" }` | Username or identifier conflict, invalid provider ownership for transfer, `enhanced_mode_required` when a username is claimed or received while the stored mode is `anon`, `mode_request_not_newer` when a mode request would roll the mode back, or `signature has already been used` when a register, unregister, or transfer statement is presented again. |
 | `429` | JSON string `"rate_limited"` | More mode requests than `LNURL_MODE_REQUESTS_PER_IP_PER_MINUTE` from one client IP, or a mode request with no trusted `x-real-ip` outside `DEPLOYMENT_ENV=local`. |
 | `500` | JSON string or `{ "error": "internal_server_error" }` | Repository failure, provider state failure, malformed configured keys/certificates, or unexpected invoice/provider state. |
 

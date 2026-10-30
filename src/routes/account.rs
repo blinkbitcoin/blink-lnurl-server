@@ -38,8 +38,9 @@ use super::{
     lnurl_pay::PublicIdentifierIntent,
     lnurl_pay::PublicRecipient,
     signed::{
-        Candidate, MessageFormat, SignedRoute, check_timestamp, legacy_timestamped,
-        parse_signed_request, verify_candidates,
+        Candidate, ClaimExpiry, MessageFormat, SignedRoute, check_timestamp, claim_statement,
+        legacy_timestamped, parse_signed_request, statement_already_used, statement_claim,
+        verify_candidates,
     },
 };
 
@@ -93,12 +94,25 @@ where
                 SignedRoute::Register,
             ),
         ];
-        verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
+        let authorization =
+            verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
 
         let stored_mode = stored_account_mode(&state, &pubkey.to_string()).await?;
         if stored_mode == Some(AccountMode::Anon) {
             return Err(enhanced_mode_required());
         }
+
+        // Register and the legacy unregister candidate cover identical bytes,
+        // so this spends the statement for both routes.
+        claim_statement(
+            &state,
+            &statement_claim(
+                &pubkey,
+                authorization,
+                ClaimExpiry::Bounded(payload.timestamp),
+            ),
+        )
+        .await?;
 
         let registration = NewSparkRegistration {
             account_id: None,
@@ -155,8 +169,19 @@ where
             &payload.description,
             payload.timestamp,
         );
-        verify_candidates(&state, &from_pk, &from_sig, &from_candidates, Some(&domain)).await?;
+        let authorization =
+            verify_candidates(&state, &from_pk, &from_sig, &from_candidates, Some(&domain)).await?;
         verify_candidates(&state, &to_pk, &to_sig, &to_candidates, Some(&domain)).await?;
+        // The current owner's statement is the one claimed: it is what
+        // authorizes the name to leave. The legacy message carries no time, so
+        // its claim is kept for good.
+        let claim = statement_claim(
+            &from_pk,
+            authorization,
+            payload
+                .timestamp
+                .map_or(ClaimExpiry::Unbounded, ClaimExpiry::Bounded),
+        );
 
         if from_pk == to_pk {
             return Err((
@@ -196,6 +221,7 @@ where
                 source_account_id: source_recipient.account_id,
                 destination_spark_pubkey: to_pubkey.clone(),
                 description: payload.description,
+                claim: Some(claim),
             })
             .await
         {
@@ -237,13 +263,24 @@ where
                 SignedRoute::Unregister,
             ),
         ];
-        verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
+        let authorization =
+            verify_candidates(&state, &pubkey, &signature, &candidates, Some(&domain)).await?;
 
         state
             .db
             .get_account_by_spark_pubkey(&pubkey.to_string())
             .await
             .map_err(storage_error)?;
+
+        claim_statement(
+            &state,
+            &statement_claim(
+                &pubkey,
+                authorization,
+                ClaimExpiry::Bounded(payload.timestamp),
+            ),
+        )
+        .await?;
 
         state
             .db
@@ -871,6 +908,10 @@ pub(super) fn spark_transfer_error(
             StatusCode::CONFLICT,
             Json(Value::String(ERROR_MODE_REQUEST_NOT_NEWER.into())),
         ),
+        LnurlRepositoryError::StatementAlreadyUsed => {
+            trace!("transfer of '{username}' already performed with this authorization");
+            statement_already_used()
+        }
         LnurlRepositoryError::General(err) => {
             error!("failed to execute transfer query: {err}");
             (
@@ -2862,5 +2903,132 @@ mod tests {
             );
         }
         assert!(repo.spark_mode(&pubkey).is_none());
+    }
+
+    // -- Single-use statements ---------------------------------------------------
+
+    fn assert_already_used(result: Result<impl Sized, (StatusCode, Json<Value>)>) {
+        let Err((status, Json(body))) = result else {
+            panic!("expected a replay to be refused");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            Value::String("signature has already been used".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_register_statement_is_acted_on_once() {
+        let (secret, pubkey) = mode_key(56);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+
+        for message in [
+            signed_message::register(V2_DOMAIN, "alice", "d", timestamp),
+            format!("alice-{timestamp}"),
+        ] {
+            let signature = sign_hex(&secret, &message);
+            let _ = post_register(&state, &pubkey, signature.clone(), timestamp, "d")
+                .await
+                .expect("the first presentation registers");
+            assert_already_used(post_register(&state, &pubkey, signature, timestamp, "d").await);
+        }
+        assert_eq!(repo.spark_registration_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_register_signature_cannot_be_replayed_as_unregister() {
+        let (secret, pubkey) = mode_key(57);
+        let repo = MockRepository::default();
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(&secret, &format!("alice-{timestamp}"));
+
+        let _ = post_register(&state, &pubkey, signature.clone(), timestamp, "d")
+            .await
+            .expect("register succeeds");
+        assert_already_used(
+            LnurlServer::unregister(
+                Host(V2_DOMAIN.to_string()),
+                Path(pubkey.clone()),
+                Extension(state),
+                Json(UnregisterLnurlPayRequest {
+                    username: "alice".to_string(),
+                    signature,
+                    timestamp,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(repo.spark_unregistrations().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_register_does_not_spend_its_statement() {
+        let (secret, pubkey) = mode_key(58);
+        let repo = MockRepository::default().with_spark_mode(&pubkey, Some(AccountMode::Anon));
+        let state = v2_state(repo.clone()).await;
+        let timestamp = now_u64();
+        let signature = sign_hex(
+            &secret,
+            &signed_message::register(V2_DOMAIN, "alice", "d", timestamp),
+        );
+
+        assert_conflict(
+            post_register(&state, &pubkey, signature.clone(), timestamp, "d").await,
+            ERROR_ENHANCED_MODE_REQUIRED,
+        );
+        assert!(
+            repo.claimed_statements.lock().unwrap().is_empty(),
+            "a request refused before acting must stay actionable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_authorization_is_acted_on_once() {
+        let (from, from_pubkey) = mode_key(59);
+        let (to, to_pubkey) = mode_key(60);
+        let repo = MockRepository::default()
+            .with_resolved_recipient(transfer_source_recipient(&from_pubkey));
+        let timestamp = now_u64();
+        let from_signature = sign_hex(
+            &from,
+            &signed_message::transfer_from(V2_DOMAIN, "alice", &from_pubkey, &to_pubkey, timestamp),
+        );
+        let to_signature = sign_hex(
+            &to,
+            &signed_message::transfer_to(
+                V2_DOMAIN,
+                "alice",
+                &from_pubkey,
+                &to_pubkey,
+                "Alice",
+                timestamp,
+            ),
+        );
+
+        let _ = run_v2_transfer(
+            repo.clone(),
+            from_signature.clone(),
+            to_signature.clone(),
+            &from_pubkey,
+            &to_pubkey,
+            timestamp,
+        )
+        .await
+        .expect("the first presentation transfers");
+        assert_already_used(
+            run_v2_transfer(
+                repo,
+                from_signature,
+                to_signature,
+                &from_pubkey,
+                &to_pubkey,
+                timestamp,
+            )
+            .await,
+        );
     }
 }

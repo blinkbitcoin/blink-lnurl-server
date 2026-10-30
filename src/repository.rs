@@ -31,6 +31,9 @@ pub enum LnurlRepositoryError {
     InvalidAccountMode,
     #[error("mode request is not newer than the last accepted one")]
     StaleModeTimestamp,
+    /// The signed statement authorizing this request has already been acted on.
+    #[error("statement already used")]
+    StatementAlreadyUsed,
     #[error("database error: {0}")]
     General(anyhow::Error),
 }
@@ -309,6 +312,22 @@ pub struct IdentifierTransfer {
     pub source_account_id: String,
     pub destination_spark_pubkey: String,
     pub description: String,
+    /// The signed statement authorizing the transfer, claimed in the same
+    /// transaction so a transfer that fails leaves it actionable.
+    pub claim: Option<StatementClaim>,
+}
+
+/// A signed statement a mutating route acts on, recorded so it is acted on
+/// once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementClaim {
+    /// `sha256(pubkey || 0x00 || signed message)`.
+    pub statement_hash: [u8; 32],
+    /// Which route acted on it. Diagnostic only.
+    pub route: &'static str,
+    /// Unix seconds after which the row may be pruned; `i64::MAX` for a
+    /// statement nothing else bounds in time.
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,6 +469,17 @@ pub trait LnurlRepository {
     ) -> Result<(), LnurlRepositoryError> {
         Err(provider_neutral_not_implemented())
     }
+
+    /// Record `claim`, returning whether this call claimed it. `false` means
+    /// it was already claimed and must not be acted on again. The first claim
+    /// wins and its route is never overwritten.
+    async fn claim_signed_message(
+        &self,
+        claim: &StatementClaim,
+    ) -> Result<bool, LnurlRepositoryError>;
+
+    /// Delete claims whose `expires_at` is before `now`.
+    async fn delete_expired_signed_messages(&self, now: i64) -> Result<u64, LnurlRepositoryError>;
 
     async fn create_blink_account(
         &self,
@@ -620,7 +650,7 @@ pub mod shared_tests {
         AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
         IdentifierTransfer, Invoice, LnurlRepository, LnurlRepositoryError, LnurlSenderComment,
         ModeSource, NewAccountIdentifier, NewBlinkAccount, NewSparkRegistration, SparkModeUpdate,
-        WalletKind, generate_account_id,
+        StatementClaim, WalletKind, generate_account_id,
     };
     use crate::zap::Zap;
 
@@ -1178,6 +1208,134 @@ pub mod shared_tests {
         assert_eq!(phone.default_wallet, username.default_wallet);
     }
 
+    fn claim(seed: u8, route: &'static str, expires_at: i64) -> StatementClaim {
+        StatementClaim {
+            statement_hash: [seed; 32],
+            route,
+            expires_at,
+        }
+    }
+
+    pub async fn a_signed_statement_is_claimed_once<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        assert!(
+            db.claim_signed_message(&claim(1, "register", 9_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.claim_signed_message(&claim(1, "unregister", 9_000))
+                .await
+                .unwrap(),
+            "a statement claimed by one route is spent for every route"
+        );
+        assert!(
+            !db.claim_signed_message(&claim(1, "register", 9_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_signed_message(&claim(2, "register", 9_000))
+                .await
+                .unwrap()
+        );
+    }
+
+    pub async fn expired_claims_are_pruned_and_unbounded_ones_never<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        assert!(
+            db.claim_signed_message(&claim(3, "register", 1_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_signed_message(&claim(4, "register", 9_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_signed_message(&claim(5, "transfer", i64::MAX))
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(db.delete_expired_signed_messages(5_000).await.unwrap(), 1);
+
+        assert!(
+            db.claim_signed_message(&claim(3, "register", 1_000))
+                .await
+                .unwrap(),
+            "a pruned claim is claimable again; its timestamp refuses it by then"
+        );
+        assert!(
+            !db.claim_signed_message(&claim(4, "register", 9_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.claim_signed_message(&claim(5, "transfer", i64::MAX))
+                .await
+                .unwrap(),
+            "a claim nothing bounds in time must never be pruned"
+        );
+    }
+
+    pub async fn transfer_claims_its_statement_only_when_it_succeeds<DB>(db: &DB)
+    where
+        DB: LnurlRepository + Clone + Send + Sync + 'static,
+    {
+        let statement = claim(6, "transfer", 9_000);
+        let failed = db
+            .transfer_identifier(&IdentifierTransfer {
+                domain: "claim-transfer.example.com".to_string(),
+                identifier: "gina".to_string(),
+                source_account_id: "not_the_owner".to_string(),
+                destination_spark_pubkey: "claim_destination_pubkey".to_string(),
+                description: "transfer".to_string(),
+                claim: Some(statement.clone()),
+            })
+            .await;
+        assert!(matches!(failed, Err(LnurlRepositoryError::SourceNotOwner)));
+
+        let source_account_id = generate_account_id(AccountProvider::Spark);
+        db.upsert_spark_registration(&NewSparkRegistration {
+            account_id: Some(source_account_id.clone()),
+            pubkey: "claim_source_pubkey".to_string(),
+            identifier: NewAccountIdentifier {
+                domain: "claim-transfer.example.com".to_string(),
+                identifier: "gina".to_string(),
+                identifier_kind: AccountIdentifierKind::Username,
+                description: "before".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        let transfer = IdentifierTransfer {
+            domain: "claim-transfer.example.com".to_string(),
+            identifier: "gina".to_string(),
+            source_account_id,
+            destination_spark_pubkey: "claim_destination_pubkey".to_string(),
+            description: "after".to_string(),
+            claim: Some(statement.clone()),
+        };
+        db.transfer_identifier(&transfer)
+            .await
+            .expect("a failed transfer leaves its statement actionable");
+
+        assert!(
+            !db.claim_signed_message(&statement).await.unwrap(),
+            "a completed transfer spends its statement"
+        );
+        assert!(matches!(
+            db.transfer_identifier(&transfer).await,
+            Err(LnurlRepositoryError::StatementAlreadyUsed)
+        ));
+    }
+
     pub async fn transfer_identifier_requires_source_owner<DB>(db: &DB)
     where
         DB: LnurlRepository + Clone + Send + Sync + 'static,
@@ -1191,6 +1349,7 @@ pub mod shared_tests {
                 source_account_id: "not_the_owner".to_string(),
                 destination_spark_pubkey: "destination_pubkey".to_string(),
                 description: "transfer".to_string(),
+                claim: None,
             })
             .await;
         assert!(matches!(result, Err(LnurlRepositoryError::SourceNotOwner)));
@@ -1234,6 +1393,7 @@ pub mod shared_tests {
             source_account_id,
             destination_spark_pubkey: "spark_recover_destination_pubkey".to_string(),
             description: "after transfer".to_string(),
+            claim: None,
         })
         .await
         .unwrap();
@@ -1284,6 +1444,7 @@ pub mod shared_tests {
             source_account_id: source_account_id.clone(),
             destination_spark_pubkey: "spark_fresh_transfer_destination_pubkey".to_string(),
             description: "after fresh transfer".to_string(),
+            claim: None,
         })
         .await
         .unwrap();
@@ -1352,6 +1513,7 @@ pub mod shared_tests {
             source_account_id,
             destination_spark_pubkey: "spark_replace_alias_destination_pubkey".to_string(),
             description: "replacement transfer".to_string(),
+            claim: None,
         })
         .await
         .unwrap();

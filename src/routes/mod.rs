@@ -8,7 +8,7 @@ mod webhook;
 mod zap;
 #[allow(unused_imports)]
 pub use lnurl_pay::{LnurlPayCallbackParams, PayResponse, Tag};
-pub use signed::spawn_legacy_signature_reporter;
+pub use signed::{spawn_legacy_signature_reporter, spawn_signed_message_pruner};
 use std::marker::PhantomData;
 #[cfg(test)]
 #[allow(unused_imports)]

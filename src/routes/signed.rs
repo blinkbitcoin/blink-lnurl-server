@@ -14,11 +14,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::{Json, http::StatusCode};
+use bitcoin::hashes::{Hash, HashEngine, sha256};
 use bitcoin::secp256k1::{PublicKey, ecdsa::Signature};
 use serde_json::Value;
-use tracing::{info, trace};
+use tracing::{debug, error, info, trace};
 
-use crate::{state::State, time::now_u64};
+use crate::{
+    repository::{LnurlRepository, StatementClaim},
+    state::State,
+    time::{now, now_u64},
+};
 
 use super::account::{parse_pubkey, verify_with_spark_client};
 
@@ -27,7 +32,9 @@ type ApiError = (StatusCode, Json<Value>);
 /// Target the legacy-usage line is logged on, so a deployment can route it
 /// somewhere durable without keeping the rest of the route output.
 pub const LEGACY_SIGNATURE_TARGET: &str = "blink_lnurl::legacy_signatures";
-const LEGACY_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const LEGACY_REPORT_INTERVAL: Duration = Duration::from_mins(1);
+/// How often expired signed-message claims are pruned.
+const CLAIM_PRUNE_INTERVAL: Duration = Duration::from_mins(10);
 
 /// The route a signature authorizes, which names its legacy counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +223,107 @@ pub(super) async fn verify_candidates<'a, DB>(
     Err(invalid_signature())
 }
 
+/// How long the claim over a statement must be retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaimExpiry {
+    /// The statement carries this timestamp, so its claim may be pruned once
+    /// [`check_timestamp`] refuses the statement on its own.
+    Bounded(u64),
+    /// Nothing bounds the statement in time (the legacy transfer message), so
+    /// dropping its claim would put it back in play.
+    Unbounded,
+}
+
+impl ClaimExpiry {
+    fn expires_at(self) -> i64 {
+        match self {
+            // Saturating: an unrepresentable expiry only retains the claim
+            // longer.
+            Self::Bounded(timestamp) => {
+                i64::try_from(timestamp.saturating_add(super::ACCEPTABLE_TIME_DIFF_SECS))
+                    .unwrap_or(i64::MAX)
+            }
+            Self::Unbounded => i64::MAX,
+        }
+    }
+}
+
+/// The claim record for the statement `candidate` authorized.
+///
+/// Hashes what was authorized rather than the signature bytes: ECDSA
+/// signatures are malleable, so keying on them would let a reshaped signature
+/// re-authorize a claimed statement.
+pub(super) fn statement_claim(
+    pubkey: &PublicKey,
+    candidate: &Candidate,
+    expiry: ClaimExpiry,
+) -> StatementClaim {
+    let mut engine = sha256::Hash::engine();
+    engine.input(pubkey.to_string().as_bytes());
+    // The pubkey is fixed-width hex, but the boundary is still marked so no
+    // pubkey/message split can be read two ways.
+    engine.input(b"\x00");
+    engine.input(candidate.message.as_bytes());
+    StatementClaim {
+        statement_hash: sha256::Hash::from_engine(engine).to_byte_array(),
+        route: candidate.route.as_str(),
+        expires_at: expiry.expires_at(),
+    }
+}
+
+/// Claim the statement a verified signature authorized, refusing a replay.
+///
+/// A statement is claimable once, whichever route presents it, and is claimed
+/// before the route acts so a replay cannot slip in beside the request it
+/// copies. A client that retries re-signs, which gives a fresh timestamp and so
+/// a statement of its own.
+pub(super) async fn claim_statement<DB>(
+    state: &State<DB>,
+    claim: &StatementClaim,
+) -> Result<(), ApiError>
+where
+    DB: LnurlRepository + Send + Sync,
+{
+    let claimed = state.db.claim_signed_message(claim).await.map_err(|e| {
+        error!("failed to claim signed message: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(Value::String("internal server error".into())),
+        )
+    })?;
+    if claimed {
+        return Ok(());
+    }
+    trace!("signature already used, refusing on '{}'", claim.route);
+    Err(statement_already_used())
+}
+
+pub(super) fn statement_already_used() -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        Json(Value::String("signature has already been used".into())),
+    )
+}
+
+/// Prune expired claims periodically. Retention is tied to the accept window:
+/// a claim is only dropped once its statement's timestamp is refused anyway.
+pub fn spawn_signed_message_pruner<DB>(db: DB)
+where
+    DB: LnurlRepository + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLAIM_PRUNE_INTERVAL);
+        loop {
+            interval.tick().await;
+            match db.delete_expired_signed_messages(now()).await {
+                Ok(0) => {}
+                Ok(count) => debug!("pruned {count} expired signed-message claims"),
+                Err(e) => error!("failed to prune signed-message claims: {e}"),
+            }
+        }
+    });
+}
+
 fn invalid_signature() -> ApiError {
     (
         StatusCode::BAD_REQUEST,
@@ -283,6 +391,35 @@ mod tests {
             seen[index] = true;
         }
         assert_eq!(SignedRoute::Available.legacy_index(), None);
+    }
+
+    #[test]
+    fn statement_claims_key_on_pubkey_and_message_not_signature() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key = |seed| {
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+            PublicKey::from_secret_key(&secp, &secret)
+        };
+        let message = |text: &str| Candidate::legacy(text.to_string(), SignedRoute::Register);
+        let claim =
+            |seed, text| statement_claim(&key(seed), &message(text), ClaimExpiry::Bounded(1));
+
+        assert_eq!(claim(1, "alice-1"), claim(1, "alice-1"));
+        assert_ne!(
+            claim(1, "alice-1").statement_hash,
+            claim(2, "alice-1").statement_hash
+        );
+        assert_ne!(
+            claim(1, "alice-1").statement_hash,
+            claim(1, "alice-2").statement_hash
+        );
+    }
+
+    #[test]
+    fn claim_expiry_outlives_the_accept_window() {
+        assert_eq!(ClaimExpiry::Bounded(1_000).expires_at(), 1_600);
+        assert_eq!(ClaimExpiry::Bounded(u64::MAX).expires_at(), i64::MAX);
+        assert_eq!(ClaimExpiry::Unbounded.expires_at(), i64::MAX);
     }
 
     #[test]

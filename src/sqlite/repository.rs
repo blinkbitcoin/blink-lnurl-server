@@ -5,8 +5,8 @@ use crate::repository::{
     Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
     IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
     NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
-    UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
-    generate_account_id,
+    StatementClaim, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    classify_refused_mode_write, generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -20,6 +20,29 @@ use crate::{
 #[derive(Clone)]
 pub struct LnurlRepository {
     pool: SqlitePool,
+}
+
+/// Insert `claim` unless its statement is already claimed, returning whether
+/// this call claimed it.
+async fn insert_statement_claim<'e, E>(
+    executor: E,
+    claim: &StatementClaim,
+) -> Result<bool, LnurlRepositoryError>
+where
+    E: sqlx::SqliteExecutor<'e>,
+{
+    let inserted = sqlx::query(
+        "INSERT INTO used_signed_messages (statement_hash, route, expires_at, created_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (statement_hash) DO NOTHING",
+    )
+    .bind(claim.statement_hash.as_slice())
+    .bind(claim.route)
+    .bind(claim.expires_at)
+    .bind(now())
+    .execute(executor)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 impl LnurlRepository {
@@ -526,6 +549,21 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         Ok(())
     }
 
+    async fn claim_signed_message(
+        &self,
+        claim: &StatementClaim,
+    ) -> Result<bool, LnurlRepositoryError> {
+        insert_statement_claim(&self.pool, claim).await
+    }
+
+    async fn delete_expired_signed_messages(&self, now: i64) -> Result<u64, LnurlRepositoryError> {
+        let deleted = sqlx::query("DELETE FROM used_signed_messages WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(deleted.rows_affected())
+    }
+
     async fn create_blink_account(
         &self,
         account: &NewBlinkAccount,
@@ -729,6 +767,14 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .begin()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        // Claimed inside the transaction, so a transfer that fails below rolls
+        // the claim back and the statement stays actionable.
+        if let Some(claim) = &transfer.claim
+            && !insert_statement_claim(&mut *tx, claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
 
         let source_account_id: Option<String> = sqlx::query_scalar(
             "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
@@ -1860,6 +1906,23 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn a_signed_statement_is_claimed_once() {
+        shared_tests::a_signed_statement_is_claimed_once(&setup_test_db().await).await;
+    }
+
+    #[tokio::test]
+    async fn expired_claims_are_pruned_and_unbounded_ones_never() {
+        shared_tests::expired_claims_are_pruned_and_unbounded_ones_never(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_claims_its_statement_only_when_it_succeeds() {
+        shared_tests::transfer_claims_its_statement_only_when_it_succeeds(&setup_test_db().await)
+            .await;
+    }
+
+    #[tokio::test]
     async fn transfer_identifier_requires_source_owner() {
         shared_tests::transfer_identifier_requires_source_owner(&setup_test_db().await).await;
     }
@@ -2110,6 +2173,7 @@ mod provider_neutral_tests {
             source_account_id: source_account_id.clone(),
             destination_spark_pubkey: "spark_transfer_destination".to_string(),
             description: "moved".to_string(),
+            claim: None,
         })
         .await
         .unwrap();

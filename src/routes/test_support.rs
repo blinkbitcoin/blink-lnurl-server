@@ -72,6 +72,7 @@ pub(crate) struct MockRepository {
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
     /// `(domain, pubkey, identifier)` per accepted unregister.
     pub(super) spark_unregistrations: std::sync::Arc<Mutex<Vec<(String, String, String)>>>,
+    pub(super) claimed_statements: std::sync::Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -212,6 +213,19 @@ impl LnurlRepository for MockRepository {
             .push(registration.clone());
         Ok(())
     }
+    async fn claim_signed_message(
+        &self,
+        claim: &crate::repository::StatementClaim,
+    ) -> Result<bool, LnurlRepositoryError> {
+        Ok(self
+            .claimed_statements
+            .lock()
+            .unwrap()
+            .insert(claim.statement_hash))
+    }
+    async fn delete_expired_signed_messages(&self, _: i64) -> Result<u64, LnurlRepositoryError> {
+        Ok(0)
+    }
     async fn delete_spark_registration(
         &self,
         domain: &str,
@@ -348,8 +362,13 @@ impl LnurlRepository for MockRepository {
     }
     async fn transfer_identifier(
         &self,
-        _: &IdentifierTransfer,
+        transfer: &IdentifierTransfer,
     ) -> Result<(), LnurlRepositoryError> {
+        if let Some(claim) = &transfer.claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
         Ok(())
     }
     async fn transfer_blink_identifier_to_spark(
