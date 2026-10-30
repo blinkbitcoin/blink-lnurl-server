@@ -86,14 +86,73 @@ identifier_spark_pubkey() {
   run recover_user "authuser" "localhost:8080"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.username' 'authuser'
-  assert_json_equals "$output" '.description' 'Authenticated test wallet'
+  # The pre-v2 message does not cover the description, so the body's is not
+  # stored.
+  assert_json_equals "$output" '.description' 'Pay to authuser@localhost:8080'
 
-  run unregister_user "authuser" "localhost:8080"
+  run unregister_user_v2 "authuser" "localhost:8080"
   [ "$status" -eq 0 ]
 
   run username_available "authuser" "localhost:8080"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.available' 'true'
+}
+
+@test "spark: v2 signed availability register recover metadata and unregister" {
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+
+  run register_user_v2 "v2user" "localhost:8080" "V2 test wallet"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.lightning_address' 'v2user@localhost:8080'
+
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'false'
+
+  response="$(recover_user_v2_status_body "v2user" "localhost:8080")"
+  [ "${response##*$'\n'}" = "200" ]
+  body="${response%$'\n'*}"
+  assert_json_equals "$body" '.username' 'v2user'
+  assert_json_equals "$body" '.description' 'V2 test wallet'
+
+  run list_metadata_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no-store, private"* ]]
+
+  run unregister_user_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+
+  run username_available_v2 "v2user" "localhost:8080"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.available' 'true'
+}
+
+@test "spark: v2 signature for another domain names the resolved domain" {
+  response="$(username_available_v2_status_body "v2domain" "localhost:8080" "other.example")"
+  [ "${response##*$'\n'}" = "400" ]
+  [ "${response%$'\n'*}" = "\"invalid signature for domain 'localhost:8080'\"" ]
+}
+
+@test "spark: v2 transfer hands the address to the transferee" {
+  run register_user_v2 "v2transfer" "localhost:8080" "V2 transfer source"
+  [ "$status" -eq 0 ]
+
+  run transfer_user_v2 "v2transfer" "localhost:8080" "V2 transfer target"
+  [ "$status" -eq 0 ]
+  assert_json_equals "$output" '.lightning_address' 'v2transfer@localhost:8080'
+
+  response="$(recover_user_v2_status_body "v2transfer" "localhost:8080" "to")"
+  [ "${response##*$'\n'}" = "200" ]
+  assert_json_equals "${response%$'\n'*}" '.description' 'V2 transfer target'
+
+  response="$(recover_user_v2_status_body "v2transfer" "localhost:8080")"
+  [ "${response##*$'\n'}" = "404" ]
+
+  # The transferee identity is shared with the later transfer tests.
+  docker compose exec -T postgres psql -U user -d lnurl \
+    -c "DELETE FROM account_identifiers WHERE domain = 'localhost:8080' AND identifier = 'v2transfer'" >/dev/null
 }
 
 @test "spark: availability and duplicate registration preserve Spark contract" {
@@ -126,7 +185,7 @@ identifier_spark_pubkey() {
   auth="$(auth_payload "transferuser")"
   to_pubkey="$(json_get "$auth" '.to_pubkey')"
 
-  run transfer_user "transferuser" "localhost:8080" "Transfer target wallet"
+  run transfer_user_v2 "transferuser" "localhost:8080" "Transfer target wallet"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.lightning_address' 'transferuser@localhost:8080'
   assert_json_equals "$output" '.lnurl' 'lnurlp://localhost:8080/lnurlp/transferuser'
@@ -200,7 +259,7 @@ identifier_spark_pubkey() {
   [ "$code" = "200" ]
   assert_json_equals "$body" '.lightning_address' 'destinationalias@localhost:8080'
 
-  run transfer_user "transferreplace" "localhost:8080" "Transfer replacement target"
+  run transfer_user_v2 "transferreplace" "localhost:8080" "Transfer replacement target"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.lightning_address' 'transferreplace@localhost:8080'
 
@@ -263,7 +322,7 @@ identifier_spark_pubkey() {
   run recover_user "newalias" "localhost:8080"
   [ "$status" -eq 0 ]
   assert_json_equals "$output" '.username' 'newalias'
-  assert_json_equals "$output" '.description' 'New alias wallet'
+  assert_json_equals "$output" '.description' 'Pay to newalias@localhost:8080'
 }
 
 @test "spark: unregister deletes only the signed Spark identifier" {
@@ -275,7 +334,7 @@ identifier_spark_pubkey() {
   docker compose exec -T postgres psql -U user -d lnurl \
     -c "INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) SELECT account_id, 'localhost:8080', 'keepone', 'username', 'Keep one wallet', 0, 0 FROM spark_accounts WHERE pubkey = '${pubkey}' ON CONFLICT (domain, identifier) DO NOTHING" >/dev/null
 
-  run unregister_user "deleteone" "localhost:8080"
+  run unregister_user_v2 "deleteone" "localhost:8080"
   [ "$status" -eq 0 ]
 
   run username_available "deleteone" "localhost:8080"
@@ -288,21 +347,44 @@ identifier_spark_pubkey() {
   metadata_description="$(json_get "$output" '.metadata | fromjson | .[0][1]')"
   [ "$metadata_description" = "Keep one wallet" ]
 
-  run unregister_user "keepone" "localhost:8080"
+  run unregister_user_v2 "keepone" "localhost:8080"
   [ "$status" -eq 0 ]
 }
 
 @test "spark: transfer rejects invalid signature with stable error shape" {
   register_user "badtransfer" "localhost:8080" "Transfer bad signature wallet" >/dev/null
 
-  auth="$(auth_payload "badtransfer")"
+  auth="$(v2_auth_payload "badtransfer" "localhost:8080" "Bad transfer")"
   from_pubkey="$(json_get "$auth" '.pubkey')"
   to_pubkey="$(json_get "$auth" '.to_pubkey')"
-  to_signature="$(json_get "$auth" '.transfer_to_signature')"
+  to_signature="$(json_get "$auth" '.v2.transfer_to_signature')"
+  timestamp="$(json_get "$auth" '.timestamp')"
 
-  run transfer_user_status "badtransfer" "localhost:8080" "Bad transfer" "00" "$to_signature" "$from_pubkey" "$to_pubkey"
+  response="$(transfer_user_status_body "badtransfer" "localhost:8080" "Bad transfer" "00" "$to_signature" "$from_pubkey" "$to_pubkey" "$timestamp")"
+  [ "${response##*$'\n'}" = "400" ]
+  [ "${response%$'\n'*}" = '"invalid signature"' ]
+}
+
+@test "spark: pre-v2 unregister and transfer signatures are refused" {
+  register_user "legacyonly" "localhost:8080" "Legacy only wallet" >/dev/null
+
+  # The pre-v2 unregister message equals the pre-v2 register message, so a
+  # fresh one must not delete a name its signer holds.
+  auth="$(auth_payload "legacyonly")"
+  pubkey="$(json_get "$auth" '.pubkey')"
+  data="$(jq -cn --arg signature "$(json_get "$auth" '.unregister_signature')" --argjson timestamp "$(json_get "$auth" '.timestamp')" '{username:"legacyonly",signature:$signature,timestamp:$timestamp}')"
+  response="$(http_status_body "DELETE" "${BASE_URL}/lnurlpay/${pubkey}" "localhost:8080" "$data")"
+  [ "${response##*$'\n'}" = "400" ]
+  [ "${response%$'\n'*}" = "\"invalid signature for domain 'localhost:8080'\"" ]
+
+  auth="$(auth_payload "legacyonly")"
+  response="$(transfer_user_status_body "legacyonly" "localhost:8080" "Legacy transfer" "$(json_get "$auth" '.transfer_from_signature')" "$(json_get "$auth" '.transfer_to_signature')" "$(json_get "$auth" '.pubkey')" "$(json_get "$auth" '.to_pubkey')")"
+  [ "${response##*$'\n'}" = "400" ]
+  [ "${response%$'\n'*}" = '"transfer requires a timestamped breez-lnurl:v2 authorization"' ]
+
+  run recover_user "legacyonly" "localhost:8080"
   [ "$status" -eq 0 ]
-  [ "$output" = "400" ]
+  assert_json_equals "$output" '.username' 'legacyonly'
 }
 
 @test "spark: available rejects invalid username" {
@@ -397,10 +479,10 @@ identifier_spark_pubkey() {
 @test "spark: unregister rejects mismatched signature" {
   register_user "unregisteruser" "localhost:8080" "Unregister test wallet" >/dev/null
 
-  auth="$(auth_payload "unregisteruser")"
+  auth="$(v2_auth_payload "unregisteruser" "localhost:8080")"
   pubkey="$(json_get "$auth" '.pubkey')"
   timestamp="$(json_get "$auth" '.timestamp')"
-  signature="$(json_get "$auth" '.unregister_signature')"
+  signature="$(json_get "$auth" '.v2.unregister_signature')"
 
   run unregister_user_status "otheruser" "localhost:8080" "$signature" "$timestamp" "$pubkey"
   [ "$status" -eq 0 ]

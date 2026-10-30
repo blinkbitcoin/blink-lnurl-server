@@ -14,7 +14,7 @@ test-rust:
 	env -u LNURL_TEST_POSTGRES_URL cargo test --locked
 
 start-deps:
-	docker compose up -d postgres
+	docker compose up -d --wait postgres
 
 stop-deps:
 	docker compose down --remove-orphans
@@ -32,7 +32,7 @@ e2e: test-e2e
 
 test-integration:
 	LNURL_POSTGRES_PORT=$${LNURL_POSTGRES_PORT:-25432} $(MAKE) reset-deps
-	LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:$${LNURL_POSTGRES_PORT:-25432}/lnurl cargo test --locked postgres_tests -- --test-threads=1
+	LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:$${LNURL_POSTGRES_PORT:-25432}/lnurl cargo test --locked postgres -- --test-threads=1
 
 test-in-ci: test-rust test-integration
 

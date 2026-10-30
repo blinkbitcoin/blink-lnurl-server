@@ -5,8 +5,8 @@ use crate::repository::{
     Account, AccountIdentifierKind, AccountMode, AccountProvider, BlinkToSparkIdentifierTransfer,
     IdentifierTransfer, Invoice, LnurlSenderComment, ModeSource, NewBlinkAccount,
     NewSparkRegistration, PendingZapReceipt, ResolvedRecipient, SparkAccountMode, SparkModeUpdate,
-    UpdatedBlinkAccount, WalletKind, WebhookPayloadData, classify_refused_mode_write,
-    generate_account_id,
+    StatementClaim, UpdatedBlinkAccount, WalletKind, WebhookPayloadData,
+    classify_refused_mode_write, generate_account_id,
 };
 use crate::webhooks::repository::{
     NewWebhookDelivery, WebhookConfig, WebhookDelivery, WebhookRepositoryError,
@@ -20,6 +20,29 @@ use crate::{
 #[derive(Clone)]
 pub struct LnurlRepository {
     pool: PgPool,
+}
+
+/// Insert `claim` unless its statement is already claimed, returning whether
+/// this call claimed it.
+async fn insert_statement_claim<'e, E>(
+    executor: E,
+    claim: &StatementClaim,
+) -> Result<bool, LnurlRepositoryError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let inserted = sqlx::query(
+        "INSERT INTO used_signed_messages (statement_hash, route, expires_at, created_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (statement_hash) DO NOTHING",
+    )
+    .bind(claim.statement_hash.as_slice())
+    .bind(claim.route)
+    .bind(claim.expires_at)
+    .bind(now())
+    .execute(executor)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 impl LnurlRepository {
@@ -308,6 +331,15 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
 
+        // Claimed inside the transaction, so a registration refused below
+        // (name taken, wrong owner) or failing in storage rolls the claim back
+        // and the statement stays actionable.
+        if let Some(claim) = &registration.claim
+            && !insert_statement_claim(&mut *tx, claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
+
         let account_id = if let Some(account_id) = &registration.account_id {
             account_id.clone()
         } else if let Some((account_id,)) = sqlx::query_as::<_, (String,)>(
@@ -526,6 +558,22 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn claim_signed_message(
+        &self,
+        claim: &StatementClaim,
+    ) -> Result<bool, LnurlRepositoryError> {
+        insert_statement_claim(&self.pool, claim).await
+    }
+
+    async fn delete_expired_signed_messages(&self, now: i64) -> Result<u64, LnurlRepositoryError> {
+        let deleted = sqlx::query("DELETE FROM used_signed_messages WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(deleted.rows_affected())
+    }
+
     async fn create_blink_account(
         &self,
         account: &NewBlinkAccount,
@@ -680,12 +728,23 @@ impl crate::repository::LnurlRepository for LnurlRepository {
         domain: &str,
         pubkey: &str,
         identifier: &str,
+        claim: Option<&StatementClaim>,
     ) -> Result<(), LnurlRepositoryError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        // Claimed inside the transaction, so a delete refused below (not the
+        // owner) rolls the claim back. That matters for the legacy message,
+        // which register and unregister share: presenting a pending register
+        // signature here first must not spend it.
+        if let Some(claim) = claim
+            && !insert_statement_claim(&mut *tx, claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
 
         let account_id: Option<String> =
             sqlx::query_scalar("SELECT account_id FROM spark_accounts WHERE pubkey = $1")
@@ -727,6 +786,14 @@ impl crate::repository::LnurlRepository for LnurlRepository {
             .begin()
             .await
             .map_err(|e| LnurlRepositoryError::General(e.into()))?;
+
+        // Claimed inside the transaction, so a transfer that fails below rolls
+        // the claim back and the statement stays actionable.
+        if let Some(claim) = &transfer.claim
+            && !insert_statement_claim(&mut *tx, claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
 
         let source_account_id: Option<String> = sqlx::query_scalar(
             "SELECT account_id FROM account_identifiers WHERE domain = $1 AND identifier = $2",
@@ -1806,14 +1873,14 @@ mod provider_neutral_tests {
 
     async fn setup_test_db() -> Option<(sqlx::PgPool, LnurlRepository)> {
         let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
-        crate::postgresql::run_migrations(&pool).await.ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        crate::postgresql::run_migrations(&pool).await.unwrap();
         sqlx::query(
-            "TRUNCATE account_identifiers, spark_accounts, blink_accounts, accounts CASCADE",
+            "TRUNCATE account_identifiers, spark_accounts, blink_accounts, accounts, used_signed_messages CASCADE",
         )
         .execute(&pool)
         .await
-        .ok()?;
+        .unwrap();
         let db = LnurlRepository::new(pool.clone());
         Some((pool, db))
     }
@@ -1984,6 +2051,54 @@ mod provider_neutral_tests {
     }
 
     #[tokio::test]
+    async fn a_signed_statement_is_claimed_once() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::a_signed_statement_is_claimed_once(&db).await;
+    }
+
+    #[tokio::test]
+    async fn expired_claims_are_pruned_and_saturated_ones_never() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::expired_claims_are_pruned_and_saturated_ones_never(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_claims_its_statement_only_when_it_succeeds() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::transfer_claims_its_statement_only_when_it_succeeds(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_registration_leaves_its_statement_actionable() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::a_refused_registration_leaves_its_statement_actionable(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_registration_failing_after_its_claim_rolls_the_claim_back() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::a_registration_failing_after_its_claim_rolls_the_claim_back(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_unregister_leaves_its_statement_actionable() {
+        let Some((_, db)) = setup_test_db().await else {
+            return;
+        };
+        shared_tests::a_refused_unregister_leaves_its_statement_actionable(&db).await;
+    }
+
+    #[tokio::test]
     async fn transfer_identifier_requires_source_owner() {
         let Some((_, db)) = setup_test_db().await else {
             return;
@@ -2147,6 +2262,7 @@ mod provider_neutral_tests {
 
         let result = db
             .upsert_spark_registration(&NewSparkRegistration {
+                claim: None,
                 account_id: Some(account_id.clone()),
                 pubkey: "pg_spark_rejected_phone_pubkey".to_string(),
                 identifier: NewAccountIdentifier {
@@ -2232,6 +2348,7 @@ mod provider_neutral_tests {
         let destination_account_id = generate_account_id(AccountProvider::Spark);
 
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: Some(source_account_id.clone()),
             pubkey: "pg_spark_transfer_source".to_string(),
             identifier: NewAccountIdentifier {
@@ -2256,6 +2373,7 @@ mod provider_neutral_tests {
         .await
         .unwrap();
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: Some(destination_account_id.clone()),
             pubkey: "pg_spark_transfer_destination".to_string(),
             identifier: NewAccountIdentifier {
@@ -2274,6 +2392,7 @@ mod provider_neutral_tests {
             source_account_id: source_account_id.clone(),
             destination_spark_pubkey: "pg_spark_transfer_destination".to_string(),
             description: "moved".to_string(),
+            claim: None,
         })
         .await
         .unwrap();
@@ -2301,6 +2420,7 @@ mod provider_neutral_tests {
         };
         let account_id = generate_account_id(AccountProvider::Spark);
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: Some(account_id.clone()),
             pubkey: "pg_spark_targeted_unregister_pubkey".to_string(),
             identifier: NewAccountIdentifier {
@@ -2329,6 +2449,7 @@ mod provider_neutral_tests {
             "pg-targeted-unregister.example.com",
             "pg_spark_targeted_unregister_pubkey",
             "secondary",
+            None,
         )
         .await
         .unwrap();

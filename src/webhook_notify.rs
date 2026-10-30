@@ -121,6 +121,7 @@ mod shared_tests {
 
         db.add_domain(domain).await.unwrap();
         db.upsert_spark_registration(&NewSparkRegistration {
+            claim: None,
             account_id: None,
             pubkey: "enqueue_pubkey".to_string(),
             identifier: NewAccountIdentifier {
@@ -478,25 +479,25 @@ mod postgres_tests {
 
     async fn setup_test_db() -> Option<crate::postgresql::LnurlRepository> {
         let url = std::env::var("LNURL_TEST_POSTGRES_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
-        crate::postgresql::run_migrations(&pool).await.ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        crate::postgresql::run_migrations(&pool).await.unwrap();
 
         sqlx::query("DELETE FROM webhook_deliveries")
             .execute(&pool)
             .await
-            .ok()?;
+            .unwrap();
         sqlx::query("DELETE FROM domain_webhooks")
             .execute(&pool)
             .await
-            .ok()?;
+            .unwrap();
         sqlx::query("DELETE FROM invoices")
             .execute(&pool)
             .await
-            .ok()?;
+            .unwrap();
         sqlx::query("DELETE FROM settings")
             .execute(&pool)
             .await
-            .ok()?;
+            .unwrap();
 
         Some(crate::postgresql::LnurlRepository::new(pool))
     }

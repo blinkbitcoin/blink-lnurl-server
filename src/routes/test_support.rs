@@ -70,6 +70,9 @@ pub(crate) struct MockRepository {
     pub(super) blink_to_spark_transfers: std::sync::Arc<Mutex<Vec<BlinkToSparkIdentifierTransfer>>>,
     pub(super) spark_modes: std::sync::Arc<Mutex<HashMap<String, SparkAccountMode>>>,
     pub(super) spark_registrations: std::sync::Arc<Mutex<Vec<NewSparkRegistration>>>,
+    /// `(domain, pubkey, identifier)` per accepted unregister.
+    pub(super) spark_unregistrations: std::sync::Arc<Mutex<Vec<(String, String, String)>>>,
+    pub(super) claimed_statements: std::sync::Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +140,10 @@ impl MockRepository {
     pub(super) fn spark_registration_count(&self) -> usize {
         self.spark_registrations.lock().unwrap().len()
     }
+
+    pub(super) fn spark_unregistrations(&self) -> Vec<(String, String, String)> {
+        self.spark_unregistrations.lock().unwrap().clone()
+    }
 }
 
 pub(super) fn empty_spark_mode_record(pubkey: &str) -> SparkAccountMode {
@@ -200,10 +207,57 @@ impl LnurlRepository for MockRepository {
         registration: &NewSparkRegistration,
     ) -> Result<(), LnurlRepositoryError> {
         registration.validate()?;
+        if let Some(claim) = &registration.claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
         self.spark_registrations
             .lock()
             .unwrap()
             .push(registration.clone());
+        Ok(())
+    }
+    async fn claim_signed_message(
+        &self,
+        claim: &crate::repository::StatementClaim,
+    ) -> Result<bool, LnurlRepositoryError> {
+        Ok(self
+            .claimed_statements
+            .lock()
+            .unwrap()
+            .insert(claim.statement_hash))
+    }
+    async fn delete_expired_signed_messages(&self, _: i64) -> Result<u64, LnurlRepositoryError> {
+        Ok(0)
+    }
+    /// Refuses a pubkey that holds no such registration, and like the real
+    /// repositories leaves the claim unspent when it does.
+    async fn delete_spark_registration(
+        &self,
+        domain: &str,
+        pubkey: &str,
+        identifier: &str,
+        claim: Option<&crate::repository::StatementClaim>,
+    ) -> Result<(), LnurlRepositoryError> {
+        let owned = self.spark_registrations.lock().unwrap().iter().any(|r| {
+            r.pubkey == pubkey
+                && r.identifier.domain == domain
+                && r.identifier.identifier == identifier
+        });
+        if !owned {
+            return Err(LnurlRepositoryError::SourceNotOwner);
+        }
+        if let Some(claim) = claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
+        self.spark_unregistrations.lock().unwrap().push((
+            domain.to_string(),
+            pubkey.to_string(),
+            identifier.to_string(),
+        ));
         Ok(())
     }
     async fn get_spark_account_mode(
@@ -329,8 +383,13 @@ impl LnurlRepository for MockRepository {
     }
     async fn transfer_identifier(
         &self,
-        _: &IdentifierTransfer,
+        transfer: &IdentifierTransfer,
     ) -> Result<(), LnurlRepositoryError> {
+        if let Some(claim) = &transfer.claim
+            && !self.claim_signed_message(claim).await?
+        {
+            return Err(LnurlRepositoryError::StatementAlreadyUsed);
+        }
         Ok(())
     }
     async fn transfer_blink_identifier_to_spark(

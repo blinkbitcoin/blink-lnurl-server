@@ -48,6 +48,22 @@ pub struct SignedAuthPayload {
     pub transfer_to_signature: String,
 }
 
+/// The same deterministic identities as [`SignedAuthPayload`], signing the
+/// `breez-lnurl:v2` messages Breez SDK 0.23+ sends for one domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedV2AuthPayload {
+    pub domain: String,
+    pub description: String,
+    pub available_signature: String,
+    pub register_signature: String,
+    pub unregister_signature: String,
+    pub recover_signature: String,
+    pub metadata_signature: String,
+    pub to_recover_signature: String,
+    pub transfer_from_signature: String,
+    pub transfer_to_signature: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookRegistrationRequest {
     pub webhook_url: String,

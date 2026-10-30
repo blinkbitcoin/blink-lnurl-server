@@ -1,8 +1,16 @@
+/// Domain and description the v2 signatures commit to unless given.
+const DEFAULT_DOMAIN: &str = "localhost:8080";
+const DEFAULT_DESCRIPTION: &str = "Test LNURL user";
+
 async fn build_payload_json(
     username: &str,
     timestamp: u64,
+    domain: &str,
+    description: &str,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let payload = spark_client::Client::build_auth_payload(username, timestamp).await?;
+    let v2 = spark_client::Client::build_v2_auth_payload(username, timestamp, domain, description)
+        .await?;
 
     Ok(serde_json::json!({
         "pubkey": payload.pubkey,
@@ -15,6 +23,18 @@ async fn build_payload_json(
         "to_recover_signature": payload.to_recover_signature,
         "transfer_from_signature": payload.transfer_from_signature,
         "transfer_to_signature": payload.transfer_to_signature,
+        "v2": {
+            "domain": v2.domain,
+            "description": v2.description,
+            "available_signature": v2.available_signature,
+            "register_signature": v2.register_signature,
+            "unregister_signature": v2.unregister_signature,
+            "recover_signature": v2.recover_signature,
+            "metadata_signature": v2.metadata_signature,
+            "to_recover_signature": v2.to_recover_signature,
+            "transfer_from_signature": v2.transfer_from_signature,
+            "transfer_to_signature": v2.transfer_to_signature,
+        },
     }))
 }
 
@@ -34,7 +54,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 .as_secs()
         });
 
-    println!("{}", build_payload_json(&username, timestamp).await?);
+    let domain = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| DEFAULT_DOMAIN.to_string());
+    let description = std::env::args()
+        .nth(4)
+        .unwrap_or_else(|| DEFAULT_DESCRIPTION.to_string());
+
+    println!(
+        "{}",
+        build_payload_json(&username, timestamp, &domain, &description).await?
+    );
 
     Ok(())
 }
@@ -45,7 +75,9 @@ mod tests {
 
     #[tokio::test]
     async fn auth_payload_includes_deterministic_transfer_signatures() {
-        let payload = build_payload_json("transferuser", 1).await.unwrap();
+        let payload = build_payload_json("transferuser", 1, DEFAULT_DOMAIN, DEFAULT_DESCRIPTION)
+            .await
+            .unwrap();
 
         assert!(
             payload["pubkey"]
@@ -73,5 +105,22 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+        for key in [
+            "available_signature",
+            "register_signature",
+            "unregister_signature",
+            "recover_signature",
+            "metadata_signature",
+            "to_recover_signature",
+            "transfer_from_signature",
+            "transfer_to_signature",
+        ] {
+            assert!(
+                payload["v2"][key]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "missing v2 {key}"
+            );
+        }
     }
 }

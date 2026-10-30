@@ -86,21 +86,45 @@ stop_stack() {
   stop_blink_graphql_mock
 }
 
+# A unix timestamp no earlier than now and strictly after the last one handed
+# out. The server acts on a register, unregister or transfer statement once, so
+# two requests signed in the same second must not sign the same bytes.
+fresh_timestamp() {
+  local now
+  local last=0
+  local next
+  mkdir -p "${STATE_DIR}"
+  now="$(date +%s)"
+  if [ -f "${STATE_DIR}/last_timestamp" ]; then
+    last="$(<"${STATE_DIR}/last_timestamp")"
+  fi
+  next=$((now > last ? now : last + 1))
+  echo "${next}" >"${STATE_DIR}/last_timestamp"
+  echo "${next}"
+}
+
 auth_payload() {
   local username="${1:?username is required}"
-  local timestamp="${2:-}"
+  local timestamp="${2:-$(fresh_timestamp)}"
   if [ -x "${E2E_AUTH_BIN}" ] && [ "${E2E_AUTH_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_auth.rs" ]; then
-    if [ -n "${timestamp}" ]; then
-      "${E2E_AUTH_BIN}" "${username}" "${timestamp}"
-    else
-      "${E2E_AUTH_BIN}" "${username}"
-    fi
+    "${E2E_AUTH_BIN}" "${username}" "${timestamp}"
   else
-    if [ -n "${timestamp}" ]; then
-      cargo run --quiet --locked --bin e2e_auth -- "${username}" "${timestamp}"
-    else
-      cargo run --quiet --locked --bin e2e_auth -- "${username}"
-    fi
+    cargo run --quiet --locked --bin e2e_auth -- "${username}" "${timestamp}"
+  fi
+}
+
+# Legacy and breez-lnurl:v2 signatures by the deterministic e2e identities.
+# The v2 ones commit to the host and description, as a Breez SDK 0.23+ client
+# addressing that host does.
+v2_auth_payload() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local description="${3:-Test LNURL user}"
+  local timestamp="${4:-$(fresh_timestamp)}"
+  if [ -x "${E2E_AUTH_BIN}" ] && [ "${E2E_AUTH_BIN}" -nt "${ROOT_DIR}/src/bin/e2e_auth.rs" ]; then
+    "${E2E_AUTH_BIN}" "${username}" "${timestamp}" "${host}" "${description}"
+  else
+    cargo run --quiet --locked --bin e2e_auth -- "${username}" "${timestamp}" "${host}" "${description}"
   fi
 }
 
@@ -535,27 +559,6 @@ recover_user_status() {
     "${BASE_URL}/lnurlpay/${pubkey}/recover"
 }
 
-unregister_user() {
-  local username="${1:?username is required}"
-  local host="${2:?host is required}"
-  local auth
-  local pubkey
-  local timestamp
-  local signature
-
-  auth="$(auth_payload "${username}")"
-  pubkey="$(json_get "${auth}" '.pubkey')"
-  timestamp="$(json_get "${auth}" '.timestamp')"
-  signature="$(json_get "${auth}" '.unregister_signature')"
-
-  curl -fsS \
-    --request DELETE \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"signature\":\"${signature}\",\"timestamp\":${timestamp}}" \
-    "${BASE_URL}/lnurlpay/${pubkey}"
-}
-
 unregister_user_status() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
@@ -571,30 +574,9 @@ unregister_user_status() {
     "${BASE_URL}/lnurlpay/${pubkey}"
 }
 
-transfer_user() {
-  local username="${1:?username is required}"
-  local host="${2:?host is required}"
-  local description="${3:-Transferred LNURL user}"
-  local auth
-  local from_pubkey
-  local to_pubkey
-  local from_signature
-  local to_signature
-
-  auth="$(auth_payload "${username}")"
-  from_pubkey="$(json_get "${auth}" '.pubkey')"
-  to_pubkey="$(json_get "${auth}" '.to_pubkey')"
-  from_signature="$(json_get "${auth}" '.transfer_from_signature')"
-  to_signature="$(json_get "${auth}" '.transfer_to_signature')"
-
-  curl -fsS \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
-    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer" | jq -cer '.'
-}
-
-transfer_user_status() {
+# Prints the status code and body on separate lines. Leave the timestamp empty
+# to send a pre-v2 (untimestamped) transfer.
+transfer_user_status_body() {
   local username="${1:?username is required}"
   local host="${2:?host is required}"
   local description="${3:?description is required}"
@@ -602,12 +584,10 @@ transfer_user_status() {
   local to_signature="${5:?to signature is required}"
   local from_pubkey="${6:?from pubkey is required}"
   local to_pubkey="${7:?to pubkey is required}"
+  local timestamp="${8:-}"
 
-  curl -sS -o /dev/null -w "%{http_code}" \
-    --header "Host: ${host}" \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"${username}\",\"description\":\"${description}\",\"from_pubkey\":\"${from_pubkey}\",\"from_signature\":\"${from_signature}\",\"to_signature\":\"${to_signature}\"}" \
-    "${BASE_URL}/lnurlpay/${to_pubkey}/transfer"
+  http_status_body "POST" "${BASE_URL}/lnurlpay/${to_pubkey}/transfer" "${host}" \
+    "$(jq -cn --arg username "${username}" --arg description "${description}" --arg from_pubkey "${from_pubkey}" --arg from_signature "${from_signature}" --arg to_signature "${to_signature}" --arg timestamp "${timestamp}" '{username:$username,description:$description,from_pubkey:$from_pubkey,from_signature:$from_signature,to_signature:$to_signature} + (if $timestamp == "" then {} else {timestamp:($timestamp|tonumber)} end)')"
 }
 
 http_status_body() {
@@ -647,6 +627,103 @@ insert_legacy_user() {
 
   docker compose exec -T postgres psql -U user -d lnurl \
     -c "INSERT INTO accounts(account_id, provider, created_at, updated_at) VALUES ('${sql_account_id}', 'spark', 0, 0) ON CONFLICT (account_id) DO NOTHING; INSERT INTO spark_accounts(account_id, pubkey, created_at, updated_at) VALUES ('${sql_account_id}', '${sql_pubkey}', 0, 0) ON CONFLICT (account_id) DO UPDATE SET pubkey = EXCLUDED.pubkey, updated_at = EXCLUDED.updated_at; INSERT INTO account_identifiers(account_id, domain, identifier, identifier_kind, description, created_at, updated_at) VALUES ('${sql_account_id}', '${sql_host}', '${sql_username}', 'username', '${sql_description}', 0, 0) ON CONFLICT (account_id, domain, identifier) DO UPDATE SET description = EXCLUDED.description, updated_at = EXCLUDED.updated_at" >/dev/null
+}
+
+# POST /lnurlpay/{pubkey}/available, signed: prints the body then the status.
+username_available_v2_status_body() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local sign_host="${3:-${host}}"
+  local auth
+  auth="$(v2_auth_payload "${username}" "${sign_host}")"
+
+  http_status_body "POST" "${BASE_URL}/lnurlpay/$(json_get "${auth}" '.pubkey')/available" "${host}" \
+    "$(jq -cn --arg username "${username}" --arg signature "$(json_get "${auth}" '.v2.available_signature')" --argjson timestamp "$(json_get "${auth}" '.timestamp')" '{username:$username,signature:$signature,timestamp:$timestamp}')"
+}
+
+username_available_v2() {
+  local response
+  response="$(username_available_v2_status_body "$@")"
+  [ "${response##*$'\n'}" = "200" ] || return 1
+  printf '%s\n' "${response%$'\n'*}"
+}
+
+register_user_v2() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local description="${3:-Test LNURL user}"
+  local auth
+  auth="$(v2_auth_payload "${username}" "${host}" "${description}")"
+
+  curl -fsS \
+    --header "Host: ${host}" \
+    --header "Content-Type: application/json" \
+    --data "$(jq -cn --arg username "${username}" --arg signature "$(json_get "${auth}" '.v2.register_signature')" --argjson timestamp "$(json_get "${auth}" '.timestamp')" --arg description "${description}" '{username:$username,signature:$signature,timestamp:$timestamp,description:$description}')" \
+    "${BASE_URL}/lnurlpay/$(json_get "${auth}" '.pubkey')" | jq -cer '.'
+}
+
+# Recover as the current owner, or with "to" as the transferee identity.
+recover_user_v2_status_body() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local identity="${3:-from}"
+  local auth
+  local pubkey
+  local signature
+  auth="$(v2_auth_payload "${username}" "${host}")"
+  if [ "${identity}" = "to" ]; then
+    pubkey="$(json_get "${auth}" '.to_pubkey')"
+    signature="$(json_get "${auth}" '.v2.to_recover_signature')"
+  else
+    pubkey="$(json_get "${auth}" '.pubkey')"
+    signature="$(json_get "${auth}" '.v2.recover_signature')"
+  fi
+
+  http_status_body "POST" "${BASE_URL}/lnurlpay/${pubkey}/recover" "${host}" \
+    "$(jq -cn --arg signature "${signature}" --argjson timestamp "$(json_get "${auth}" '.timestamp')" '{signature:$signature,timestamp:$timestamp}')"
+}
+
+unregister_user_v2() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local auth
+  auth="$(v2_auth_payload "${username}" "${host}")"
+
+  curl -fsS \
+    --request DELETE \
+    --header "Host: ${host}" \
+    --header "Content-Type: application/json" \
+    --data "$(jq -cn --arg username "${username}" --arg signature "$(json_get "${auth}" '.v2.unregister_signature')" --argjson timestamp "$(json_get "${auth}" '.timestamp')" '{username:$username,signature:$signature,timestamp:$timestamp}')" \
+    "${BASE_URL}/lnurlpay/$(json_get "${auth}" '.pubkey')"
+}
+
+# GET metadata with the credential in X-Breez-* headers; prints the response
+# headers and body.
+list_metadata_v2() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local auth
+  auth="$(v2_auth_payload "${username}" "${host}")"
+
+  curl -fsS -i \
+    --header "Host: ${host}" \
+    --header "X-Breez-Signature: $(json_get "${auth}" '.v2.metadata_signature')" \
+    --header "X-Breez-Timestamp: $(json_get "${auth}" '.timestamp')" \
+    "${BASE_URL}/lnurlpay/$(json_get "${auth}" '.pubkey')/metadata"
+}
+
+transfer_user_v2() {
+  local username="${1:?username is required}"
+  local host="${2:?host is required}"
+  local description="${3:-Transferred LNURL user}"
+  local auth
+  auth="$(v2_auth_payload "${username}" "${host}" "${description}")"
+
+  curl -fsS \
+    --header "Host: ${host}" \
+    --header "Content-Type: application/json" \
+    --data "$(jq -cn --arg username "${username}" --arg description "${description}" --arg from_pubkey "$(json_get "${auth}" '.pubkey')" --arg from_signature "$(json_get "${auth}" '.v2.transfer_from_signature')" --arg to_signature "$(json_get "${auth}" '.v2.transfer_to_signature')" --argjson timestamp "$(json_get "${auth}" '.timestamp')" '{username:$username,description:$description,from_pubkey:$from_pubkey,from_signature:$from_signature,to_signature:$to_signature,timestamp:$timestamp}')" \
+    "${BASE_URL}/lnurlpay/$(json_get "${auth}" '.to_pubkey')/transfer" | jq -cer '.'
 }
 
 username_available() {

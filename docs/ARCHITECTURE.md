@@ -36,7 +36,7 @@ graph TD
 
 1. Spark-compatible clients call `/lnurlpay/{pubkey}` management routes for availability, registration, deletion, transfer, recovery, metadata listing, invoice-paid notifications, and zap receipt publication.
 2. `src/auth.rs` optionally enforces bearer X.509 client-certificate authentication when a CA certificate is configured.
-3. `src/routes/account.rs` validates Spark public keys, signatures, timestamps, usernames, descriptions, and domain ownership.
+3. `src/routes/signed.rs` verifies the identity-key signature against each route's candidate messages: `breez-lnurl:v2` (Breez SDK 0.23+) first, then the pre-v2 form, counting legacy matches. `src/routes/account.rs` validates usernames, descriptions, and domain ownership, and builds each route's candidates.
 4. Route handlers mutate provider-neutral account and identifier state through `LnurlRepository` methods such as `upsert_spark_registration`, `delete_spark_registration`, and `transfer_identifier`.
 
 ### Blink internal account management
@@ -106,6 +106,7 @@ The source tree separates protocol-facing routes from provider adapters and stor
 - **Configuration:** `src/main.rs` merges CLI defaults, an optional TOML config file, and `LNURL_` environment variables through Figment.
 - **Authentication:** Spark management routes use optional bearer X.509 validation in `src/auth.rs`; internal Blink routes use scoped JWT validation in `src/internal_auth.rs`.
 - **Domain validation:** Allowed domains are stored in the database, seeded from configuration on startup, and refreshed through `src/domains.rs` into an `Arc<RwLock<HashSet<String>>>` cache.
+- **Request domain resolution:** Routes resolve the request domain with `axum_extra::extract::Host`, which prefers `Forwarded` and `X-Forwarded-Host` over `Host`. Breez SDK 0.23+ signs the domain it addressed (`breez-lnurl:v2` messages, see `src/signed_message.rs`), so the resolved value must equal the client's URL authority, for example `blink.sv`. The ingress must therefore forward the original host unchanged; a mismatch surfaces as `400 invalid signature for domain '<resolved>'`. Upstream Breez switched to a `Host`-only extractor; Blink keeps `axum_extra` so domain resolution stays identical to the address the register route already returns.
 - **Provider separation:** Routes resolve recipients and dispatch to `LnurlProvider` implementations instead of embedding Spark or Blink invoice creation directly.
 - **Persistence portability:** Repository traits are implemented by both `src/postgresql/repository.rs` and `src/sqlite/repository.rs`, with parallel migration directories.
 - **Background work:** Zap receipts and outbound webhooks use durable database queues and wake-up signals rather than in-memory-only queues.

@@ -39,6 +39,7 @@ mod providers;
 mod rate_limit;
 mod repository;
 mod routes;
+mod signed_message;
 mod sqlite;
 mod state;
 mod time;
@@ -578,6 +579,11 @@ where
         webhook_secret,
     };
 
+    // Makes the pre-v2 signed-message tail observable, which is what gates
+    // dropping the legacy candidates.
+    routes::spawn_legacy_signature_reporter();
+    routes::spawn_signed_message_pruner(state.db.clone());
+
     // Mounted below as POST /internal/blink/accounts for Blink Core.
     let internal_router = Router::new()
         .route(
@@ -606,6 +612,10 @@ where
         .route(
             "/lnurlpay/available/{identifier}",
             get(LnurlServer::<DB>::available),
+        )
+        .route(
+            "/lnurlpay/{pubkey}/available",
+            post(LnurlServer::<DB>::available_for_pubkey),
         )
         .route("/lnurlpay/{pubkey}", post(LnurlServer::<DB>::register))
         .route("/lnurlpay/{pubkey}", delete(LnurlServer::<DB>::unregister))

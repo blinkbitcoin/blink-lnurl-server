@@ -42,8 +42,10 @@ make test-integration
 This starts PostgreSQL through Docker Compose and runs:
 
 ```bash
-LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:${LNURL_POSTGRES_PORT:-25432}/lnurl cargo test --locked postgres_tests -- --test-threads=1
+LNURL_TEST_POSTGRES_URL=postgres://user:password@127.0.0.1:${LNURL_POSTGRES_PORT:-25432}/lnurl cargo test --locked postgres -- --test-threads=1
 ```
+
+The `postgres` filter matches every test whose name contains `postgres`: the `postgres_tests` modules, the shared repository tests under `postgresql::repository::provider_neutral_tests`, and the Postgres schema and migration checks. Name new Postgres-backed tests so they match, or CI will skip them.
 
 Run all Bats E2E tests:
 
@@ -69,7 +71,7 @@ Useful focused commands:
 
 ```bash
 cargo test --locked lnurl_pay
-cargo test --locked postgres_tests -- --test-threads=1
+cargo test --locked postgres -- --test-threads=1
 cargo test --locked -p blink-client --test client
 bats -t bats/spark_endpoints.bats
 bats -t bats/lnurl_protocol.bats
