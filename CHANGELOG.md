@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.9.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.9.0)
+
+
+### Features
+
+- Support Breez SDK 0.23 v2 signed lnurlpay requests (#52)
+
 # [blink-lnurl-server release v0.8.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.8.1)
 
 
