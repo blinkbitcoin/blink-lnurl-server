@@ -1,16 +1,20 @@
+#! Auto synced from Shared CI Resources repository
+#! Don't change this file, instead change it in github.com/blinkbitcoin/concourse-shared
+
 name: Spelling
 
 on:
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   spelling:
     name: Spell Check with Typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout Actions Repository
+        uses: actions/checkout@v3
       - name: Spell Check Repo
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@v1
         with:
           config: typos.toml
