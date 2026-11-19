@@ -1,5 +1,6 @@
 #@ load("@ytt:data", "data")
 #@ load("@ytt:assert", "assert")
+#@ load("@ytt:regexp", "regexp")
 #@ def public_docker_registry():
 #@  return "us.gcr.io/galoy-org"
 #@ end
@@ -52,26 +53,12 @@ source:
 
 #@ def slack_failure_notification():
 #@ fail_url = "<$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME| :face_with_symbols_on_mouth: $BUILD_JOB_NAME> failed!"
-#@ if not data.values.disable_notifications:
 put: slack
 params:
   channel:  #@ data.values.slack_channel
   username: concourse
   icon_url: https://cl.ly/2F421Y300u07/concourse-logo-blue-transparent.png
   text:    #@ fail_url
-#@ else:
-task: notification
-config:
-  platform: linux
-  image_resource:
-    type: registry-image
-    source:
-      repository: busybox
-  run:
-    path: echo
-    args:
-    - #@ "=== SLACK NOTIFICATIONS DISABLED === Skipping failure notification"
-#@ end
 #@ end
 
 #@ def check_code():
@@ -167,7 +154,7 @@ plan:
 on_failure: #@ slack_failure_notification()
 #@ end
 
-#@ def test_on_docker_host(container, additional_params={}):
+#@ def gcp_test_on_docker_host(container, additional_params):
 #@ params = dict(additional_params)
 #@ params["REPO_PATH"] = data.values.gh_repository + "-" + container
 #@ params["GOOGLE_CREDENTIALS"] = "((staging-gcp-creds.creds_json))"
@@ -207,7 +194,7 @@ plan:
 on_failure: #@ slack_failure_notification()
 #@ end
 
-#@ def run_on_nix_host(name, cmd, additional_params={}):
+#@ def gcp_run_on_nix_host(name, cmd, additional_params):
 #@ params = dict(additional_params)
 #@ params["REPO_PATH"] = data.values.gh_repository + "-" + name
 #@ params["GOOGLE_CREDENTIALS"] = "((staging-gcp-creds.creds_json))"
@@ -429,7 +416,6 @@ plan:
         trigger: true
         passed: [ release ]
       - get: charts-repo
-        params: { skip_download: true }
       - get: pipeline-tasks
   - task: bump-image-digest-in-values
     config:
@@ -601,7 +587,7 @@ source:
   private_key: #@ data.values.github_private_key
 #@ end
 
-#@ def docker_host_pool():
+#@ def gcp_docker_host_pool():
 name: docker-host
 type: pool
 source:
@@ -609,6 +595,157 @@ source:
   branch: main
   pool: docker-hosts
   private_key: #@ data.values.github_private_key
+#@ end
+
+#! Docker hosts. Without site, docker_host_pool, run_on_nix_host and
+#! test_on_docker_host render the GCP pool and tasks as before. With
+#! site="site1" they use that site's SSH Docker hosts instead; see
+#! docs/ssh-docker-hosts.md. Site jobs run once per claim on untagged workers
+#! and release the host only after a confirmed remote cleanup; otherwise the
+#! claim is kept as quarantine.
+
+#@ def check_docker_host_site(site):
+#@ if type(site) != "string" or not regexp.match("^site[1-9][0-9]*$", site):
+#@   assert.fail("site must look like site1, got: " + str(site))
+#@ end
+#@ end
+
+#@ def site_docker_host_pool(site):
+name: #@ "docker-host-" + site
+type: pool
+source:
+  uri: git@github.com:blinkbitcoin/concourse-locks.git
+  branch: main
+  pool: #@ "docker-hosts-" + site
+  private_key: #@ data.values.github_private_key
+#@ end
+
+#@ def docker_host_pool(site=None):
+#@ if site == None:
+#@   return gcp_docker_host_pool()
+#@ end
+#@ check_docker_host_site(site)
+#@ return site_docker_host_pool(site)
+#@ end
+
+#! Names ssh-host-run.sh refuses in PARAMS_KEYS, plus params the fragment sets
+#! itself (which would silently replace the caller's value). Rejecting them at
+#! render time keeps a pipeline mistake from failing builds on a claimed host.
+#@ def check_site_additional_params(additional_params, fragment_params=[]):
+#@ reserved = ["PATH", "HOME", "SHELL", "IFS", "ENV", "BASH_ENV", "TMPDIR", "CI_RUN_DIR", "CI_MODE", "CI_TIMEOUT",
+#@   "REPO_PATH", "PACKAGE_DIR", "CMD", "TEST_CONTAINER", "DOCKER_CONFIG", "GOOGLE_CREDENTIALS", "SSH_PRIVATE_KEY",
+#@   "SSH_PUB_KEY", "WORKLOAD_TIMEOUT_MINUTES", "SSH_HOST_MODE", "PARAMS_KEYS"] + fragment_params
+#@ for key in additional_params.keys():
+#@   if type(key) != "string" or not regexp.match("^[A-Za-z_][A-Za-z0-9_]*$", key):
+#@     assert.fail("invalid additional_params key: " + str(key))
+#@   end
+#@   if key in reserved or key.startswith("LD_"):
+#@     assert.fail("reserved additional_params key: " + key)
+#@   end
+#@ end
+#@ end
+
+#@ def site_docker_host_job(site, name, image_resource, params, workload_timeout_minutes, on_failure=None):
+#@ check_docker_host_site(site)
+#@ if type(workload_timeout_minutes) != "int" or workload_timeout_minutes < 1 or workload_timeout_minutes > 999:
+#@   assert.fail("workload_timeout_minutes must be an integer from 1 to 999")
+#@ end
+#@ pool = "docker-host-" + site
+#@ params = dict(params)
+#@ params["REPO_PATH"] = data.values.gh_repository + "-" + name
+#@ params["GOOGLE_CREDENTIALS"] = "((staging-gcp-creds.creds_json))"
+#@ params["SSH_PRIVATE_KEY"] = "((staging-ssh.ssh_private_key))"
+#@ params["WORKLOAD_TIMEOUT_MINUTES"] = str(workload_timeout_minutes)
+name: #@ name
+serial: true
+plan:
+#! Fetch inputs before claiming: a failed get after the acquire has no ensure
+#! and would hold the claim.
+- in_parallel:
+  - { get: repo, trigger: true }
+  - { get: pipeline-tasks }
+- put: #@ pool
+  params: { acquire: true }
+- task: #@ name
+  attempts: 1
+  #! More than the sum of every bounded transport step around the workload.
+  timeout: #@ str(workload_timeout_minutes + 25) + "m"
+  #! The tasks read the claim from a fixed input name, whatever the site.
+  input_mapping: #@ {"docker-host": pool}
+  config:
+    platform: linux
+    image_resource: #@ image_resource
+    inputs:
+    - name: pipeline-tasks
+    - name: docker-host
+    - name: repo
+      path: #@ params["REPO_PATH"]
+    outputs:
+    - name: host-cleanup
+    params: #@ params
+    run:
+      path: pipeline-tasks/ci/vendor/tasks/ssh-host-run.sh
+  ensure:
+    do:
+    - task: check-host-cleanup
+      input_mapping: #@ {"docker-host": pool}
+      config:
+        platform: linux
+        image_resource: #@ image_resource
+        inputs:
+        - name: pipeline-tasks
+        - name: docker-host
+        - name: host-cleanup
+          optional: true
+        run:
+          path: bash
+          args: [pipeline-tasks/ci/vendor/tasks/ssh-host-check-cleanup.sh]
+    - put: #@ pool
+      params:
+        release: #@ pool
+#@ if on_failure != None:
+on_failure: #@ on_failure
+#@ end
+#@ end
+
+#! workload_timeout_minutes applies to site hosts only (default 12); the GCP
+#! task keeps its fixed timeout, so passing it without site fails the render.
+#@ def run_on_nix_host(name, cmd, additional_params={}, site=None, workload_timeout_minutes=None):
+#@ if site == None:
+#@   if workload_timeout_minutes != None:
+#@     assert.fail("workload_timeout_minutes requires site")
+#@   end
+#@   return gcp_run_on_nix_host(name, cmd, additional_params)
+#@ end
+#@ if workload_timeout_minutes == None:
+#@   workload_timeout_minutes = 12
+#@ end
+#@ check_site_additional_params(additional_params)
+#@ params = dict(additional_params)
+#@ params["SSH_HOST_MODE"] = "nix"
+#@ params["CMD"] = cmd
+#@ params["PARAMS_KEYS"] = " ".join(additional_params.keys())
+#@ return site_docker_host_job(site, name, nodejs_task_image_config(), params, workload_timeout_minutes)
+#@ end
+
+#! As run_on_nix_host; the site default for workload_timeout_minutes is 20.
+#@ def test_on_docker_host(container, additional_params={}, site=None, workload_timeout_minutes=None):
+#@ if site == None:
+#@   if workload_timeout_minutes != None:
+#@     assert.fail("workload_timeout_minutes requires site")
+#@   end
+#@   return gcp_test_on_docker_host(container, additional_params)
+#@ end
+#@ if workload_timeout_minutes == None:
+#@   workload_timeout_minutes = 20
+#@ end
+#@ check_site_additional_params(additional_params, ["JEST_TIMEOUT"])
+#@ params = dict(additional_params)
+#@ params["SSH_HOST_MODE"] = "compose"
+#@ params["TEST_CONTAINER"] = container
+#@ params["JEST_TIMEOUT"] = 90000
+#@ params["PARAMS_KEYS"] = " ".join(additional_params.keys())
+#@ return site_docker_host_job(site, container, rust_task_image_config(), params, workload_timeout_minutes, slack_failure_notification())
 #@ end
 
 #@ def gcr_resource_type():
