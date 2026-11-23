@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ pub struct CreateInvoiceRequest<'a> {
     pub description_hash: [u8; 32],
     pub expiry: Option<u32>,
     pub include_spark_address: bool,
+    pub payer_ip: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +268,7 @@ impl BlinkProvider {
             description_hash_hex: Some(hex::encode(request.description_hash)),
             expires_in_minutes: request.expiry,
             webhook_url: self.blink_webhook_url.as_deref(),
+            payer_ip: request.payer_ip,
         };
 
         let invoice = match wallet {
@@ -517,6 +520,7 @@ mod tests {
                 description_hash: [0; 32],
                 expiry: None,
                 include_spark_address: false,
+                payer_ip: None,
             })
             .await
             .expect_err("Spark must reject USD wallet intent");
@@ -544,6 +548,7 @@ mod tests {
                     description_hash: [0; 32],
                     expiry: None,
                     include_spark_address: false,
+                    payer_ip: None,
                 })
                 .await;
 
@@ -693,6 +698,7 @@ mod tests {
             description_hash: [7; 32],
             expiry,
             include_spark_address: true,
+            payer_ip: None,
         }
     }
 
@@ -992,6 +998,7 @@ mod tests {
                 description_hash: [0; 32],
                 expiry: Some(1),
                 include_spark_address: false,
+                payer_ip: None,
             })
             .await
             .expect_err("Spark must reject USD wallet intent before wallet use");
@@ -1012,6 +1019,7 @@ mod tests {
                     description_hash: [0; 32],
                     expiry: Some(2),
                     include_spark_address: false,
+                    payer_ip: None,
                 })
                 .await;
             assert!(

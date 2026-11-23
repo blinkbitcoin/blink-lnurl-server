@@ -879,22 +879,49 @@ pub(super) async fn start_blink_invoice_mock_server(
 }
 
 pub(super) async fn start_blink_invoice_mock_server_with_conversion_failure(
-    _bolt11: String,
+    bolt11: String,
     fail: bool,
     conversion_fail: bool,
 ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    let (endpoint, calls, bodies, _payer_ips) =
+        start_blink_invoice_mock_server_recording_payer_ips(bolt11, fail, conversion_fail).await;
+    (endpoint, calls, bodies)
+}
+
+/// Per-request `x-real-ip` values, in the same order as the captured bodies.
+pub(super) type RecordedPayerIps = Arc<Mutex<Vec<Option<String>>>>;
+
+pub(super) async fn start_blink_invoice_mock_server_recording_payer_ips(
+    _bolt11: String,
+    fail: bool,
+    conversion_fail: bool,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Value>>>,
+    RecordedPayerIps,
+) {
     let calls = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(Mutex::new(Vec::new()));
+    let payer_ips = Arc::new(Mutex::new(Vec::new()));
     let calls_for_route = Arc::clone(&calls);
     let bodies_for_route = Arc::clone(&bodies);
+    let payer_ips_for_route = Arc::clone(&payer_ips);
     let app = Router::new().route(
         "/graphql",
-        post(move |Json(body): Json<Value>| {
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
             let calls = Arc::clone(&calls_for_route);
             let bodies = Arc::clone(&bodies_for_route);
+            let payer_ips = Arc::clone(&payer_ips_for_route);
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 bodies.lock().unwrap().push(body.clone());
+                payer_ips.lock().unwrap().push(
+                    headers
+                        .get("x-real-ip")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
                 if is_currency_conversion_request(&body) {
                     if conversion_fail {
                         return Json(mock_currency_conversion_error_response());
@@ -948,7 +975,7 @@ pub(super) async fn start_blink_invoice_mock_server_with_conversion_failure(
             .await
             .expect("mock Blink server should serve");
     });
-    (format!("http://{addr}/graphql"), calls, bodies)
+    (format!("http://{addr}/graphql"), calls, bodies, payer_ips)
 }
 
 pub(super) async fn start_blink_fixed_invoice_mock_server(
@@ -1093,11 +1120,21 @@ pub(super) async fn get_public_invoice(
     identifier: &str,
     params: LnurlPayCallbackParams,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    get_public_invoice_with_headers(state, identifier, params, HeaderMap::new()).await
+}
+
+pub(super) async fn get_public_invoice_with_headers(
+    state: State<MockRepository>,
+    identifier: &str,
+    params: LnurlPayCallbackParams,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     LnurlServer::<MockRepository>::handle_invoice(
         Host("example.com".to_string()),
         Path(identifier.to_string()),
         Query(params),
         Extension(state),
+        headers,
     )
     .await
 }
@@ -1107,6 +1144,17 @@ pub(super) async fn get_public_invoice_for_domain(
     domain: &str,
     identifier: &str,
     params: LnurlPayCallbackParams,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    get_public_invoice_for_domain_with_headers(state, domain, identifier, params, HeaderMap::new())
+        .await
+}
+
+pub(super) async fn get_public_invoice_for_domain_with_headers(
+    state: State<MockRepository>,
+    domain: &str,
+    identifier: &str,
+    params: LnurlPayCallbackParams,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     LnurlServer::<MockRepository>::handle_invoice_for_domain(
         Host(
@@ -1118,6 +1166,7 @@ pub(super) async fn get_public_invoice_for_domain(
         Path((domain.to_string(), identifier.to_string())),
         Query(params),
         Extension(state),
+        headers,
     )
     .await
 }
