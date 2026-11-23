@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -9,6 +11,8 @@ use crate::types::{
 
 pub const PRODUCTION_GRAPHQL_ENDPOINT: &str = "https://api.blink.sv/graphql";
 pub const STAGING_GRAPHQL_ENDPOINT: &str = "https://api.staging.blink.sv/graphql";
+
+const PAYER_IP_HEADER: &str = "x-real-ip";
 
 const BTC_INVOICE_OPERATION: &str =
     include_str!("../graphql/ln_invoice_create_on_behalf_of_recipient.graphql");
@@ -81,6 +85,7 @@ impl Client {
                     "amount": amount,
                     "currency": currency.as_graphql_value(),
                 }),
+                None,
             )
             .await?;
         data.currency_conversion_estimation
@@ -109,7 +114,7 @@ impl Client {
             input.insert("webhookUrl".to_string(), json!(webhook_url));
         }
 
-        self.execute_with_variables(query, json!({ "input": input }))
+        self.execute_with_variables(query, json!({ "input": input }), request.payer_ip)
             .await
     }
 
@@ -117,20 +122,19 @@ impl Client {
         &self,
         query: &'static str,
         variables: serde_json::Value,
+        payer_ip: Option<IpAddr>,
     ) -> Result<T, BlinkClientError>
     where
         T: for<'de> Deserialize<'de>,
     {
-        let response = self
-            .http_client
-            .post(self.config.endpoint())
-            .json(&json!({
-                "query": query,
-                "variables": variables,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut http_request = self.http_client.post(self.config.endpoint()).json(&json!({
+            "query": query,
+            "variables": variables,
+        }));
+        if let Some(payer_ip) = payer_ip {
+            http_request = http_request.header(PAYER_IP_HEADER, payer_ip.to_string());
+        }
+        let response = http_request.send().await?.error_for_status()?;
 
         let envelope = response.json::<GraphqlEnvelope<T>>().await?;
         if !envelope.errors.is_empty() {
@@ -154,6 +158,7 @@ impl Client {
                     "paymentHash": payment_hash,
                 }
             }),
+            None,
         )
         .await
     }

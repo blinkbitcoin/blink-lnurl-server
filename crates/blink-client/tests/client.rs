@@ -3,7 +3,7 @@ use blink_client::{
     PRODUCTION_GRAPHQL_ENDPOINT, PaymentStatus, PaymentStatusState,
 };
 use serde_json::Value;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn invoice_request(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
@@ -13,6 +13,7 @@ fn invoice_request(wallet_id: &'static str) -> CreateInvoiceRequest<'static> {
         description_hash_hex: Some("f".repeat(64)),
         expires_in_minutes: Some(30),
         webhook_url: Some("https://lnurl.example/webhook/blink"),
+        payer_ip: None,
     }
 }
 
@@ -23,6 +24,7 @@ fn invoice_request_without_webhook(wallet_id: &'static str) -> CreateInvoiceRequ
         description_hash_hex: Some("f".repeat(64)),
         expires_in_minutes: Some(30),
         webhook_url: None,
+        payer_ip: None,
     }
 }
 
@@ -232,6 +234,82 @@ async fn omits_webhook_url_when_not_configured() {
         .expect("BTC invoice without webhook should still be created");
 
     assert_eq!(invoice.payment_hash, "hash123");
+}
+
+async fn mount_invoice_response_for_payer_ip(
+    server: &MockServer,
+    operation_name: &'static str,
+    expected_payer_ip: Option<&'static str>,
+) {
+    let mock = Mock::given(method("POST")).and(path("/graphql"));
+    let mock = match expected_payer_ip {
+        Some(payer_ip) => mock.and(header("x-real-ip", payer_ip)),
+        None => mock.and(|request: &Request| !request.headers.contains_key("x-real-ip")),
+    };
+    mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "data": {
+            operation_name: {
+                "invoice": {
+                    "paymentRequest": "lnbc1mocked",
+                    "paymentHash": "hash123"
+                },
+                "errors": []
+            }
+        }
+    })))
+    .expect(1)
+    .mount(server)
+    .await;
+}
+
+#[tokio::test]
+async fn sends_payer_ip_as_x_real_ip_on_invoice_creation() {
+    for (operation_name, payer_ip) in [
+        ("lnInvoiceCreateOnBehalfOfRecipient", "203.0.113.7"),
+        (
+            "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient",
+            "2001:db8::1",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_invoice_response_for_payer_ip(&server, operation_name, Some(payer_ip)).await;
+
+        let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+        let request = CreateInvoiceRequest {
+            payer_ip: Some(payer_ip.parse().unwrap()),
+            ..invoice_request("wallet-id")
+        };
+        let invoice = if operation_name == "lnInvoiceCreateOnBehalfOfRecipient" {
+            client.create_btc_invoice(request).await
+        } else {
+            client.create_usd_invoice(request).await
+        }
+        .expect("invoice should be created with the payer IP header");
+
+        assert_eq!(invoice.payment_hash, "hash123");
+    }
+}
+
+#[tokio::test]
+async fn omits_x_real_ip_when_payer_ip_is_unknown() {
+    for operation_name in [
+        "lnInvoiceCreateOnBehalfOfRecipient",
+        "lnUsdInvoiceBtcDenominatedCreateOnBehalfOfRecipient",
+    ] {
+        let server = MockServer::start().await;
+        mount_invoice_response_for_payer_ip(&server, operation_name, None).await;
+
+        let client = Client::new(ClientConfig::new(format!("{}/graphql", server.uri())));
+        let request = invoice_request("wallet-id");
+        let invoice = if operation_name == "lnInvoiceCreateOnBehalfOfRecipient" {
+            client.create_btc_invoice(request).await
+        } else {
+            client.create_usd_invoice(request).await
+        }
+        .expect("invoice should be created without a payer IP header");
+
+        assert_eq!(invoice.payment_hash, "hash123");
+    }
 }
 
 #[tokio::test]

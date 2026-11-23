@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     endpoint: String,
@@ -30,6 +32,8 @@ pub struct CreateInvoiceRequest<'a> {
     pub description_hash_hex: Option<String>,
     pub expires_in_minutes: Option<u32>,
     pub webhook_url: Option<&'a str>,
+    /// Sent to Blink as `x-real-ip`; omitted when unknown.
+    pub payer_ip: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

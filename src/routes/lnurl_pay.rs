@@ -1,7 +1,7 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use axum_extra::extract::Host;
@@ -13,10 +13,11 @@ use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::str::FromStr;
+use std::{net::IpAddr, str::FromStr};
 use tracing::{debug, error, trace, warn};
 
 use crate::{
+    country::client_ip,
     invoice_paid::{
         HandleInvoicePaidError, create_provider_invoice_for_account, handle_invoice_paid,
         handle_invoices_paid,
@@ -275,13 +276,21 @@ where
         Path(identifier): Path<String>,
         Query(params): Query<LnurlPayCallbackParams>,
         Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if identifier.is_empty() {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
         }
 
         let domain = account::sanitize_domain(&state, &host).await?;
-        Self::handle_invoice_for_resolved_domain(domain, identifier, params, state).await
+        Self::handle_invoice_for_resolved_domain(
+            domain,
+            identifier,
+            params,
+            state,
+            client_ip(&headers),
+        )
+        .await
     }
 
     pub async fn handle_invoice_for_domain(
@@ -289,6 +298,7 @@ where
         Path((domain, identifier)): Path<(String, String)>,
         Query(params): Query<LnurlPayCallbackParams>,
         Extension(state): Extension<State<DB>>,
+        headers: HeaderMap,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if identifier.is_empty() {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
@@ -303,7 +313,14 @@ where
         }
 
         let domain = account::sanitize_domain(&state, &domain).await?;
-        Self::handle_invoice_for_resolved_domain(domain, identifier, params, state).await
+        Self::handle_invoice_for_resolved_domain(
+            domain,
+            identifier,
+            params,
+            state,
+            client_ip(&headers),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -312,6 +329,7 @@ where
         identifier: String,
         params: LnurlPayCallbackParams,
         state: State<DB>,
+        payer_ip: Option<IpAddr>,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if identifier.is_empty() {
             return Err((StatusCode::NOT_FOUND, Json(Value::String(String::new()))));
@@ -439,6 +457,7 @@ where
                 description_hash: desc_hash.to_byte_array(),
                 expiry,
                 include_spark_address: state.include_spark_address,
+                payer_ip,
             })
             .await
             .map_err(map_provider_invoice_error)?;
@@ -1678,6 +1697,77 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, Value::String(String::new()));
+    }
+
+    fn headers_with_real_ip(ip: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", ip.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_forwards_payer_ip_only_on_invoice_creation() {
+        for (headers, expected) in [
+            (headers_with_real_ip("203.0.113.7"), Some("203.0.113.7")),
+            (headers_with_real_ip("not-an-ip"), None),
+            (HeaderMap::new(), None),
+        ] {
+            let (_payment_hash, bolt11) = generate_route_test_invoice(33);
+            let (endpoint, _calls, bodies, payer_ips) =
+                start_blink_invoice_mock_server_recording_payer_ips(bolt11, false, false).await;
+            let repo =
+                MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+            let state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+
+            let _ = get_public_invoice_with_headers(
+                state,
+                "alice",
+                LnurlPayCallbackParams {
+                    amount: Some(21_000),
+                    ..LnurlPayCallbackParams::default()
+                },
+                headers,
+            )
+            .await
+            .expect("Blink invoice callback should succeed");
+
+            let bodies = bodies.lock().unwrap();
+            let payer_ips = payer_ips.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "conversion estimate then invoice creation");
+            for (body, payer_ip) in bodies.iter().zip(payer_ips.iter()) {
+                let is_invoice_creation = body["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("CreateOnBehalfOfRecipient"));
+                let expected = if is_invoice_creation { expected } else { None };
+                assert_eq!(payer_ip.as_deref(), expected, "{}", body["query"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_invoice_callback_for_domain_forwards_payer_ip() {
+        let (_payment_hash, bolt11) = generate_route_test_invoice(34);
+        let (endpoint, _calls, _bodies, payer_ips) =
+            start_blink_invoice_mock_server_recording_payer_ips(bolt11, false, false).await;
+        let repo = MockRepository::default().with_resolved_recipient(blink_resolved_recipient());
+        let mut state = internal_route_test_state_with_blink_endpoint(repo, None, &endpoint).await;
+        state.callback_domain = Some("callback.example.com".to_string());
+
+        let _ = get_public_invoice_for_domain_with_headers(
+            state,
+            "example.com",
+            "alice",
+            LnurlPayCallbackParams {
+                amount: Some(21_000),
+                ..LnurlPayCallbackParams::default()
+            },
+            headers_with_real_ip("2001:db8::1"),
+        )
+        .await
+        .expect("callback-domain invoice callback should succeed");
+
+        let payer_ips = payer_ips.lock().unwrap();
+        assert_eq!(payer_ips.last(), Some(&Some("2001:db8::1".to_string())));
     }
 
     #[tokio::test]
