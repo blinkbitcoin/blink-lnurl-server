@@ -1,3 +1,14 @@
+# [blink-lnurl-server release v0.10.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.10.0)
+
+
+### Features
+
+- Forward payer IP to Blink on invoice creation (#57)
+
+### Miscellaneous Tasks
+
+- Clear cargo audit advisories (#58)
+
 # [blink-lnurl-server release v0.9.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.9.0)
 
 
