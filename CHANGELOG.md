@@ -1,3 +1,10 @@
+# [blink-lnurl-server release v0.10.1](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.10.1)
+
+
+### Bug Fixes
+
+- Send LUD-12 comment as invoice memo (#37)
+
 # [blink-lnurl-server release v0.10.0](https://github.com/blinkbitcoin/blink-lnurl-server/releases/tag/0.10.0)
 
 
